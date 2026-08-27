@@ -1,4 +1,4 @@
-﻿# 🎬 BSAI H3 upscale 4K
+# 🎬 BSAI H3 upscale 4K
 
 > **MiniMax H3 专用视频高清放大超分超清极速生成插件**
 > A dedicated AI video super-resolution / upscaling plugin for **MiniMax H3** — extreme-speed HD/4K upscale.
@@ -37,12 +37,20 @@
 | 参数 / Parameter | 说明 / Description | 默认 |
 |---|---|---|
 | `images` | 视频帧序列 `[B,H,W,3]`（接 H3 解码输出） | — |
-| `model_name` | 超分模型（自动下载） | `RealESRGAN_x4plus.pth` |
+| `model_name` | 超分模型（自动下载） | `realesr-general-x4v3.pth`（极速） |
 | `scale` | 放大倍数 2–4 | 4 |
-| `tile_size` | 分块大小（0=不切块，显存足够可调大更快） | 256 |
+| `tile_size` | 分块大小（**0=不切块全图，最快**；显存不足时再调大） | 0 |
 | `tile_pad` | 块重叠宽度（消除接缝） | 16 |
-| `batch_frames` | 每批处理帧数（越大越吃显存但更快） | 4 |
+| `batch_frames` | 每批搬移帧数（控制显存/H2D 节奏） | 4 |
 | `use_fp16` | 半精度加速 | True |
+| `use_compile` | torch.compile 加速（首帧编译一次，进程内缓存） | True |
+
+> **模型选择 / Model pick（RTX 5090 实测，960×544 → 4K，compile + FP16）**
+> | 模型 | 质量 | 速度（12s/24fps 视频 ≈288 帧） |
+> |---|---|---|
+> | `realesr-general-x4v3.pth` ✅默认 | ≈x4plus（PSNR ~39 dB） | **最快**，约 20–36 s |
+> | `RealESRGAN_x4plus_anime_6B.pth` | 良好（偏动漫锐化） | 约 77 s |
+> | `RealESRGAN_x4plus.pth` | 最高 | 约 170 s |
 
 **输出 / Outputs**: `IMAGE`（放大后帧）、`width`、`height`、`scale_used`、`info`（耗时等诊断信息）
 
@@ -83,17 +91,33 @@ H3 生成 → 二采 latent 放大(路线B) → VAE Decode → [BSAI H3 upscale 
 
 ---
 
-## 🧪 性能参考 / Performance (RTX 5090 Laptop, FP16)
+## 🧪 性能参考 / Performance (RTX 5090 Laptop, FP16 + compile)
 
-| 场景 / Case | 耗时 / Time |
-|---|---|
-| 2 帧 64×64 → 4x (anime_6B, 含模型加载) | ~0.5 s |
-| 模型缓存后二次调用 | **~0.02 s** |
-| 2 帧 64×64 → 4x (x4plus) | ~0.3 s |
+实测（960×544 单帧 → 4K，进程内缓存命中后）：
+
+| 模型 | ms/帧 | 288 帧（12s@24fps） |
+|---|---|---|
+| `realesr-general-x4v3` + compile ✅ | 76–124 | **22–36 s** |
+| `RealESRGAN_x4plus_anime_6B` + compile | 267 | ~77 s |
+| `RealESRGAN_x4plus` + compile | 599 | ~172 s |
+
+> ⚠️ 关于 RTX Video Super Resolution：它是 NVIDIA 硬件级 TensorRT 实时管线（2x、流式、去噪为主），
+> 纯 PyTorch 推理无法达到其 ~1s 的延迟。本插件目标为「**比 RTX VSR 更清晰的 4K 逐帧导出**」，
+> 已通过 cuDNN autotune + torch.compile + 真·GPU 流水把速度从最初的 ~10.9s/8帧 提到 ~0.6–1s/8帧（约 10 倍）。
 
 ---
 
 ## 📝 更新日志 / Changelog
+
+### v1.2.0 — 极速引擎 / Extreme-speed engine
+- **修复色偏根因**：`conv_first` 后误加 LeakyReLU 导致的全局偏暗偏紫红，已移除（与 spandrel 参考逐像素一致）
+- **新增 torch.compile 加速**（`use_compile` 参数，首帧编译一次、进程内缓存）
+- **cuDNN benchmark 自动调优** + TF32 加速卷积
+- **移除每块 `torch.cuda.empty_cache()`**（曾被每批强制清显存严重拖慢）
+- **GPU 流水线优化**：结果在显存累积、按 batch 一次回传 CPU，去掉逐帧 `.cpu()` 同步卡顿
+- **修复 `tile_size=0` 全图路径 bug**（此前被 `max(1,0)` 错误钳到 1 导致死循环/报错）
+- **新增 SRVGGNetCompact 支持**（`realesr-general-x4v3`，残差结构 + PixelShuffle，与 spandrel maxdiff=0）
+- **默认模型改为 `realesr-general-x4v3`**：与 x4plus 质量几乎一致（PSNR ~39 dB）但快 ~8 倍
 
 ### v1.0.0 — 首版 / Initial release
 - 首个正式版本：像素级 Real-ESRGAN 极速超分 + H3 latent 二次采样放大

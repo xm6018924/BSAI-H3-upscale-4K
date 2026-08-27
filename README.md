@@ -1,4 +1,4 @@
-# 🎬 BSAI H3 UPSCAL 4K
+﻿# 🎬 BSAI H3 upscale 4K
 
 > **MiniMax H3 专用视频高清放大超分超清极速生成插件**
 > A dedicated AI video super-resolution / upscaling plugin for **MiniMax H3** — extreme-speed HD/4K upscale.
@@ -32,7 +32,7 @@
 
 ## 🔧 节点 / Nodes
 
-### 1️⃣ BSAI H3 UPSCAL 4K（视频帧 → AI 超分高清帧）
+### 1️⃣ BSAI H3 upscale 4K（视频帧 → AI 超分高清帧）
 
 | 参数 / Parameter | 说明 / Description | 默认 |
 |---|---|---|
@@ -46,7 +46,7 @@
 
 **输出 / Outputs**: `IMAGE`（放大后帧）、`width`、`height`、`scale_used`、`info`（耗时等诊断信息）
 
-### 2️⃣ BSAI H3 UPSCAL 4K Latent（H3 latent → 放大 latent）
+### 2️⃣ BSAI H3 upscale 4K Latent（H3 latent → 放大 latent）
 
 H3 专属 latent 空间放大，自动对齐 32 像素网格，用于**第二遍采样补细节**：
 低分辨率生成 → 本节点放大 latent → H3 二次采样（保持原始 prompt / 参考条件 / seed）。
@@ -65,20 +65,20 @@ H3 专属 latent 空间放大，自动对齐 32 像素网格，用于**第二遍
 
 **路线 A — 像素级 4K 放大（最直接）**
 ```
-H3 生成 → VAE Decode(视频) → [BSAI H3 UPSCAL 4K] → Save Video (4K)
+H3 生成 → VAE Decode(视频) → [BSAI H3 upscale 4K] → Save Video (4K)
 ```
 
 **路线 B — latent 二次采样（H3 官方高清路线）**
 ```
 H3 第一次采样(低分辨率 latent)
-   → [BSAI H3 UPSCAL 4K Latent](scale_by≈1.5)
+   → [BSAI H3 upscale 4K Latent](scale_by≈1.5)
    → H3 第二次采样(相同 prompt/参考条件/seed, steps 3, simple)
    → VAE Decode → Save Video
 ```
 
 **路线 C — 双路组合（极致高清）**
 ```
-H3 生成 → 二采 latent 放大(路线B) → VAE Decode → [BSAI H3 UPSCAL 4K] → 4K
+H3 生成 → 二采 latent 放大(路线B) → VAE Decode → [BSAI H3 upscale 4K] → 4K
 ```
 
 ---
@@ -109,3 +109,4 @@ H3 生成 → 二采 latent 放大(路线B) → VAE Decode → [BSAI H3 UPSCAL 4
 ## ⚖️ 许可 / License
 
 MIT — 模型权重版权归其各自作者所有 / Model weights © their respective authors.
+

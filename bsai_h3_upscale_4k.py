@@ -308,7 +308,10 @@ def _upscale_image_tiled(model, img, tile_size, tile_pad, device):
     inp = F.pad(img.to(device).to(dt), (pad, pad, pad, pad), mode="replicate")
     h_pad, w_pad = inp.shape[2], inp.shape[3]
 
-    over = torch.zeros((1, 1, h_pad, w_pad), dtype=torch.float32, device=device)
+    # overlap weight map lives in OUTPUT space (repeat_interleave == exact pixel
+    # alignment with the accumulated `out`; a bilinear upscale would shift weights
+    # at tile borders and cause visible block/grid seams)
+    over = torch.zeros((1, 1, h_pad * scale, w_pad * scale), dtype=torch.float32, device=device)
     out = torch.zeros((1, 3, h_pad * scale, w_pad * scale), dtype=torch.float32, device=device)
 
     if h_pad <= tile:
@@ -332,7 +335,6 @@ def _upscale_image_tiled(model, img, tile_size, tile_pad, device):
                 t_in = inp[:, :, r:r + th, c:c + tw]
                 t_out = model(t_in).float()
                 hh, ww = t_out.shape[2], t_out.shape[3]
-                out[:, :, r * scale:r * scale + hh, c * scale:c * scale + ww] += t_out
                 wg = torch.ones((1, 1, th, tw), dtype=torch.float32, device=device)
                 p1 = min(pad, th)
                 p2 = min(pad, tw)
@@ -344,10 +346,14 @@ def _upscale_image_tiled(model, img, tile_size, tile_pad, device):
                     wg[:, :, :, :p2] *= torch.linspace(0, 1, p2, device=device).view(1, 1, 1, p2)
                 if c + tw < w_pad:
                     wg[:, :, :, -p2:] *= torch.linspace(1, 0, p2, device=device).view(1, 1, 1, p2)
-                over[:, :, r:r + th, c:c + tw] += wg
+                wg_out = wg.repeat_interleave(scale, dim=2).repeat_interleave(scale, dim=3)
+                # weighted accumulate: out must carry the same weights as `over`,
+                # otherwise the normalized blend over tile overlaps produces
+                # visible brightness bands (block/grid seams)
+                out[:, :, r * scale:r * scale + th * scale, c * scale:c * scale + tw * scale] += t_out * wg_out
+                over[:, :, r * scale:r * scale + th * scale, c * scale:c * scale + tw * scale] += wg_out
 
     out = out[:, :, pad * scale:(pad + h0) * scale, pad * scale:(pad + w0) * scale]
-    over = F.interpolate(over, scale_factor=scale, mode="bilinear", align_corners=False)
     over = over[:, :, pad * scale:(pad + h0) * scale, pad * scale:(pad + w0) * scale]
     out = out / over.clamp_min(1e-6)
     return out.float().clamp_(0, 1).cpu()

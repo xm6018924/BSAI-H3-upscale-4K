@@ -281,10 +281,6 @@ def _load_model(path, use_fp16):
 # ---------------------------------------------------------------------------
 # Tile-based inference (VRAM friendly, seam-free, dtype-safe)
 # ---------------------------------------------------------------------------
-def _tile_pad(value, size):
-    return math.ceil(value / size) * size
-
-
 def _upscale_image(model, img):
     """img [1,C,H,W] on CPU float32 -> [1,C,scaledH,scaledW] float32 on CPU."""
     device = "cuda" if torch.cuda.is_available() else "cpu"

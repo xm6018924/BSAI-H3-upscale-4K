@@ -202,7 +202,11 @@ class RRDBNet(nn.Module):
         self.lrelu = nn.LeakyReLU(negative_slope=0.2, inplace=True)
 
     def forward(self, x):
-        feat = self.lrelu(self.conv_first(x))
+        # NOTE: Real-ESRGAN (x4plus/anime_6B/general-x4v3) trained WITHOUT activation
+        # after conv_first. Adding LeakyReLU here shifts features into a nonlinear
+        # regime and causes a global dark + red/magenta color cast (verified against
+        # spandrel reference implementation). Keep conv_first activation-free.
+        feat = self.conv_first(x)
         body_feat = self.conv_body(self.body(feat))
         feat = feat + body_feat
         feat = self.lrelu(self.conv_up1(F.interpolate(feat, scale_factor=2, mode="nearest")))
@@ -213,26 +217,93 @@ class RRDBNet(nn.Module):
 
 
 def _detect_arch(state):
-    """Detect num_block, scale, num_feat, num_grow_ch, compact from a Real-ESRGAN state dict."""
-    compact = "body.0.rdb1.conv1.weight" in state
-    num_block = 0
-    while True:
-        if compact and f"body.{num_block}.rdb1.conv1.weight" in state:
-            num_block += 1
-        elif (not compact) and f"body.{num_block}.conv1.weight" in state:
-            num_block += 1
-        else:
-            break
-    if num_block == 0:
-        raise RuntimeError(
-            "[BSAI H3 UPSCAL 4K] Cannot recognize this model as a Real-ESRGAN (RRDBNet) "
-            "architecture. Only Real-ESRGAN x4plus / anime_6B / general-x4v3 are supported."
-        )
-    scale = 4 if "conv_up2.weight" in state else 2
-    num_feat = state["conv_first.weight"].shape[0]
-    k0 = "body.0.rdb1.conv1.weight" if compact else "body.0.conv1.weight"
-    num_grow_ch = state[k0].shape[0]
-    return num_block, scale, num_feat, num_grow_ch, compact
+    """
+    Detect architecture + hyper-parameters from a Real-ESRGAN family state dict.
+
+    Returns:
+      ("rrdb", dict(num_block, scale, num_feat, num_grow_ch, compact)) for
+              RRDBNet (x4plus / anime_6B) and its compact layout (general-x4v3
+              is SRVGG though, see below).
+      ("srvgg", dict(num_feat)) for SRVGGNetCompact (realesr-general-x4v3).
+    """
+    # --- RRDBNet (standard + compact): has conv_first + body.N.{rdb1,rdb2,rdb3} ---
+    if "conv_first.weight" in state and "body.0.rdb1.conv1.weight" in state:
+        compact = True
+        k0 = "body.0.rdb1.conv1.weight"
+    elif "conv_first.weight" in state and "body.0.conv1.weight" in state:
+        compact = False
+        k0 = "body.0.conv1.weight"
+    else:
+        compact = None
+        k0 = None
+
+    if compact is not None:
+        num_block = 0
+        while True:
+            if compact and f"body.{num_block}.rdb1.conv1.weight" in state:
+                num_block += 1
+            elif (not compact) and f"body.{num_block}.conv1.weight" in state:
+                num_block += 1
+            else:
+                break
+        if num_block == 0:
+            raise RuntimeError(
+                "[BSAI H3 UPSCAL 4K] Cannot recognize this model as a Real-ESRGAN (RRDBNet) "
+                "architecture. Only Real-ESRGAN x4plus / anime_6B / general-x4v3 are supported."
+            )
+        scale = 4 if "conv_up2.weight" in state else 2
+        num_feat = state["conv_first.weight"].shape[0]
+        num_grow_ch = state[k0].shape[0]
+        return "rrdb", dict(num_block=num_block, scale=scale, num_feat=num_feat,
+                            num_grow_ch=num_grow_ch, compact=compact)
+
+    # --- SRVGGNetCompact (realesr-general-x4v3): body.N alternating Conv / PReLU ---
+    if "body.0.weight" in state and "body.0.bias" in state and "body.1.weight" in state:
+        num_feat = state["body.0.weight"].shape[0]
+        return "srvgg", dict(num_feat=num_feat)
+
+    raise RuntimeError(
+        "[BSAI H3 UPSCAL 4K] Cannot recognize this model as a Real-ESRGAN family "
+        "architecture. Only Real-ESRGAN x4plus / anime_6B / general-x4v3 are supported."
+    )
+
+
+class SRVGGNetCompact(nn.Module):
+    """
+    SRVGGNetCompact — the tiny general-purpose 4x model (realesr-general-x4v3).
+    body: alternating Conv2d (even index) + PReLU (odd index), tail Conv out=3*scale^2,
+    then a single PixelShuffle. Layers are reconstructed from the state dict keys.
+    """
+
+    def __init__(self, state):
+        super().__init__()
+        body = nn.ModuleList()
+        i = 0
+        while True:
+            wkey = f"body.{i}.weight"
+            if wkey not in state:
+                break
+            bkey = f"body.{i}.bias"
+            w = state[wkey]
+            if bkey in state:
+                body.append(nn.Conv2d(w.shape[1], w.shape[0], 3, 1, 1))
+            else:
+                body.append(nn.PReLU(num_parameters=w.shape[0]))
+            i += 1
+        self.body = body
+        # tail conv determines upscale factor (out == 3 * scale^2)
+        tail_out = body[-1].out_channels
+        self.scale = int(round(math.sqrt(max(tail_out // 3, 1)))) if tail_out % 3 == 0 else 1
+        self.pixel_shuffle = nn.PixelShuffle(self.scale)
+
+    def forward(self, x):
+        out = x
+        for layer in self.body:
+            out = layer(out)
+        out = self.pixel_shuffle(out)
+        # SRVGGNetCompact learns the residual: add back the nearest-upsampled input.
+        base = F.interpolate(x, scale_factor=self.scale, mode="nearest")
+        return out + base
 
 
 # ---------------------------------------------------------------------------
@@ -253,15 +324,19 @@ def _load_model(path, use_fp16):
     elif "params" in state:
         state = state["params"]
     state = {k: v for k, v in state.items() if k.startswith(("conv_", "body."))}
-    nb, scale, nf, ng, compact = _detect_arch(state)
-    net = RRDBNet(num_feat=nf, num_block=nb, num_grow_ch=ng, scale=scale, compact=compact)
-    missing, unexpected = net.load_state_dict(state, strict=False)
-    if missing:
-        raise RuntimeError(
-            f"[BSAI H3 UPSCAL 4K] Model weights mismatch for {os.path.basename(path)} "
-            f"(missing {len(missing)} keys, e.g. {missing[0]}). This may not be a "
-            "Real-ESRGAN (RRDBNet) checkpoint."
-        )
+    arch, params = _detect_arch(state)
+    if arch == "srvgg":
+        net = SRVGGNetCompact(state)
+        missing, unexpected = net.load_state_dict(state, strict=True)
+    else:
+        net = RRDBNet(**params)
+        missing, unexpected = net.load_state_dict(state, strict=False)
+        if missing:
+            raise RuntimeError(
+                f"[BSAI H3 UPSCAL 4K] Model weights mismatch for {os.path.basename(path)} "
+                f"(missing {len(missing)} keys, e.g. {missing[0]}). This may not be a "
+                "Real-ESRGAN (RRDBNet) checkpoint."
+            )
     net.eval()
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     net = net.to(dev)

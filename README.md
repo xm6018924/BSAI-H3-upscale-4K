@@ -22,7 +22,7 @@
 
 ## 📥 安装 / Installation
 
-1. 把 `BSAI-H3-Upscal4K` 文件夹放进 `ComfyUI/custom_nodes/`
+1. 把 `BSAI-H3-upscale-4K` 文件夹放进 `ComfyUI/custom_nodes/`
 2. 重启 ComfyUI（首次使用选模型时**自动下载**权重到 `models/upscale_models/`，约 14–67 MB）
 3. 刷新浏览器（Ctrl+F5）
 
@@ -109,4 +109,5 @@ H3 生成 → 二采 latent 放大(路线B) → VAE Decode → [BSAI H3 upscale 
 ## ⚖️ 许可 / License
 
 MIT — 模型权重版权归其各自作者所有 / Model weights © their respective authors.
+
 

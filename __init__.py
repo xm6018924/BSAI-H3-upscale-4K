@@ -6,3 +6,4 @@ BSAI H3 UPSCAL 4K — ComfyUI custom node package entry.
 from .bsai_h3_upscal4k import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
 
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]
+

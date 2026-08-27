@@ -13,8 +13,8 @@ A dedicated video super-resolution / upscaling plugin for MiniMax H3.
   - H3 专属 latent 二次采样放大（32 像素对齐，供 H3 第二遍采样补细节）
 
 节点列表 / Node list:
-  - BSAI H3 UPSCAL 4K            : 视频帧 -> AI 超分高清视频帧 (pixel-domain upscale)
-  - BSAI H3 UPSCAL 4K Latent     : H3 latent -> 放大 latent (second-pass refine)
+  - BSAI H3 upscale 4K            : 视频帧 -> AI 超分高清视频帧 (pixel-domain upscale)
+  - BSAI H3 upscale 4K Latent     : H3 latent -> 放大 latent (second-pass refine)
 
 Classic ComfyUI API (INPUT_TYPES / NODE_CLASS_MAPPINGS) for max compatibility
 with ComfyUI 0.34.x and community builds.
@@ -376,7 +376,7 @@ def _upscale_batch(model, images, tile_size, tile_pad, batch_frames):
 # ---------------------------------------------------------------------------
 # Main node: video frames -> AI upscaled frames
 # ---------------------------------------------------------------------------
-class BSAI_H3_Upscal4K:
+class BSAI_H3_Upscale4K:
     """Video frame AI super-resolution for MiniMax H3 (pixel domain, extremely fast)."""
 
     @classmethod
@@ -433,7 +433,7 @@ class BSAI_H3_Upscal4K:
 # ---------------------------------------------------------------------------
 # Latent node: H3 latent -> enlarged latent (32px aligned, second-pass refine)
 # ---------------------------------------------------------------------------
-class BSAI_H3_Upscal4K_Latent:
+class BSAI_H3_Upscale4K_Latent:
     """H3 latent-space upscale aligned to the 32-px grid for safe second-pass sampling."""
 
     upscale_methods = ["nearest-exact", "bilinear", "area", "bicubic", "bislerp"]
@@ -496,11 +496,11 @@ class BSAI_H3_Upscal4K_Latent:
 
 
 NODE_CLASS_MAPPINGS = {
-    "BSAI_H3_Upscal4K": BSAI_H3_Upscal4K,
-    "BSAI_H3_Upscal4K_Latent": BSAI_H3_Upscal4K_Latent,
+    "BSAI_H3_Upscale4K": BSAI_H3_Upscale4K,
+    "BSAI_H3_Upscale4K_Latent": BSAI_H3_Upscale4K_Latent,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "BSAI_H3_Upscal4K": "BSAI H3 UPSCAL 4K / 视频超分",
-    "BSAI_H3_Upscal4K_Latent": "BSAI H3 UPSCAL 4K Latent / H3潜空间放大",
+    "BSAI_H3_Upscale4K": "BSAI H3 upscale 4K / 视频超分",
+    "BSAI_H3_Upscale4K_Latent": "BSAI H3 upscale 4K Latent / H3潜空间放大",
 }

@@ -298,51 +298,61 @@ def _upscale_image_tiled(model, img, tile_size, tile_pad, device):
     """
     img: torch [1, C, H, W] float32 in [0,1], on CPU.
     Returns [1, C, H*scale, W*scale] float32 on CPU.
+    Tile loop pads the input first (seam-free, never cuts below kernel size).
     """
     scale = model.scale
-    h, w = img.shape[2], img.shape[3]
-    if tile_size <= 0 or (h <= tile_size and w <= tile_size):
+    h0, w0 = img.shape[2], img.shape[3]
+    tile = max(1, int(tile_size))
+    pad = max(0, int(tile_pad))
+    if tile <= 0 or (h0 + 2 * pad <= tile and w0 + 2 * pad <= tile):
         return _upscale_image(model, img)
-
-    tile = tile_size
-    pad = tile_pad
-    h_pad = _tile_pad(h + pad * 2, tile)
-    w_pad = _tile_pad(w + pad * 2, tile)
     dt = next(model.parameters()).dtype
+
+    # pad input with edge replication (safe even when dim < pad)
+    inp = F.pad(img.to(device).to(dt), (pad, pad, pad, pad), mode="replicate")
+    h_pad, w_pad = inp.shape[2], inp.shape[3]
 
     over = torch.zeros((1, 1, h_pad, w_pad), dtype=torch.float32, device=device)
     out = torch.zeros((1, 3, h_pad * scale, w_pad * scale), dtype=torch.float32, device=device)
-    inp = img.to(device).to(dt)
 
-    rows = list(range(0, h_pad - pad * 2, tile - pad * 2))
-    cols = list(range(0, w_pad - pad * 2, tile - pad * 2))
-    last_row = max(0, h_pad - tile)
-    last_col = max(0, w_pad - tile)
-    if rows[-1] != last_row:
-        rows.append(last_row)
-    if cols[-1] != last_col:
-        cols.append(last_col)
+    if h_pad <= tile:
+        rows = [0]
+    else:
+        rows = list(range(0, h_pad - tile, tile - pad * 2))
+        if rows[-1] != h_pad - tile:
+            rows.append(h_pad - tile)
+    if w_pad <= tile:
+        cols = [0]
+    else:
+        cols = list(range(0, w_pad - tile, tile - pad * 2))
+        if cols[-1] != w_pad - tile:
+            cols.append(w_pad - tile)
 
     with torch.no_grad():
         for r in rows:
             for c in cols:
-                t_in = inp[:, :, r:r + tile, c:c + tile]
+                th = min(tile, h_pad - r)
+                tw = min(tile, w_pad - c)
+                t_in = inp[:, :, r:r + th, c:c + tw]
                 t_out = model(t_in).float()
                 hh, ww = t_out.shape[2], t_out.shape[3]
                 out[:, :, r * scale:r * scale + hh, c * scale:c * scale + ww] += t_out
-                wg = torch.ones((1, 1, tile, tile), dtype=torch.float32, device=device)
+                wg = torch.ones((1, 1, th, tw), dtype=torch.float32, device=device)
+                p1 = min(pad, th)
+                p2 = min(pad, tw)
                 if r > 0:
-                    wg[:, :, :pad, :] *= torch.linspace(0, 1, pad, device=device).view(1, 1, pad, 1)
-                if r + tile < h_pad:
-                    wg[:, :, -pad:, :] *= torch.linspace(1, 0, pad, device=device).view(1, 1, pad, 1)
+                    wg[:, :, :p1, :] *= torch.linspace(0, 1, p1, device=device).view(1, 1, p1, 1)
+                if r + th < h_pad:
+                    wg[:, :, -p1:, :] *= torch.linspace(1, 0, p1, device=device).view(1, 1, p1, 1)
                 if c > 0:
-                    wg[:, :, :, :pad] *= torch.linspace(0, 1, pad, device=device).view(1, 1, 1, pad)
-                if c + tile < w_pad:
-                    wg[:, :, :, -pad:] *= torch.linspace(1, 0, pad, device=device).view(1, 1, 1, pad)
-                over[:, :, r:r + tile, c:c + tile] += wg
+                    wg[:, :, :, :p2] *= torch.linspace(0, 1, p2, device=device).view(1, 1, 1, p2)
+                if c + tw < w_pad:
+                    wg[:, :, :, -p2:] *= torch.linspace(1, 0, p2, device=device).view(1, 1, 1, p2)
+                over[:, :, r:r + th, c:c + tw] += wg
 
-    out = out[:, :, :h * scale, :w * scale]
-    over = over[:, :, :h * scale, :w * scale]
+    out = out[:, :, pad * scale:(pad + h0) * scale, pad * scale:(pad + w0) * scale]
+    over = F.interpolate(over, scale_factor=scale, mode="bilinear", align_corners=False)
+    over = over[:, :, pad * scale:(pad + h0) * scale, pad * scale:(pad + w0) * scale]
     out = out / over.clamp_min(1e-6)
     return out.float().clamp_(0, 1).cpu()
 

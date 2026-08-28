@@ -25,9 +25,16 @@ import time
 import threading
 import urllib.request
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+try:
+    import cv2
+    _HAS_CV2 = True
+except Exception:
+    _HAS_CV2 = False
 
 import folder_paths
 
@@ -527,6 +534,181 @@ def _upscale_batch(model, images, tile_size, tile_pad, batch_frames):
 
 
 # ---------------------------------------------------------------------------
+# Temporal consistency + detail enhancement (motion-compensated video refine)
+# ---------------------------------------------------------------------------
+# The per-frame CNN upscaler is temporally independent: on video, uncorrelated
+# per-frame noise makes static regions shimmer / flicker. We fix this with a
+# light Farneback optical-flow step (computed on the LR frames, rescaled to SR):
+# each SR frame is blended with its motion-compensated neighbours; the blend
+# weight is attenuated by local motion magnitude so fast/occluded areas do not
+# ghost. Then an optional separable-Gaussian unsharp-mask adds crisp detail.
+# All heavy math stays on GPU; only the LR flow is computed on CPU (cheap).
+
+def _frame_gray(frame_np):
+    """frame_np [h,w,3] float32 0-1 -> grayscale uint8 for Farneback (faster)."""
+    img = np.clip(frame_np, 0, 1)
+    g = img.astype(np.float32).mean(axis=2)
+    return (g * 255.0).astype(np.uint8)
+
+
+def _compute_flow_pairs(lr_np, max_size=512):
+    """
+    lr_np: [B,h,w,3] float32 0-1 numpy.
+    Returns list of len B-1: flows[i] = optical flow from frame i to frame i+1
+    (h,w,2) float32, in *original LR* pixel coordinates (rescaled back up).
+    Downscales internally to speed up Farneback; flow is upsampled to LR size.
+    """
+    if not _HAS_CV2:
+        return None
+    B = lr_np.shape[0]
+    if B < 2:
+        return []
+    h, w = lr_np.shape[1], lr_np.shape[2]
+    ds = 1.0
+    th, tw = h, w
+    if max(max(h, w), 1) > max_size:
+        ds = max_size / float(max(h, w))
+        th, tw = max(2, int(round(h * ds))), max(2, int(round(w * ds)))
+    prev = cv2.resize(_frame_gray(lr_np[0]), (tw, th), interpolation=cv2.INTER_AREA)
+    flows = []
+    for i in range(1, B):
+        cur = cv2.resize(_frame_gray(lr_np[i]), (tw, th), interpolation=cv2.INTER_AREA)
+        f = cv2.calcOpticalFlowFarneback(prev, cur, None, 0.5, 3, 15, 3, 5, 1.2, 0)
+        if ds != 1.0:
+            f = cv2.resize(f, (w, h), interpolation=cv2.INTER_LINEAR) / ds
+        flows.append(f.astype(np.float32))
+        prev = cur
+    return flows
+
+
+_SR_GRID_CACHE = {}
+
+
+def _sr_grid(H, W, device):
+    """Cached normalized coordinate grid [1,H,W,2] (align_corners) for the SR size."""
+    key = (H, W, str(device))
+    g = _SR_GRID_CACHE.get(key)
+    if g is None:
+        yy, xx = torch.meshgrid(torch.arange(H, device=device),
+                                torch.arange(W, device=device), indexing="ij")
+        gx = xx.float() * 2.0 / max(W - 1, 1) - 1.0
+        gy = yy.float() * 2.0 / max(H - 1, 1) - 1.0
+        g = torch.stack([gx, gy], dim=-1).unsqueeze(0)
+        if len(_SR_GRID_CACHE) > 4:
+            _SR_GRID_CACHE.clear()
+        _SR_GRID_CACHE[key] = g
+    return g
+
+
+def _warp_flow(img, ft, grid):
+    """
+    img [1,3,H,W] cuda; ft [1,2,H,W] SR-space flow (cuda); grid cached [1,H,W,2].
+    Warps img by ft (queries img at position p + ft). Returns [1,3,H,W].
+    """
+    H, W = img.shape[2], img.shape[3]
+    fx = ft[:, 0:1] * (2.0 / max(W - 1, 1))
+    fy = ft[:, 1:2] * (2.0 / max(H - 1, 1))
+    g = grid.to(img.dtype) + torch.cat([fx, fy], dim=1).permute(0, 2, 3, 1)
+    return F.grid_sample(img, g, mode="bilinear", padding_mode="border", align_corners=True)
+
+
+def _flow_motion_weight(ft):
+    """Per-pixel confidence: high motion (large flow) contributes less (avoids ghosting).
+    ft [1,2,H,W] -> [1,1,H,W] in [0,1]."""
+    mag = ft.norm(dim=1, keepdim=True)
+    sig = max(ft.shape[2], ft.shape[3]) * 0.05
+    return torch.exp(-mag / max(sig, 1e-3))
+
+
+def _detail_enhance_gpu(frames, amount, radius):
+    """
+    frames [n,3,H,W] cuda -> separable-Gaussian unsharp mask, same shape/dtype.
+    Clamps the detail layer to avoid halos / overshoot on 4K video.
+    """
+    if amount <= 0:
+        return frames
+    n, C, H, W = frames.shape
+    sig = max(0.5, float(radius))
+    ks = int(math.ceil(sig * 4)) | 1
+    half = ks // 2
+    dev, dt = frames.device, frames.dtype
+    ax = torch.arange(-half, half + 1, dtype=torch.float32, device=dev)
+    g = torch.exp(-(ax * ax) / (2 * sig * sig))
+    g = (g / g.sum()).to(dt)
+    k1 = g.view(1, 1, -1, 1).repeat(C, 1, 1, 1)  # [C,1,ks,1]
+    k2 = g.view(1, 1, 1, -1).repeat(C, 1, 1, 1)  # [C,1,1,ks]
+    xb = F.conv2d(frames, k1, padding=(half, 0), groups=C)
+    xb = F.conv2d(xb, k2, padding=(0, half), groups=C)
+    detail = frames - xb
+    return frames + amount * torch.clamp(detail, -0.3, 0.3)
+
+
+def _video_temporal_detail(sr_cpu, lr_np, temporal_strength, detail_amount, detail_radius, scale):
+    """
+    sr_cpu: [B,H,W,3] float32 CPU 0-1 (already upscaled).
+    lr_np:  [B,h,w,3] float32 0-1 numpy (original LR frames, for optical flow).
+    Returns fused + enhanced frames [B,H,W,3] CPU float32.
+
+    Fast path: frames are staged to GPU in windows (with neighbours) in ONE
+    transfer, all math runs in fp16, and the warp grid is cached per (H,W).
+    """
+    B = sr_cpu.shape[0]
+    if (temporal_strength <= 0 and detail_amount <= 0) or B < 1:
+        return sr_cpu
+    flows = _compute_flow_pairs(lr_np) if temporal_strength > 0 else None
+    H, W = sr_cpu.shape[1], sr_cpu.shape[2]
+    use_gpu = torch.cuda.is_available()
+    dev = torch.cuda.current_device() if use_gpu else torch.device("cpu")
+    half = use_gpu
+    pix = H * W
+    window = 8 if pix > 10_000_000 else 16
+    grid = _sr_grid(H, W, dev) if flows is not None else None
+    out_chunks = []
+    for s in range(0, B, window):
+        e = min(B, s + window)
+        lo = max(0, s - 1)
+        hi = min(B, e + 1)
+        buf = sr_cpu[lo:hi].to(dev).permute(0, 3, 1, 2)  # [m,3,H,W] one transfer
+        if half:
+            buf = buf.half()
+        rel = {i: i - lo for i in range(lo, hi)}
+        chunk = buf[rel[s]:rel[e - 1] + 1].clone()
+        if flows is not None:
+            n = chunk.shape[0]
+            fused = chunk.clone()
+            for j in range(n):
+                i = s + j
+                acc = chunk[j:j + 1].clone()
+                denom = torch.ones(1, 1, H, W, device=dev, dtype=acc.dtype)
+                if i > 0:
+                    ft = torch.from_numpy(flows[i - 1]).float().to(dev)
+                    ft = F.interpolate(ft.permute(2, 0, 1).unsqueeze(0) * scale,
+                                       size=(H, W), mode="bilinear", align_corners=False)
+                    if half:
+                        ft = ft.half()
+                    wimg = _warp_flow(buf[rel[i - 1]:rel[i - 1] + 1], ft, grid)
+                    w = (temporal_strength * _flow_motion_weight(ft)).to(acc.dtype)
+                    acc = acc + w * wimg
+                    denom = denom + w
+                if i < B - 1:
+                    ft = torch.from_numpy(flows[i]).float().to(dev)
+                    ft = F.interpolate(ft.permute(2, 0, 1).unsqueeze(0) * scale,
+                                       size=(H, W), mode="bilinear", align_corners=False)
+                    if half:
+                        ft = ft.half()
+                    wimg = _warp_flow(buf[rel[i + 1]:rel[i + 1] + 1], ft, grid)
+                    w = (temporal_strength * _flow_motion_weight(ft)).to(acc.dtype)
+                    acc = acc + w * wimg
+                    denom = denom + w
+                fused[j:j + 1] = acc / denom.clamp_min(1e-4)
+            chunk = fused
+        if detail_amount > 0:
+            chunk = _detail_enhance_gpu(chunk, detail_amount, detail_radius)
+        out_chunks.append(chunk.float().permute(0, 2, 3, 1).cpu())
+    return torch.cat(out_chunks, dim=0)
+
+
+# ---------------------------------------------------------------------------
 # Main node: video frames -> AI upscaled frames
 # ---------------------------------------------------------------------------
 class BSAI_H3_Upscale4K:
@@ -551,6 +733,12 @@ class BSAI_H3_Upscale4K:
                 # torch.compile: ~1.6-1.9x faster on fixed-size video frames.
                 # One-time compile cost on first run, then cached process-wide.
                 "use_compile": ("BOOLEAN", {"default": True}),
+                # Temporal consistency: motion-compensated blend with neighbours
+                # (Farneback optical flow on LR, GPU warp on SR). 0 = off.
+                "temporal_strength": ("FLOAT", {"default": 0.20, "min": 0.0, "max": 0.8, "step": 0.05}),
+                # Detail enhancement: separable-Gaussian unsharp mask on SR. 0 = off.
+                "detail_amount": ("FLOAT", {"default": 0.30, "min": 0.0, "max": 1.5, "step": 0.05}),
+                "detail_radius": ("FLOAT", {"default": 1.5, "min": 0.3, "max": 8.0, "step": 0.1}),
             },
         }
 
@@ -559,12 +747,15 @@ class BSAI_H3_Upscale4K:
     FUNCTION = "upscale"
     CATEGORY = "BSAI/H3"
     DESCRIPTION = (
-        "H3 视频专用 AI 超分（像素域）：Real-ESRGAN 极速放大。\n"
-        "Tile 分块 + FP16 半精度 + 帧批量并行 + 模型常驻缓存。\n"
-        "Video-only AI super-resolution for MiniMax H3: Real-ESRGAN extreme-speed upscale."
+        "H3 视频专用 AI 超分（像素域）：Real-ESRGAN 极速放大 + 光流时序一致性 + 细节增强。\n"
+        "Tile 分块 + FP16 半精度 + torch.compile + 帧批量并行 + 模型常驻缓存。\n"
+        "Video-only AI super-resolution for MiniMax H3: Real-ESRGAN extreme-speed upscale,\n"
+        "with optical-flow temporal consistency and unsharp detail enhancement."
     )
 
-    def upscale(self, images, model_name, scale, tile_size, tile_pad, batch_frames, use_fp16, use_compile=True):
+    def upscale(self, images, model_name, scale, tile_size, tile_pad, batch_frames,
+                use_fp16, use_compile=True, temporal_strength=0.20,
+                detail_amount=0.30, detail_radius=1.5):
         t0 = time.time()
         path = ensure_model(model_name)
         if use_compile and torch.cuda.is_available():
@@ -572,6 +763,11 @@ class BSAI_H3_Upscale4K:
         else:
             model = _load_model(path, use_fp16)
         eff_scale = min(scale, model.scale)
+
+        # keep the original LR frames around (needed by the temporal pass for flow)
+        lr_np = None
+        if temporal_strength > 0 and _HAS_CV2 and images.shape[0] > 1:
+            lr_np = np.ascontiguousarray(images.float().numpy(), dtype=np.float32)
 
         if model.scale == 2 and scale == 4:
             # 2x model but user asked 4x -> run twice
@@ -581,13 +777,20 @@ class BSAI_H3_Upscale4K:
         else:
             out = _upscale_batch(model, images, tile_size, tile_pad, batch_frames)
 
+        # Temporal consistency (motion-compensated neighbour blend) + detail USM
+        t_td = time.time()
+        out = _video_temporal_detail(out, lr_np, temporal_strength, detail_amount,
+                                     detail_radius, eff_scale)
+        td_elapsed = time.time() - t_td
+
         bh, bw = out.shape[1], out.shape[2]
         elapsed = time.time() - t0
         info = (
             f"model: {model_name} (scale={model.scale}) | "
             f"output: {bw}x{bh} | eff_scale: {eff_scale}x | "
             f"fp16: {use_fp16} | compile: {use_compile} | tile: {tile_size} pad:{tile_pad} | "
-            f"frames: {images.shape[0]} | time: {elapsed:.2f}s | "
+            f"temporal: {temporal_strength} | detail: {detail_amount}@{detail_radius} | "
+            f"frames: {images.shape[0]} | time: {elapsed:.2f}s (temporal+detail: {td_elapsed:.2f}s) | "
             f"device: {'cuda' if torch.cuda.is_available() else 'cpu'}"
         )
         return (out, bw, bh, float(eff_scale), info)

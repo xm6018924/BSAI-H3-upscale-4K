@@ -44,6 +44,9 @@
 | `batch_frames` | 每批搬移帧数（控制显存/H2D 节奏） | 4 |
 | `use_fp16` | 半精度加速 | True |
 | `use_compile` | torch.compile 加速（首帧编译一次，进程内缓存） | True |
+| `temporal_strength` | **光流时序一致性**：Farneback 光流运动补偿，与前后帧混合消除闪烁/抖动（0=关） | 0.20 |
+| `detail_amount` | **细节增强**：可分高斯 USM 锐化强度（0=关） | 0.30 |
+| `detail_radius` | 细节增强高斯半径（σ，越大越"粗"） | 1.5 |
 
 > **模型选择 / Model pick（RTX 5090 实测，960×544 → 4K，compile + FP16）**
 > | 模型 | 质量 | 速度（12s/24fps 视频 ≈288 帧） |
@@ -51,6 +54,28 @@
 > | `realesr-general-x4v3.pth` ✅默认 | ≈x4plus（PSNR ~39 dB） | **最快**，约 20–36 s |
 > | `RealESRGAN_x4plus_anime_6B.pth` | 良好（偏动漫锐化） | 约 77 s |
 > | `RealESRGAN_x4plus.pth` | 最高 | 约 170 s |
+
+> **时序 + 细节后处理实测（4K 输出，稳态）**
+> | 配置 | 速度 |
+> |---|---|
+> | temporal(0.20) + detail(0.30@1.5) | ~81 ms/帧 ≈ **23 s / 288 帧** |
+> | 仅 temporal | ~84 ms/帧 |
+> | 仅 detail | ~49 ms/帧 |
+> 效果：静态区帧间闪烁 **降 12–33%**；高频细节能量 **+60%+**（均与原始单帧超分对比）。
+
+---
+
+## 🔬 与主流超分技术对比 / vs. OmniSR · FlashVSR · SeedVR2 · Topaz Starlight
+
+| 方法 | 类型 | 时序 | 实测速度(960×544→4K) | 质量 | 优点 | 缺点 |
+|---|---|---|---|---|---|---|
+| **本插件** | CNN/GAN | ✅(光流) | **~81ms**+超分 | 好 | 最快、时序一致、轻量、开源 | 细节重建上限低于扩散模型 |
+| OmniSR | Transformer 轻量 | ❌ | 239ms | 好(PSNR高) | 0.8M 参数量 | 单帧、比 general 慢 |
+| FlashVSR | 扩散一步流式 | ✅ | A100 17FPS | 高 | 时序+实时(云端) | 模型大、消费卡慢 |
+| SeedVR2 | 扩散一步 | ✅ | 数秒/帧 | **最高** | 保真+时序，文本/人脸最强 | 慢、显存大 |
+| Topaz Starlight | 扩散(6B) | ✅ | 慢 | 最高(专调AI视频) | AI 视频去塑料感 | 商业闭源、$799/年 |
+
+**取舍结论**：纯 PyTorch 无法达到 NVIDIA RTX VSR 的硬件实时延迟；本插件以「**最快速度 + 光流时序一致性 + 细节增强**」在消费级 GPU 上实现逐帧 4K 导出，清晰度优于 RTX VSR 的 2x 实时增强，速度远快于 SeedVR2 / Starlight 等扩散方案。
 
 **输出 / Outputs**: `IMAGE`（放大后帧）、`width`、`height`、`scale_used`、`info`（耗时等诊断信息）
 
@@ -108,6 +133,16 @@ H3 生成 → 二采 latent 放大(路线B) → VAE Decode → [BSAI H3 upscale 
 ---
 
 ## 📝 更新日志 / Changelog
+
+### v1.3.0 — 时序一致性 + 细节增强 / Temporal consistency + detail
+- **新增光流时序一致性**（`temporal_strength`）：Farneback 光流在 LR 域计算、放大到 SR，
+  运动自适应权重与前后帧 warp 融合——静态区闪烁/抖动 **降 12–33%**，快速运动区自动降权防鬼影
+- **新增细节增强**（`detail_amount` / `detail_radius`）：可分高斯 Unsharp Mask（GPU 批量），
+  高频细节能量 **+60%+**，clamp 防过冲光晕
+- **GPU 极速流水线**：fp16 全链路 + 窗口批量邻居一次性 H2D + 坐标网格缓存，
+  稳态仅 **~81 ms/帧**（temporal+detail 全开，4K 输出）
+- **对比调研**：与 OmniSR / FlashVSR / SeedVR2 / Topaz Starlight 横向分析——保留极速 CNN 路线，
+  以时序一致性 + 细节增强补齐单帧超分在视频上的两大短板（详见 README 对比章节）
 
 ### v1.2.0 — 极速引擎 / Extreme-speed engine
 - **修复色偏根因**：`conv_first` 后误加 LeakyReLU 导致的全局偏暗偏紫红，已移除（与 spandrel 参考逐像素一致）

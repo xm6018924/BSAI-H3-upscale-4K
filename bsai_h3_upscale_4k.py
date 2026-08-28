@@ -779,8 +779,15 @@ def _face_models(mode: str):
     return det, sess
 
 
-def _restore_faces_frame(img, boxes, sess, mode, blend):
-    """Restore every detected face in one BGR/RGB uint8 frame (numpy), blend back."""
+def _restore_faces_frame(img, boxes, sess, mode, blend, fidelity=0.5):
+    """Restore every detected face in one BGR/RGB uint8 frame (numpy), blend back.
+
+    v1.4.2 fixes: (1) aspect-preserving letterbox resize into 512x512 so the
+    face is never anisotropically stretched (stretched crops corrupt GFPGAN /
+    CodeFormer reconstruction and cause ghosting / missing features after the
+    blend); (2) elliptical blend mask centred on the face bbox instead of the
+    crop centre; (3) wider pad (esp. vertically) to keep chin/forehead inside.
+    """
     H, W = img.shape[:2]
     out = img.copy()
     for b in boxes:
@@ -788,34 +795,45 @@ def _restore_faces_frame(img, boxes, sess, mode, blend):
         w, h = x2 - x1, y2 - y1
         if w < 8 or h < 8:
             continue
-        pad = 0.35 * max(w, h)
-        cx1 = max(0, int(x1 - pad)); cy1 = max(0, int(y1 - pad))
-        cx2 = min(W, int(x2 + pad)); cy2 = min(H, int(y2 + pad))
+        # generous pad (more vertical) so the whole face stays inside the crop
+        pad_w, pad_h = 0.45 * w, 0.50 * h
+        cx1 = max(0, int(x1 - pad_w)); cy1 = max(0, int(y1 - pad_h))
+        cx2 = min(W, int(x2 + pad_w)); cy2 = min(H, int(y2 + pad_h))
         crop = img[cy1:cy2, cx1:cx2]
         ch, cw = crop.shape[:2]
-        r = cv2.resize(crop, (512, 512), interpolation=cv2.INTER_CUBIC)
-        inp = r.astype(np.float32) / 255.0
+        # --- aspect-preserving letterbox into 512x512 (no anisotropic stretch) ---
+        S = 512
+        scale = min(S / float(ch), S / float(cw))
+        nh = max(1, int(round(ch * scale))); nw = max(1, int(round(cw * scale)))
+        resized = cv2.resize(crop, (nw, nh), interpolation=cv2.INTER_CUBIC)
+        canvas = np.zeros((S, S, 3), dtype=np.uint8)
+        dx, dy = (S - nw) // 2, (S - nh) // 2
+        canvas[dy:dy + nh, dx:dx + nw] = resized
+        inp = canvas.astype(np.float32) / 255.0
         inp = inp.transpose(2, 0, 1)[None]
         feed = {sess.get_inputs()[0].name: inp}
         if len(sess.get_inputs()) > 1:  # CodeFormer: weight (fidelity)
-            feed[sess.get_inputs()[1].name] = np.array([0.5], dtype=np.float64)
+            feed[sess.get_inputs()[1].name] = np.array([float(fidelity)], dtype=np.float64)
         o = sess.run(None, feed)[0][0].transpose(1, 2, 0)
         o = np.clip(o, 0, 1)
         o = (o * 255.0).astype(np.uint8)
-        o = cv2.resize(o, (cw, ch), interpolation=cv2.INTER_CUBIC)
-        # radial Gaussian mask: full-strength in the face centre, feather at edges
+        restored = o[dy:dy + nh, dx:dx + nw]            # drop letterbox padding
+        restored = cv2.resize(restored, (cw, ch), interpolation=cv2.INTER_CUBIC)
+        # --- elliptical mask centred on the FACE bbox (not crop centre) ---
+        fx = (x1 + x2) / 2.0 - cx1
+        fy = (y1 + y2) / 2.0 - cy1
         yy, xx = np.mgrid[0:ch, 0:cw].astype(np.float32)
-        sy = (yy - ch / 2.0) / max(ch / 2.0, 1.0)
-        sx = (xx - cw / 2.0) / max(cw / 2.0, 1.0)
-        m = np.clip(1.0 - np.sqrt(sy * sy + sx * sx) ** 1.5, 0.0, 1.0)
-        m = cv2.GaussianBlur(m, (0, 0), sigmaX=max(2.0, cw / 24.0))
+        sx = (xx - fx) / max(w / 2.0 + 0.30 * cw, 1.0)
+        sy = (yy - fy) / max(h / 2.0 + 0.35 * ch, 1.0)
+        m = np.clip(1.0 - np.sqrt(sx * sx + sy * sy), 0.0, 1.0)
+        m = cv2.GaussianBlur(m, (0, 0), sigmaX=max(2.0, min(cw, ch) / 28.0))
         m = m[..., None].astype(np.float32)
-        fused = blend * o.astype(np.float32) + (1.0 - blend) * crop.astype(np.float32)
+        fused = blend * restored.astype(np.float32) + (1.0 - blend) * crop.astype(np.float32)
         out[cy1:cy2, cx1:cx2] = (m * fused + (1.0 - m) * crop.astype(np.float32)).astype(np.uint8)
     return out
 
 
-def _face_restore_frames(out_tensor, mode, det_conf, blend):
+def _face_restore_frames(out_tensor, mode, det_conf, blend, fidelity=0.5):
     """Apply face restoration to an SR tensor [n,H,W,3] float 0-1 (CPU).
 
     Returns (out_tensor, total_faces_detected)."""
@@ -840,7 +858,7 @@ def _face_restore_frames(out_tensor, mode, det_conf, blend):
             boxes = res[i].boxes.xyxy.cpu().numpy() if (res[i].boxes is not None) else np.zeros((0, 4))
             if len(boxes):
                 total += len(boxes)
-                frames[i] = _restore_faces_frame(frames[i], boxes, sess, mode, blend)
+                frames[i] = _restore_faces_frame(frames[i], boxes, sess, mode, blend, fidelity)
         chunks.append(torch.from_numpy(frames).float() / 255.0)
     return torch.cat(chunks, dim=0), total
 
@@ -886,6 +904,10 @@ class BSAI_H3_Upscale4K:
                 # How strongly the restored face is blended over the original
                 # crop. 1.0 = full restore, ~0.8 keeps a touch of original skin.
                 "face_blend": ("FLOAT", {"default": 0.85, "min": 0.1, "max": 1.0, "step": 0.05}),
+                # CodeFormer fidelity (0 = heavy regeneration for badly-broken
+                # faces, 1 = preserve original structure/details). Ignored by
+                # GFPGANv1.4.
+                "face_fidelity": ("FLOAT", {"default": 0.50, "min": 0.0, "max": 1.0, "step": 0.05}),
             },
         }
 
@@ -905,7 +927,8 @@ class BSAI_H3_Upscale4K:
     def upscale(self, images, model_name, scale, tile_size, tile_pad, batch_frames,
                 use_fp16, use_compile=True, temporal_strength=0.20,
                 detail_amount=0.30, detail_radius=1.5,
-                face_restore="Off", face_det_conf=0.25, face_blend=0.85):
+                face_restore="Off", face_det_conf=0.25, face_blend=0.85,
+                face_fidelity=0.50):
         t0 = time.time()
         path = ensure_model(model_name)
         if use_compile and torch.cuda.is_available():
@@ -936,7 +959,7 @@ class BSAI_H3_Upscale4K:
         # Face restoration (small / distant broken faces) - optional, on the SR frames
         t_fr = time.time()
         if face_restore != "Off":
-            out, _ = _face_restore_frames(out, face_restore, face_det_conf, face_blend)
+            out, _ = _face_restore_frames(out, face_restore, face_det_conf, face_blend, face_fidelity)
         fr_elapsed = time.time() - t_fr
 
         bh, bw = out.shape[1], out.shape[2]
@@ -946,7 +969,7 @@ class BSAI_H3_Upscale4K:
             f"output: {bw}x{bh} | eff_scale: {eff_scale}x | "
             f"fp16: {use_fp16} | compile: {use_compile} | tile: {tile_size} pad:{tile_pad} | "
             f"temporal: {temporal_strength} | detail: {detail_amount}@{detail_radius} | "
-            f"face: {face_restore} (conf={face_det_conf}, blend={face_blend}) | "
+            f"face: {face_restore} (conf={face_det_conf}, blend={face_blend}, fid={face_fidelity}) | "
             f"frames: {images.shape[0]} | time: {elapsed:.2f}s "
             f"(temporal+detail: {td_elapsed:.2f}s, face: {fr_elapsed:.2f}s) | "
             f"device: {'cuda' if torch.cuda.is_available() else 'cpu'}"
@@ -1035,6 +1058,7 @@ class BSAI_H3_FaceRestore:
                 "face_restore": (["Off", "GFPGANv1.4", "CodeFormer"], {"default": "GFPGANv1.4"}),
                 "face_det_conf": ("FLOAT", {"default": 0.25, "min": 0.05, "max": 0.95, "step": 0.05}),
                 "face_blend": ("FLOAT", {"default": 0.85, "min": 0.1, "max": 1.0, "step": 0.05}),
+                "face_fidelity": ("FLOAT", {"default": 0.50, "min": 0.0, "max": 1.0, "step": 0.05}),
             },
         }
 
@@ -1049,11 +1073,11 @@ class BSAI_H3_FaceRestore:
         "GFPGAN/CodeFormer regenerate, fixes small/distant broken faces."
     )
 
-    def restore(self, images, face_restore, face_det_conf, face_blend):
+    def restore(self, images, face_restore, face_det_conf, face_blend, face_fidelity=0.50):
         t0 = time.time()
-        out, nf = _face_restore_frames(images, face_restore, face_det_conf, face_blend)
+        out, nf = _face_restore_frames(images, face_restore, face_det_conf, face_blend, face_fidelity)
         info = (
-            f"face restore: {face_restore} (conf={face_det_conf}, blend={face_blend}) | "
+            f"face restore: {face_restore} (conf={face_det_conf}, blend={face_blend}, fid={face_fidelity}) | "
             f"faces detected: {nf} | frames: {images.shape[0]} | "
             f"time: {time.time() - t0:.2f}s | "
             f"device: {'cuda' if torch.cuda.is_available() else 'cpu'}"

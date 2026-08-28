@@ -51,6 +51,7 @@
 | `face_restore` | **人脸修复**：YOLOv8-Face 检测 + GFPGAN/CodeFormer 重建五官，解决 H3 **远景小脸崩坏/模糊**（Off / GFPGANv1.4 / CodeFormer） | Off |
 | `face_det_conf` | 人脸检测置信度（调低可检出更小的远脸，可能增加误检） | 0.25 |
 | `face_blend` | 修复结果与原始融合强度（1=全替换，~0.8 保留一点原皮肤） | 0.85 |
+| `face_fidelity` | **CodeFormer fidelity**（0=强重建适合严重崩坏脸，1=保留原结构细节；GFPGANv1.4 忽略） | 0.50 |
 
 > **模型选择 / Model pick（RTX 5090 实测，960×544 → 4K，compile + FP16）**
 > | 模型 | 质量 | 速度（12s/24fps 视频 ≈288 帧） |
@@ -156,6 +157,20 @@ H3 生成 → 二采 latent 放大(路线B) → VAE Decode → [BSAI H3 upscale 
 ---
 
 ## 📝 更新日志 / Changelog
+
+### v1.4.2 — 人脸修复质量修复 / Face-restore quality fix
+- **修复「修复后五官不全 / 双眼变形 / 叠影」**（真实 H3 帧复现并解决）：
+  - **根因**：旧版把非正方形的脸 crop **非等比拉伸**到 512×512 再喂 GFPGAN/CodeFormer，
+    输入变形导致生成式模型重建时五官错位 → 融合后出现重影/五官缺失
+  - **修复**：改为 **aspect-preserving letterbox**（保持纵横比、补边到 512²，推理后去边还原），
+    重建的五官与原始位置对齐，融合无重影
+  - 融合 mask 从「crop 中心径向」改为「**以人脸检测框为中心**的椭圆 mask」，
+    强度峰值对准五官、向发际/背景羽化，杜绝边缘叠影
+  - crop pad 加宽（横向 0.45×宽 / 纵向 0.50×高），确保下巴/额头完整入框
+- **新增 `face_fidelity` 参数**（0–1，默认 0.5，仅 CodeFormer 生效）：
+  0 = 强重建（适合严重崩坏脸），1 = 保留原结构细节；GFPGANv1.4 忽略该参数
+- 实测（RTX 5090，真实 H3 帧 00004 崩坏脸）：修复后五官完整重建，无叠影无变形，
+  单脸推理 GFPGAN ~0.33s / CodeFormer ~0.06–0.2s
 
 ### v1.4.1 — 独立人脸修复节点 / Standalone face-restore node
 - **新增独立节点 `BSAI H3 Face Restore`**：任何视频/图片帧可直接单独调用

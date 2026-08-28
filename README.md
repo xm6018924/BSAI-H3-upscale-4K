@@ -96,6 +96,25 @@ H3 专属 latent 空间放大，自动对齐 32 像素网格，用于**第二遍
 
 **输出**: `LATENT`、`width`、`height`、`effective_scale`、`info`
 
+### 3️⃣ BSAI H3 Face Restore（独立人脸修复，任意工作流可用）
+
+不依赖超分链，**任何视频/图片帧**（`IMAGE`）直接修人脸：
+```
+H3 解码 / 任意视频帧 → [BSAI H3 Face Restore] → 修复后帧
+```
+
+| 参数 | 说明 | 默认 |
+|---|---|---|
+| `images` | 任意视频/图片帧 `[B,H,W,3]` | — |
+| `face_restore` | GFPGANv1.4 / CodeFormer / Off | GFPGANv1.4 |
+| `face_det_conf` | 人脸检测置信度（调低检出更小远脸） | 0.25 |
+| `face_blend` | 修复融合强度（1=全替换，~0.8 保留原皮肤） | 0.85 |
+
+**输出**: `IMAGE`（修复后帧）、`faces_detected`（检测人脸总数）、`info`
+
+> 与超分节点的 `face_restore` 参数共用同一套检测/修复引擎与模型缓存；
+> 模型缺失或未启用时自动原样透传，不会崩工作流。
+
 ---
 
 ## 🎬 H3 工作流推荐用法 / Recommended H3 workflow
@@ -137,6 +156,11 @@ H3 生成 → 二采 latent 放大(路线B) → VAE Decode → [BSAI H3 upscale 
 ---
 
 ## 📝 更新日志 / Changelog
+
+### v1.4.1 — 独立人脸修复节点 / Standalone face-restore node
+- **新增独立节点 `BSAI H3 Face Restore`**：任何视频/图片帧可直接单独调用
+  （`IMAGE` → 修复后 `IMAGE` + 检测脸数 + 诊断信息），不依赖超分链
+- 与超分节点共用同一检测/修复引擎与模型缓存；模型缺失自动透传不崩工作流
 
 ### v1.4.0 — 人脸修复 / Face restoration
 - **新增人脸修复**（`face_restore` / `face_det_conf` / `face_blend`）：

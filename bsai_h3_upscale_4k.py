@@ -816,17 +816,20 @@ def _restore_faces_frame(img, boxes, sess, mode, blend):
 
 
 def _face_restore_frames(out_tensor, mode, det_conf, blend):
-    """Apply face restoration to an SR tensor [n,H,W,3] float 0-1 (CPU)."""
+    """Apply face restoration to an SR tensor [n,H,W,3] float 0-1 (CPU).
+
+    Returns (out_tensor, total_faces_detected)."""
     if mode == "Off" or not _HAS_CV2 or not torch.cuda.is_available():
-        return out_tensor
+        return out_tensor, 0
     try:
         det, sess = _face_models(mode)
     except Exception as e:  # never crash the main upscale on face issues
         print(f"[BSAI-H3] face restore unavailable ({e}); skipping")
-        return out_tensor
+        return out_tensor, 0
     n = out_tensor.shape[0]
     det_bs = min(8, n)
     chunks = []
+    total = 0
     for s in range(0, n, det_bs):
         seg = out_tensor[s:s + det_bs]
         frames = (seg.clamp(0, 1).numpy() * 255.0).astype(np.uint8)
@@ -836,9 +839,10 @@ def _face_restore_frames(out_tensor, mode, det_conf, blend):
         for i in range(len(frames)):
             boxes = res[i].boxes.xyxy.cpu().numpy() if (res[i].boxes is not None) else np.zeros((0, 4))
             if len(boxes):
+                total += len(boxes)
                 frames[i] = _restore_faces_frame(frames[i], boxes, sess, mode, blend)
         chunks.append(torch.from_numpy(frames).float() / 255.0)
-    return torch.cat(chunks, dim=0)
+    return torch.cat(chunks, dim=0), total
 
 
 # ---------------------------------------------------------------------------
@@ -932,7 +936,7 @@ class BSAI_H3_Upscale4K:
         # Face restoration (small / distant broken faces) - optional, on the SR frames
         t_fr = time.time()
         if face_restore != "Off":
-            out = _face_restore_frames(out, face_restore, face_det_conf, face_blend)
+            out, _ = _face_restore_frames(out, face_restore, face_det_conf, face_blend)
         fr_elapsed = time.time() - t_fr
 
         bh, bw = out.shape[1], out.shape[2]
@@ -1015,12 +1019,56 @@ class BSAI_H3_Upscale4K_Latent:
         return (result, po_w, po_h, float(eff), info)
 
 
+# ---------------------------------------------------------------------------
+# Standalone face-restore node: works on any video / image frames, no upscale.
+# Fixes H3 small / distant broken faces anywhere in a workflow.
+# ---------------------------------------------------------------------------
+class BSAI_H3_FaceRestore:
+    """Detect faces (YOLOv8-Face) and regenerate facial structure with
+    GFPGAN / CodeFormer (ONNX + GPU). Works standalone on any IMAGE frames."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images": ("IMAGE",),
+                "face_restore": (["Off", "GFPGANv1.4", "CodeFormer"], {"default": "GFPGANv1.4"}),
+                "face_det_conf": ("FLOAT", {"default": 0.25, "min": 0.05, "max": 0.95, "step": 0.05}),
+                "face_blend": ("FLOAT", {"default": 0.85, "min": 0.1, "max": 1.0, "step": 0.05}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "INT", "STRING")
+    RETURN_NAMES = ("IMAGE", "faces_detected", "info")
+    FUNCTION = "restore"
+    CATEGORY = "BSAI/H3"
+    DESCRIPTION = (
+        "独立人脸修复节点：YOLOv8-Face 检测 + GFPGAN/CodeFormer 重建五官，\n"
+        "解决 H3 中远景小脸崩坏 / 五官模糊丢失，可在任意工作流单独使用。\n"
+        "Standalone face restoration for any frames: YOLOv8-Face detect +\n"
+        "GFPGAN/CodeFormer regenerate, fixes small/distant broken faces."
+    )
+
+    def restore(self, images, face_restore, face_det_conf, face_blend):
+        t0 = time.time()
+        out, nf = _face_restore_frames(images, face_restore, face_det_conf, face_blend)
+        info = (
+            f"face restore: {face_restore} (conf={face_det_conf}, blend={face_blend}) | "
+            f"faces detected: {nf} | frames: {images.shape[0]} | "
+            f"time: {time.time() - t0:.2f}s | "
+            f"device: {'cuda' if torch.cuda.is_available() else 'cpu'}"
+        )
+        return (out, nf, info)
+
+
 NODE_CLASS_MAPPINGS = {
     "BSAI_H3_Upscale4K": BSAI_H3_Upscale4K,
     "BSAI_H3_Upscale4K_Latent": BSAI_H3_Upscale4K_Latent,
+    "BSAI_H3_FaceRestore": BSAI_H3_FaceRestore,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "BSAI_H3_Upscale4K": "BSAI H3 upscale 4K / 视频超分",
     "BSAI_H3_Upscale4K_Latent": "BSAI H3 upscale 4K Latent / H3潜空间放大",
+    "BSAI_H3_FaceRestore": "BSAI H3 Face Restore / 人脸修复",
 }

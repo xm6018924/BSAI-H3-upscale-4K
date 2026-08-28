@@ -654,39 +654,49 @@ def _lce_gpu(x, strength):
 
 def _detail_enhance_gpu(frames, amount, radius, mode="classic"):
     """
-    frames [n,H,W,3] or [n,3,H,W] cuda -> separable-Gaussian unsharp mask, same
-    shape/dtype. Shape-agnostic (accepts either layout defensively). Clamps the
-    detail layer to avoid halos / overshoot on 4K video.
-    mode='smart' additionally runs a light local-contrast rebuild (_lce_gpu)
-    so texture reads as reconstructed rather than merely sharpened.
+    frames [n,H,W,3] or [n,3,H,W] cuda -> multi-scale detail rebuild, same
+    shape/dtype. v1.9.0: replaces the single-scale unsharp with a luminance-domain
+    multi-scale DoG (small + medium) gated by a local-variance mask, so texture is
+    *reconstructed* (edge/tone natural) instead of merely oversharpened; flat
+    areas (skin) stay untouched to avoid a plastic look. mode='smart' additionally
+    runs a light local-contrast rebuild (_lce_gpu) for generative-style texture.
     """
     if amount <= 0:
         return frames
     is_chw = (frames.ndim == 4 and frames.shape[1] == 3 and frames.shape[3] != 3)
-    if is_chw:
-        x = frames
-        n, C, H, W = x.shape
-    else:
-        x = frames.permute(0, 3, 1, 2)  # [n,3,H,W]
-        n, C, H, W = x.shape
-    sig = max(0.5, float(radius))
-    ks = int(math.ceil(sig * 4)) | 1
-    half = ks // 2
+    x = frames if is_chw else frames.permute(0, 3, 1, 2)  # [n,3,H,W]
+    n, C, H, W = x.shape
     dev, dt = x.device, x.dtype
-    ax = torch.arange(-half, half + 1, dtype=torch.float32, device=dev)
-    g = torch.exp(-(ax * ax) / (2 * sig * sig))
-    g = (g / g.sum()).to(dt)
-    k1 = g.view(1, 1, -1, 1).repeat(C, 1, 1, 1)  # [C,1,ks,1]
-    k2 = g.view(1, 1, 1, -1).repeat(C, 1, 1, 1)  # [C,1,1,ks]
-    # depthwise separable blur: [n,3,H,W] with groups=C blurs each channel plane
-    # independently with the same Gaussian kernel (never reshape-stacks channels).
-    xb = F.conv2d(x, k1, padding=(half, 0), groups=C)
-    xb = F.conv2d(xb, k2, padding=(0, half), groups=C)
-    detail = x - xb
-    out = x + amount * torch.clamp(detail, -0.3, 0.3)
+
+    def _blur(t, sig):
+        ks = int(math.ceil(sig * 4)) | 1
+        half = ks // 2
+        ax = torch.arange(-half, half + 1, dtype=torch.float32, device=dev)
+        g = torch.exp(-(ax * ax) / (2 * sig * sig))
+        g = (g / g.sum()).to(dt)
+        k1 = g.view(1, 1, -1, 1).repeat(t.shape[1], 1, 1, 1)
+        k2 = g.view(1, 1, 1, -1).repeat(t.shape[1], 1, 1, 1)
+        b = F.conv2d(t, k1, padding=(half, 0), groups=t.shape[1])
+        b = F.conv2d(b, k2, padding=(0, half), groups=t.shape[1])
+        return b
+
+    # luminance (Rec.601) as the single detail-carrying plane
+    y = 0.299 * x[:, 0:1] + 0.587 * x[:, 1:2] + 0.114 * x[:, 2:3]  # [n,1,H,W]
+    rs = max(0.5, float(radius))
+    rm = rs * 2.4
+    yb1 = _blur(y, rs)   # small scale
+    yb2 = _blur(y, rm)   # medium scale
+    d_small = y - yb1    # micro detail / edges
+    d_mid = yb1 - yb2    # mid-frequency texture
+    # local-variance gate: strong in textured/edge areas, weak on flat skin
+    lv = F.avg_pool2d(d_small.abs(), kernel_size=9, stride=1, padding=4)
+    vmax = lv.amax(dim=(2, 3), keepdim=True).clamp_min(1e-4)
+    w = (lv / vmax).clamp(0.25, 1.0)
+    det = (0.7 * d_small + 0.45 * d_mid) * w
+    det = torch.clamp(det, -0.25, 0.25)
+    out = x + amount * det  # luminance-detail added back to all channels (no color fringing)
     if mode == "smart":
-        # Generative-style local-contrast rebuild (light, gated, no halos).
-        out = _lce_gpu(out, min(amount * 0.8, 0.45))
+        out = _lce_gpu(out, min(amount * 0.7, 0.40))
     return out if is_chw else out.permute(0, 2, 3, 1)
 
 

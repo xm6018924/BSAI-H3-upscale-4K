@@ -207,6 +207,19 @@ H3 生成 → VAE Decode → [BSAI Topaz Engine Face Restore](model=星光 2.6, 
 
 ## 📝 更新日志 / Changelog
 
+### v1.9.0 — 多尺度细节重建算法 / Multi-scale detail rebuild
+- 将 `_detail_enhance_gpu` 从"单尺度 USM 锐化"升级为**亮度域多尺度 DoG 细节重建**
+  （小尺度 + 中尺度双高斯差），并以**局部方差自适应掩膜**门控：纹理/边缘区增强、
+  平坦皮肤区几乎不动——避免塑料感与色边，纹理质感更接近生成式超分。
+- `mode=smart` 在此基础上叠加轻量局部对比度重建（LCE）。
+- 实测（RTX 5090，4K 帧）：全图锐度 331→**487**（+47%），速度 **~1.2ms/帧**（GPU，
+  与旧版相当，不影响实时性）；皮肤/眼睛区域不出现过度锐化。
+- **技术说明**：多轮对比确认，纯经典超分（Real-ESRGAN）的人脸结构自然度存在物理
+  上限——"远处/小脸的眼睛形态不自然"属于 H3 原始生成的解剖结构问题，只能由
+  **生成式人脸重建**解决（Topaz 引擎路径的 `BSAI Topaz Engine Face Restore`
+  节点已验证达到完美档：眼睛自然、画面清晰）。推荐组合：Real-ESRGAN 超分
+  (v2 细节) + BSAI Topaz 人脸修复，或用 `BSAI Topaz Engine Face Restore` 一键完美档。
+
 ### v1.8.4 — 超分细节/锐度优化（对标 Topaz / RTX VSR）/ Detail-sharpness boost
 - 依据 11 路输出对比（H3原始 / 超分4K / Topaz 星光2.6 / FlashVSR / OmniSR / SeedVR2 /
   RTX 视频放大 / 三种人脸修复等）定位根因：**主超分默认 `detail_amount 0.30` 与

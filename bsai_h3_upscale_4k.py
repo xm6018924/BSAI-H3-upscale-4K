@@ -1033,22 +1033,281 @@ class BSAI_H3_Upscale4K:
         return (out, bw, bh, float(eff_scale), info)
 
 
+# ===========================================================================
+# Learned H3 latent upscaler (3D conv network)
+# ---------------------------------------------------------------------------
+# 方法借鉴自 Comfyui_Minimax_h3_latent_Upscaler (LBH-123-AI)：用训练好的 3D
+# 卷积网络在 24 通道 H3 VAE latent 空间放大（比双线性/双三次插值更干净，可配合
+# H3 第二遍采样精修）。仅借鉴方法，不包含任何第三方权重；模型文件由用户放入
+# ComfyUI/models/latent_upscale_models/（如 minimax_h3_latent_upscaler_3d_fp16.safetensors）。
+# 实现为 torch 原生（零 einops 依赖），推理时自动检测网络结构并加载权重。
+# ===========================================================================
+import glob
+import re
+
+_LATENT_UPSCALE_FOLDER = "latent_upscale_models"
+if _LATENT_UPSCALE_FOLDER not in folder_paths.folder_names_and_paths:
+    folder_paths.add_model_folder_path(
+        _LATENT_UPSCALE_FOLDER,
+        os.path.join(folder_paths.models_dir, _LATENT_UPSCALE_FOLDER),
+    )
+
+# 24-channel Minimax H3 latent normalization stats (from the upscaler's training code).
+_LATENTS_MEAN = [0.858090341091156, -0.9606591463088989, 1.0661640167236328, -0.5090325474739075,
+                 -0.2727581858634949, -1.3675414323806763, -0.2553254961967468, -0.26907554268836975,
+                 -0.5376840829849243, -0.0464097298681736, 0.6657370328903198, 0.19690127670764923,
+                 -0.5460608005523682, -0.4035342037677765, -0.23683024942874908, 0.25928452610969543,
+                 -0.30133944749832153, 0.211341992020607, -1.1206848621368408, 0.3581933379173279,
+                 -0.04225143790245056, 0.2604829967021942, 0.22864092886447906, 0.7056031823158264]
+_LATENTS_STD = [1.2223774194717407, 1.2767263650894165, 1.6831774711608887, 1.7549455165863037,
+                1.5636216402053833, 2.194143533706665, 0.9653137922286987, 1.0569885969161987,
+                0.841948926448822, 0.7729952931404114, 1.8955937623977661, 0.946841835975647,
+                0.7996809482574463, 0.44988900423049927, 0.7197399735450745, 0.6936293244361877,
+                2.961095094680786, 2.7694199085235596, 3.0496184825897217, 2.1088054180145264,
+                3.276226282119751, 3.1627357006073, 2.2816812992095947, 2.6127843856811523]
+
+
+def _latent_norm_tensors(device, dtype):
+    mean = torch.tensor(_LATENTS_MEAN, dtype=dtype, device=device).view(1, -1, 1, 1, 1)
+    std = torch.tensor(_LATENTS_STD, dtype=dtype, device=device).view(1, -1, 1, 1, 1)
+    return mean, std
+
+
+def _gn3d(channels):
+    return nn.GroupNorm(32, channels)
+
+
+def _zero_mod3d(module):
+    for p in module.parameters():
+        p.detach().zero_()
+    return module
+
+
+class _Attn3D(nn.Module):
+    def __init__(self, c):
+        super().__init__()
+        self.norm = _gn3d(c)
+        self.q = nn.Conv3d(c, c, 1)
+        self.k = nn.Conv3d(c, c, 1)
+        self.v = nn.Conv3d(c, c, 1)
+        self.proj_out = nn.Conv3d(c, c, 1)
+
+    def forward(self, x):
+        B, C, T, H, W = x.shape
+        h = self.norm(x)
+        q = self.q(h).flatten(2).transpose(1, 2).unsqueeze(1)  # (B,1,L,C)
+        k = self.k(h).flatten(2).transpose(1, 2).unsqueeze(1)
+        v = self.v(h).flatten(2).transpose(1, 2).unsqueeze(1)
+        h = F.scaled_dot_product_attention(q, k, v)
+        h = h.squeeze(1).transpose(1, 2).view(B, C, T, H, W)
+        return x + self.proj_out(h)
+
+
+class _ResEmb3D(nn.Module):
+    def __init__(self, c, emb_c, dropout=0, out_c=None):
+        super().__init__()
+        self.out_channels = out_c or c
+        self.in_layers = nn.Sequential(_gn3d(c), nn.SiLU(), nn.Conv3d(c, self.out_channels, 3, padding=1))
+        self.emb_layers = nn.Sequential(nn.SiLU(), nn.Linear(emb_c, 2 * self.out_channels))
+        self.out_norm = _gn3d(self.out_channels)
+        self.out_layers = nn.Sequential(nn.SiLU(), nn.Dropout(p=dropout),
+                                        _zero_mod3d(nn.Conv3d(self.out_channels, self.out_channels, 3, padding=1)))
+        self.skip = nn.Conv3d(c, self.out_channels, 1) if self.out_channels != c else nn.Identity()
+
+    def forward(self, x, emb):
+        h = self.in_layers(x)
+        emb_out = self.emb_layers(emb).type(h.dtype)
+        while len(emb_out.shape) < len(h.shape):
+            emb_out = emb_out[..., None]
+        scale, shift = torch.chunk(emb_out, 2, dim=1)
+        h = self.out_norm(h) * (1 + scale) + shift
+        h = self.out_layers(h)
+        return self.skip(x) + h
+
+
+class _TemporalConv3D(nn.Module):
+    def __init__(self, c, k=5):
+        super().__init__()
+        p = k // 2
+        self.norm = _gn3d(c)
+        self.dwconv = nn.Conv3d(c, c, kernel_size=(k, 1, 1), padding=(p, 0, 0), groups=c)
+        self.pwconv = nn.Conv3d(c, c, kernel_size=1)
+        nn.init.zeros_(self.pwconv.weight)
+        nn.init.zeros_(self.pwconv.bias)
+
+    def forward(self, x):
+        return x + self.pwconv(F.silu(self.dwconv(self.norm(x))))
+
+
+class _LatentResizer3D(nn.Module):
+    """Pure-3D latent resizer (arch identical to the reference upscaler)."""
+
+    def __init__(self, in_channels=24, in_blocks=12, out_blocks=12, channels=512,
+                 dropout=0.1, attn=False, temporal_every=2, temporal_kernel=5):
+        super().__init__()
+        self.conv_in = nn.Conv3d(in_channels, channels, 3, padding=1)
+        embed_dim = 64
+        self.embed = nn.Sequential(nn.Linear(1, embed_dim), nn.SiLU(), nn.Linear(embed_dim, embed_dim))
+        self.in_blocks = nn.ModuleList()
+        for b in range(in_blocks):
+            if (b == 1 or b == in_blocks - 1) and attn:
+                self.in_blocks.append(_Attn3D(channels))
+            self.in_blocks.append(_ResEmb3D(channels, embed_dim, dropout))
+            if temporal_every > 0 and b % temporal_every == 0:
+                self.in_blocks.append(_TemporalConv3D(channels, temporal_kernel))
+        self.out_blocks = nn.ModuleList()
+        for b in range(out_blocks):
+            if (b == 1 or b == out_blocks - 1) and attn:
+                self.out_blocks.append(_Attn3D(channels))
+            self.out_blocks.append(_ResEmb3D(channels, embed_dim, dropout))
+            if temporal_every > 0 and b % temporal_every == 0:
+                self.out_blocks.append(_TemporalConv3D(channels, temporal_kernel))
+        self.norm_out = _gn3d(channels)
+        self.conv_out = nn.Conv3d(channels, in_channels, 3, padding=1)
+
+    def forward(self, x, scale=None, target_size=None):
+        if target_size is not None:
+            size = target_size
+        elif scale is not None:
+            size = tuple(int(round(s * scale)) for s in x.shape[-3:])
+        else:
+            return x
+        if size == x.shape[-3:]:
+            return x
+        emb = self.embed(torch.tensor([scale - 1 if scale is not None else 0.0],
+                                      dtype=x.dtype, device=x.device).unsqueeze(0))
+        x = self.conv_in(x)
+        for b in self.in_blocks:
+            if isinstance(b, _ResEmb3D):
+                x = b(x, emb.expand(x.shape[0], -1))
+            else:
+                x = b(x)
+        x = F.interpolate(x, size=size, mode="trilinear", align_corners=False)
+        for b in self.out_blocks:
+            if isinstance(b, _ResEmb3D):
+                x = b(x, emb.expand(x.shape[0], -1))
+            else:
+                x = b(x)
+        x = self.norm_out(x)
+        x = F.silu(x)
+        return self.conv_out(x)
+
+
+_LATENT_MODEL_CACHE = {}
+
+
+def _scan_latent_models():
+    try:
+        dirs = folder_paths.get_folder_paths(_LATENT_UPSCALE_FOLDER)
+    except Exception:
+        dirs = [os.path.join(folder_paths.models_dir, _LATENT_UPSCALE_FOLDER)]
+    out = []
+    for d in dirs:
+        for ext in ("*.safetensors", "*.pth"):
+            out.extend(glob.glob(os.path.join(d, ext)))
+    return sorted(os.path.basename(f) for f in out)
+
+
+def _pick_default_latent_model(models):
+    for pref in ("minimax_h3_latent_upscaler_3d", "minimax_h3", "minimax"):
+        for m in models:
+            if pref in m:
+                return m
+    return models[0]
+
+
+def _load_latent_3d_model(name, device, precision):
+    key = f"{name}::{device}::{precision}"
+    if key in _LATENT_MODEL_CACHE:
+        return _LATENT_MODEL_CACHE[key]
+    try:
+        dirs = folder_paths.get_folder_paths(_LATENT_UPSCALE_FOLDER)
+    except Exception:
+        dirs = [os.path.join(folder_paths.models_dir, _LATENT_UPSCALE_FOLDER)]
+    path = next((os.path.join(d, name) for d in dirs if os.path.exists(os.path.join(d, name))), None)
+    if path is None:
+        raise FileNotFoundError(f"latent upscaler model not found: {name} in {dirs}")
+    if path.endswith(".safetensors"):
+        from safetensors.torch import load_file
+        sd = load_file(path, device="cpu")
+    else:
+        sd = torch.load(path, map_location="cpu", weights_only=False)
+    if isinstance(sd, dict) and "model" in sd:
+        sd = sd["model"]
+    sd = {k: (v.to(torch.float16) if v.dtype == torch.float8_e4m3fn else v) for k, v in sd.items()}
+    if any(k.startswith("upscaler.") for k in sd):
+        sd = {k[len("upscaler."):]: v for k, v in sd.items() if k.startswith("upscaler.")}
+    cfg = {"in_channels": 24, "in_blocks": 12, "out_blocks": 12, "channels": 512,
+           "dropout": 0.1, "attn": False, "temporal_every": 2, "temporal_kernel": 5}
+    if "conv_in.weight" in sd:
+        cfg["in_channels"] = sd["conv_in.weight"].shape[1]
+        cfg["channels"] = sd["conv_in.weight"].shape[0]
+    in_ids, out_ids, t_in, t_out = set(), set(), set(), set()
+    for k in sd.keys():
+        m = re.match(r"in_blocks\.(\d+)\.in_layers\.", k)
+        if m:
+            in_ids.add(int(m.group(1)))
+        m = re.match(r"out_blocks\.(\d+)\.in_layers\.", k)
+        if m:
+            out_ids.add(int(m.group(1)))
+        m = re.match(r"in_blocks\.(\d+)\.dwconv\.weight", k)
+        if m:
+            t_in.add(int(m.group(1)))
+        m = re.match(r"out_blocks\.(\d+)\.dwconv\.weight", k)
+        if m:
+            t_out.add(int(m.group(1)))
+    if in_ids:
+        cfg["in_blocks"] = len(in_ids)
+    if out_ids:
+        cfg["out_blocks"] = len(out_ids)
+    if t_in or t_out:
+        cfg["temporal_every"] = 2
+        for k in sd:
+            if k.endswith("dwconv.weight"):
+                cfg["temporal_kernel"] = sd[k].shape[2]
+                break
+    else:
+        cfg["temporal_every"] = 0
+    model = _LatentResizer3D(**cfg)
+    model.load_state_dict(sd, strict=True)
+    model = model.to(device).eval().requires_grad_(False)
+    dt = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}.get(precision, torch.float16)
+    if dt != torch.float32:
+        model = model.to(dt)
+    _LATENT_MODEL_CACHE[key] = model
+    print(f"[BSAI-H3] loaded learned latent upscaler: {name} "
+          f"({cfg['in_blocks']}in/{cfg['out_blocks']}out, ch={cfg['channels']}, "
+          f"temporal={'on' if cfg['temporal_every'] else 'off'}) {precision}")
+    return model
+
+
 # ---------------------------------------------------------------------------
 # Latent node: H3 latent -> enlarged latent (32px aligned, second-pass refine)
+#   - learned-3d (default): trained 3D-conv latent upscaler (borrowed method)
+#   - nearest-exact / bilinear / area / bicubic / bislerp: classic interpolation
 # ---------------------------------------------------------------------------
 class BSAI_H3_Upscale4K_Latent:
     """H3 latent-space upscale aligned to the 32-px grid for safe second-pass sampling."""
 
-    upscale_methods = ["nearest-exact", "bilinear", "area", "bicubic", "bislerp"]
+    upscale_methods = ["learned-3d", "nearest-exact", "bilinear", "area", "bicubic", "bislerp"]
 
     @classmethod
     def INPUT_TYPES(cls):
+        models = _scan_latent_models()
+        if models:
+            model_opts = models
+            model_def = _pick_default_latent_model(models)
+        else:
+            model_opts = ["(未找到模型，请放入 models/latent_upscale_models/)"]
+            model_def = model_opts[0]
         return {
             "required": {
                 "samples": ("LATENT",),
-                "upscale_method": (cls.upscale_methods,),
-                "scale_by": ("FLOAT", {"default": 1.5, "min": 0.01, "max": 8.0, "step": 0.01}),
-            }
+                "upscale_method": (cls.upscale_methods, {"default": "learned-3d"}),
+                "scale_by": ("FLOAT", {"default": 1.5, "min": 1.0, "max": 8.0, "step": 0.01}),
+                "model_name": (model_opts, {"default": model_def}),
+                "precision": (["fp32", "fp16", "bf16"], {"default": "fp16"}),
+            },
         }
 
     RETURN_TYPES = ("LATENT", "INT", "INT", "FLOAT", "STRING")
@@ -1057,7 +1316,12 @@ class BSAI_H3_Upscale4K_Latent:
     CATEGORY = "BSAI/H3"
     DESCRIPTION = (
         "H3 专属 latent 放大：自动 32 像素对齐，供 H3 第二遍采样补细节（保持人物一致性）。\n"
-        "H3-specific latent upscale with 32-px alignment for second-pass detail refine."
+        "learned-3d = 训练好的 3D 卷积 latent 超分网络（方法借鉴 Minimax_h3_latent_Upscaler，\n"
+        "需在 models/latent_upscale_models/ 放置 minimax_h3_latent_upscaler_3d_fp16.safetensors）；\n"
+        "其余为经典插值回退。\n"
+        "H3-specific latent upscale with 32-px alignment: learned-3d = trained 3D-conv\n"
+        "latent SR network (method borrowed, weight in models/latent_upscale_models/),\n"
+        "other methods = classic interpolation fallback."
     )
 
     LATENT_ALIGNMENT = 2
@@ -1081,10 +1345,67 @@ class BSAI_H3_Upscale4K_Latent:
         long_out = min(candidates, key=lambda c: (abs(c - ideal_long), c))
         return (long_out, short_out) if long_is_width else (short_out, long_out)
 
-    def upscale(self, samples, upscale_method, scale_by):
+    def _upscale_learned(self, samples, source, lw, lh, scale_by, model_name, precision):
+        if scale_by < 1.0:
+            raise ValueError("learned-3d 仅支持放大 (scale_by >= 1.0)")
+        if scale_by > 4.0:
+            raise ValueError("learned-3d 网络仅支持 1.0-4.0 倍放大，请调低 scale_by")
+        if not torch.cuda.is_available():
+            raise RuntimeError("learned-3d 需要 CUDA GPU")
+        models = _scan_latent_models()
+        if not models:
+            raise FileNotFoundError(
+                "未找到学习型 latent 模型。请将 minimax_h3_latent_upscaler_3d_fp16.safetensors "
+                "放入 ComfyUI/models/latent_upscale_models/")
+        name = model_name if (model_name in models) else _pick_default_latent_model(models)
+        dt = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}[precision]
+        dev = torch.device("cuda")
+        model = _load_latent_3d_model(name, dev, precision)
+        s = source.to(device=dev, dtype=dt, copy=True)
+        was_4d = s.dim() == 4
+        if was_4d:
+            s = s.unsqueeze(2)
+        b, c, t, h_in, w_in = s.shape
+        ds = self.H3_VAE_SPATIAL_DOWNSCALE  # 16
+        # pixel-space target (scale by multiplier)
+        w_px = w_in * ds * scale_by
+        h_px = h_in * ds * scale_by
+        # align to 32-px pixel grid, width drives, keep proportion
+        align = 32
+        w_px_a = round(w_px / align) * align
+        h_px_a = w_px_a / (w_in / h_in)
+        # snap to VAE grid so latent sizes are exact integers
+        w_px_f = round(w_px_a / ds) * ds
+        h_px_f = round(h_px_a / ds) * ds
+        w_out = max(1, int(w_px_f // ds))
+        h_out = max(1, int(h_px_f // ds))
+        if w_out == w_in and h_out == h_in:
+            return (samples, w_in * ds, h_in * ds, 1.0,
+                    f"learned-3d: no-op (same size) | model={name} | {precision}")
+        norm_mean, norm_std = _latent_norm_tensors(dev, dt)
+        with torch.inference_mode():
+            s.sub_(norm_mean).div_(norm_std)
+            out = model(s, scale=scale_by, target_size=(t, h_out, w_out))
+            del s
+            out.mul_(norm_std).add_(norm_mean)
+        if was_4d:
+            out = out.squeeze(2)
+        out = out.to(device="cpu", dtype=source.dtype)
+        torch.cuda.empty_cache()
+        result = samples.copy()
+        result["samples"] = out
+        eff_actual = w_out / w_in
+        info = (f"latent {lw}x{lh} -> {w_out}x{h_out} | pixel {w_in * ds}x{h_in * ds} -> "
+                f"{w_out * ds}x{h_out * ds} | eff_scale {eff_actual:.4f}x | "
+                f"learned-3d: {name} | {precision}")
+        return (result, w_out * ds, h_out * ds, float(eff_actual), info)
+
+    def upscale(self, samples, upscale_method, scale_by, model_name="", precision="fp16"):
         import comfy.utils
         source = samples["samples"]
         lw, lh = source.shape[-1], source.shape[-2]
+        if upscale_method == "learned-3d":
+            return self._upscale_learned(samples, source, lw, lh, scale_by, model_name, precision)
         ow, oh = self._calculate_aligned_size(lw, lh, scale_by)
         result = samples.copy()
         result["samples"] = comfy.utils.common_upscale(source, ow, oh, upscale_method, "disabled")

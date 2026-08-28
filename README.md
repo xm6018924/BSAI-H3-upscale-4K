@@ -93,8 +93,14 @@ H3 专属 latent 空间放大，自动对齐 32 像素网格，用于**第二遍
 | 参数 | 说明 | 默认 |
 |---|---|---|
 | `samples` | H3 视频 latent | — |
-| `upscale_method` | nearest-exact / bilinear / area / bicubic / bislerp | bilinear |
-| `scale_by` | 放大倍率 | 1.5 |
+| `upscale_method` | **learned-3d**（训练好的 3D 卷积 latent 超分网络，方法借鉴 Minimax_h3_latent_Upscaler）/ nearest-exact / bilinear / area / bicubic / bislerp | learned-3d |
+| `scale_by` | 放大倍率（learned-3d 支持 1.0–4.0） | 1.5 |
+| `model_name` | `latent_upscale_models/` 下的 latent 超分模型 | 自动选 minimax 3D |
+| `precision` | fp32 / fp16 / bf16 推理精度 | fp16 |
+
+> **learned-3d 模式**需要先把权重放入 `ComfyUI/models/latent_upscale_models/`：
+> `minimax_h3_latent_upscaler_3d_fp16.safetensors`（约 0.64 GB，来源 LBH-123-AI/Minimax_h3_latent_Upscaler）。
+> 未放模型时会明确报错提示，不会静默失败。其余方法为经典插值回退（零依赖）。
 
 **输出**: `LATENT`、`width`、`height`、`effective_scale`、`info`
 
@@ -158,6 +164,18 @@ H3 生成 → 二采 latent 放大(路线B) → VAE Decode → [BSAI H3 upscale 
 ---
 
 ## 📝 更新日志 / Changelog
+
+### v1.6.0 — Latent 节点升级为学习型 3D 卷积超分 / Learned latent upscaler
+- **`BSAI H3 upscale 4K Latent` 新增 `learned-3d` 模式**（默认）：
+  - 方法借鉴 [Minimax_h3_latent_Upscaler](https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler)
+    —— 用训练好的 **3D 卷积网络**在 24 通道 H3 VAE latent 空间放大，比双线性/双三次插值更干净、
+    无重影鬼影，可配合 H3 第二遍采样精修
+  - 自动检测网络结构（in/out blocks、channels、temporal）并加载权重；fp16/bf16 推理；
+    像素空间 32px 对齐 + 保持宽高比；模型进程级缓存
+  - **不含任何第三方权重**：模型文件由用户放入 `ComfyUI/models/latent_upscale_models/`
+    （`minimax_h3_latent_upscaler_3d_fp16.safetensors`，约 0.64 GB）
+  - 其余方法（nearest-exact / bilinear / area / bicubic / bislerp）保留为插值回退，零依赖
+- 实测（RTX 5090，4 帧 1280×704 latent → 2×）：2560×1408 输出，eff=2.0；scale=2.67 → 3424×1888
 
 ### v1.5.0 — 借鉴 Topaz 星光的精确倍率 + 柔和度 / Topaz-style scale & softness
 - **`scale` 升级为 FLOAT（1.0–8.0，支持小数精确档位 1.78 / 2.67 / 3.0 等）**

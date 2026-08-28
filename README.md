@@ -207,6 +207,12 @@ H3 生成 → VAE Decode → [BSAI Topaz Engine Face Restore](model=星光 2.6, 
 
 ## 📝 更新日志 / Changelog
 
+### v1.8.2 — Topaz 引擎统一共用目录 / Shared engine dir
+- 引擎路径统一为 **`ComfyUI/models/Topaz_Engine`**（相对 ComfyUI 根动态解析，
+  不写死绝对路径），与第三方 TopazStarlight 节点**共用同一引擎**。
+- 兼容旧路径 `ComfyUI/topaz_engine`（若存在自动回退，引擎迁移后优先新目录）。
+- 已实测：两插件均解析到 `models/Topaz_Engine`，neuroserver + 星光 2.6 权重 + 授权齐全。
+
 ### v1.8.1 — 节点更名 + 模型自由选择 + 引擎路径默认化
 - 节点更名为 **`BSAI Topaz Engine Face Restore`**（插件子节点）。
 - **新增 `model` 下拉**：自由选择星光 2.6 / Astra / Astra HQ / Astra Sharp /

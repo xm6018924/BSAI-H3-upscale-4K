@@ -207,6 +207,18 @@ H3 生成 → VAE Decode → [BSAI Topaz Engine Face Restore](model=星光 2.6, 
 
 ## 📝 更新日志 / Changelog
 
+### v2.0.0 — 主超分节点集成 Topaz 生成式引擎（单节点完美档）/ Topaz engine in main node
+- `BSAI_H3_Upscale4K` 的 `model_name / 模型` 下拉新增两个生成式选项：
+  - **Topaz 星光 2.6 (生成式完美档)** — 调用本机 Topaz neuroserver（slp-26），
+    单节点即可达 Topaz 官方级人脸细节与纹理（眼睛有神、皮肤毛孔真实）。
+  - **Topaz Astra (生成式)** — Astra 引擎（需 ≥9 帧）。
+- 选择 Topaz 时自动跳过 Real-ESRGAN 路径与时序光流（引擎自身有时序一致性），
+  后续 `detail / softness / face_restore` 仍可叠加微调；scale 自动截断到 4x。
+- 引擎路径：默认 `ComfyUI/models/Topaz_Engine`（兼容旧 `ComfyUI/topaz_engine`）。
+- 经典 Real-ESRGAN 路径保持不变（极速档，适合预览/批量）。
+- 这是解决「经典超分人脸模糊/塑料感」的根本方案：生成式引擎重建人脸结构，
+  经典超分物理上无法生成不存在的眼睛虹膜/睫毛/毛孔细节。
+
 ### v1.9.1 — cudaMallocAsync 兼容性修复 / cudaMallocAsync compat fix
 - 修复 `RuntimeError: cudaMallocAsync does not yet support checkPoolLiveAllocations`：
   当 ComfyUI 未加 `--disable-cuda-malloc`（默认启用 cudaMallocAsync，如 RTX 50xx +

@@ -1005,9 +1005,18 @@ def _face_restore_frames(out_tensor, mode, det_conf, blend, fidelity=0.75):
 class BSAI_H3_Upscale4K:
     """Video frame AI super-resolution for MiniMax H3 (pixel domain, extremely fast)."""
 
+    # Generative Topaz engine options (prepended to the Real-ESRGAN model list).
+    # When selected, the node routes to _topaz_upscale (neuroserver) instead of
+    # Real-ESRGAN — single-node "完美档" with our detail/softness/face-restore
+    # post-processing still available on top.
+    TOPAZ_OPTIONS = {
+        "Topaz 星光 2.6 (生成式完美档)": "slp-26",
+        "Topaz Astra (生成式)": "astra",
+    }
+
     @classmethod
     def INPUT_TYPES(cls):
-        models = list_available_models()
+        models = list(cls.TOPAZ_OPTIONS.keys()) + list_available_models()
         return {
             "required": {
                 "images / 图像": ("IMAGE",),
@@ -1067,12 +1076,13 @@ class BSAI_H3_Upscale4K:
     FUNCTION = "upscale"
     CATEGORY = "BSAI/H3"
     DESCRIPTION = (
-        "H3 视频专用 AI 超分（像素域）：Real-ESRGAN 极速放大 + 光流时序一致性 + 细节增强\n"
-        "+ 人脸修复（YOLOv8-Face 检测 + GFPGAN/CodeFormer，解决 H3 远景小脸崩坏模糊）。\n"
-        "Tile 分块 + FP16 半精度 + torch.compile + 帧批量并行 + 模型常驻缓存。\n"
-        "Video-only AI super-resolution for MiniMax H3: Real-ESRGAN extreme-speed upscale,\n"
-        "with optical-flow temporal consistency, unsharp detail enhancement and\n"
-        "optional face restoration (YOLOv8-Face + GFPGAN/CodeFormer) for small/distant faces."
+        "H3 视频专用 AI 超分（像素域）：双引擎可选\n"
+        "  • Real-ESRGAN 极速档：general-x4v3 / x4plus，光流时序 + 多尺度细节 + 人脸修复\n"
+        "  • Topaz 生成式完美档：星光 2.6 / Astra 神经引擎（本机 ComfyUI/models/Topaz_Engine），\n"
+        "    单节点即可达 Topaz 官方级人脸细节与纹理，后续 detail/softness/face_restore 仍可叠加。\n"
+        "Video-only AI super-resolution for MiniMax H3. Dual engine: Real-ESRGAN fast tier "
+        "(optical-flow temporal + multi-scale detail + face restore), or Topaz generative tier "
+        "(Starlight 2.6 / Astra neuroserver, single-node perfect-tier) with our post-processing on top."
     )
     def upscale(self, **kw):
         g = kw.get
@@ -1094,39 +1104,58 @@ class BSAI_H3_Upscale4K:
         face_fidelity = g("face_fidelity / 保真度", 0.75)
         detail_mode = g("detail_mode / 细节模式", 'smart')
         t0 = time.time()
-        path = ensure_model(model_name)
-        if use_compile and torch.cuda.is_available():
-            model = _load_model_compiled(path, use_fp16)
+        _is_topaz = model_name in self.TOPAZ_OPTIONS
+
+        if _is_topaz:
+            # --- Topaz generative engine path (生成式完美档) -------------------
+            # Routes to _topaz_upscale (neuroserver, Starlight 2.6 / Astra).
+            # Topaz engine already does temporal consistency, so our optical-flow
+            # temporal pass is skipped; detail/softness/face-restore still apply.
+            model_id = self.TOPAZ_OPTIONS[model_name]
+            topaz_scale = min(float(scale), 4.0)  # engine supports up to 4x
+            frames = (images * 255.0).clamp(0, 255).cpu().numpy().astype(np.uint8)
+            out_np = _topaz_upscale(frames, fps=24, scale=topaz_scale,
+                                     strength=1.0, max_gpu_mem=14.0, qp=14,
+                                     model_id=model_id)
+            out = torch.from_numpy(out_np.astype(np.float32) / 255.0)
+            eff_scale = float(out.shape[1] / float(images.shape[1]))
+            temporal_strength = 0.0  # engine handles temporal consistency
+            lr_np = None
         else:
-            model = _load_model(path, use_fp16)
-        scale = float(scale)
-        ms = int(model.scale)
+            # --- Real-ESRGAN classic path ---------------------------------------
+            path = ensure_model(model_name)
+            if use_compile and torch.cuda.is_available():
+                model = _load_model_compiled(path, use_fp16)
+            else:
+                model = _load_model(path, use_fp16)
+            scale = float(scale)
+            ms = int(model.scale)
 
-        # keep the original LR frames around (needed by the temporal pass for flow)
-        lr_np = None
-        if temporal_strength > 0 and _HAS_CV2 and images.shape[0] > 1:
-            lr_np = np.ascontiguousarray(images.float().numpy(), dtype=np.float32)
+            # keep the original LR frames around (needed by the temporal pass for flow)
+            lr_np = None
+            if temporal_strength > 0 and _HAS_CV2 and images.shape[0] > 1:
+                lr_np = np.ascontiguousarray(images.float().numpy(), dtype=np.float32)
 
-        # --- scale plan (Topaz-style arbitrary ratios) -------------------------
-        # Super-resolve to the smallest model-integer power >= requested scale,
-        # then (only if the ratio is not an exact model multiple) precisely resize
-        # to the target with even-pixel alignment.
-        n = 0
-        sr = 1.0
-        while sr < scale - 1e-6:
-            sr *= ms
-            n += 1
-        out = images
-        for _ in range(max(1, n)):
-            out = _upscale_batch(model, out, tile_size, tile_pad, batch_frames)
-        if abs(sr - scale) > 1e-3:
-            in_h, in_w = images.shape[1], images.shape[2]
-            th = int(round(in_h * scale)); tw = int(round(in_w * scale))
-            th += th % 2; tw += tw % 2
-            out = F.interpolate(out.permute(0, 3, 1, 2), size=(th, tw),
-                                mode="bilinear", align_corners=False)
-            out = out.permute(0, 2, 3, 1).contiguous()
-        eff_scale = float(out.shape[1] / float(images.shape[1]))
+            # --- scale plan (Topaz-style arbitrary ratios) -------------------------
+            # Super-resolve to the smallest model-integer power >= requested scale,
+            # then (only if the ratio is not an exact model multiple) precisely resize
+            # to the target with even-pixel alignment.
+            n = 0
+            sr = 1.0
+            while sr < scale - 1e-6:
+                sr *= ms
+                n += 1
+            out = images
+            for _ in range(max(1, n)):
+                out = _upscale_batch(model, out, tile_size, tile_pad, batch_frames)
+            if abs(sr - scale) > 1e-3:
+                in_h, in_w = images.shape[1], images.shape[2]
+                th = int(round(in_h * scale)); tw = int(round(in_w * scale))
+                th += th % 2; tw += tw % 2
+                out = F.interpolate(out.permute(0, 3, 1, 2), size=(th, tw),
+                                    mode="bilinear", align_corners=False)
+                out = out.permute(0, 2, 3, 1).contiguous()
+            eff_scale = float(out.shape[1] / float(images.shape[1]))
 
         # Temporal consistency (motion-compensated neighbour blend) + detail USM
         t_td = time.time()
@@ -1148,8 +1177,8 @@ class BSAI_H3_Upscale4K:
         bh, bw = out.shape[1], out.shape[2]
         elapsed = time.time() - t0
         info = (
-            f"model: {model_name} (scale={model.scale}) | "
-            f"output: {bw}x{bh} | eff_scale: {eff_scale:.3f}x | "
+            f"model: {model_name} (eff_scale={eff_scale:.2f}x) | "
+            f"output: {bw}x{bh} | "
             f"fp16: {use_fp16} | compile: {use_compile} | tile: {tile_size} pad:{tile_pad} | "
             f"temporal: {temporal_strength} | detail: {detail_amount}@{detail_radius} "
             f"({detail_mode}) | "

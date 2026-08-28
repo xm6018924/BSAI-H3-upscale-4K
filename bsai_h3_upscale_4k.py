@@ -620,11 +620,45 @@ def _flow_motion_weight(ft):
     return torch.exp(-mag / max(sig, 1e-3))
 
 
-def _detail_enhance_gpu(frames, amount, radius):
+def _lce_gpu(x, strength):
+    """Lightweight local-contrast enhancement on [n,3,H,W] cuda float.
+
+    Method intent (aligns with Topaz / FlashVSR 'generated texture' feel):
+    enhanced = x + g * (x - local_mean) with an adaptive gain g that is strong
+    on mild-contrast texture and gated near strong edges (no halos). This
+    *rebuilds* texture contrast instead of only sharpening. Cheap separable
+    GPU blur, negligible cost on 4K video.
+    """
+    if strength <= 0:
+        return x
+    n, C, H, W = x.shape
+    ks = max(15, (min(H, W) // 8) | 1)
+    ks = min(ks, 129) | 1
+    if ks > 3:
+        half = ks // 2
+        dev, dt = x.device, x.dtype
+        sig = ks / 4.0
+        ax = torch.arange(-half, half + 1, dtype=torch.float32, device=dev)
+        g = torch.exp(-(ax * ax) / (2 * sig * sig))
+        g = (g / g.sum()).to(dt)
+        k1 = g.view(1, 1, -1, 1).repeat(C, 1, 1, 1)
+        k2 = g.view(1, 1, 1, -1).repeat(C, 1, 1, 1)
+        local = F.conv2d(x, k1, padding=(half, 0), groups=C)
+        local = F.conv2d(local, k2, padding=(0, half), groups=C)
+    else:
+        local = x
+    d = x - local
+    gate = torch.sigmoid(-d.abs() * 8.0 + 1.0)  # 1 on mild texture, ~0 on edges
+    return x + strength * gate * d
+
+
+def _detail_enhance_gpu(frames, amount, radius, mode="classic"):
     """
     frames [n,H,W,3] or [n,3,H,W] cuda -> separable-Gaussian unsharp mask, same
     shape/dtype. Shape-agnostic (accepts either layout defensively). Clamps the
     detail layer to avoid halos / overshoot on 4K video.
+    mode='smart' additionally runs a light local-contrast rebuild (_lce_gpu)
+    so texture reads as reconstructed rather than merely sharpened.
     """
     if amount <= 0:
         return frames
@@ -650,6 +684,9 @@ def _detail_enhance_gpu(frames, amount, radius):
     xb = F.conv2d(xb, k2, padding=(0, half), groups=C)
     detail = x - xb
     out = x + amount * torch.clamp(detail, -0.3, 0.3)
+    if mode == "smart":
+        # Generative-style local-contrast rebuild (light, gated, no halos).
+        out = _lce_gpu(out, min(amount * 0.8, 0.45))
     return out if is_chw else out.permute(0, 2, 3, 1)
 
 
@@ -681,7 +718,7 @@ def _soften_gpu(frames, softness, radius=1.2):
     return out if is_chw else out.permute(0, 2, 3, 1)
 
 
-def _video_temporal_detail(sr_cpu, lr_np, temporal_strength, detail_amount, detail_radius, scale):
+def _video_temporal_detail(sr_cpu, lr_np, temporal_strength, detail_amount, detail_radius, scale, detail_mode="classic"):
     """
     sr_cpu: [B,H,W,3] float32 CPU 0-1 (already upscaled).
     lr_np:  [B,h,w,3] float32 0-1 numpy (original LR frames, for optical flow).
@@ -741,7 +778,7 @@ def _video_temporal_detail(sr_cpu, lr_np, temporal_strength, detail_amount, deta
                 fused[j:j + 1] = acc / denom.clamp_min(1e-4)
             chunk = fused
         if detail_amount > 0:
-            chunk = _detail_enhance_gpu(chunk, detail_amount, detail_radius)
+            chunk = _detail_enhance_gpu(chunk, detail_amount, detail_radius, detail_mode)
         out_chunks.append(chunk.float().permute(0, 2, 3, 1).cpu())
     return torch.cat(out_chunks, dim=0)
 
@@ -807,14 +844,20 @@ def _face_models(mode: str):
     return det, sess
 
 
-def _restore_faces_frame(img, boxes, sess, mode, blend, fidelity=0.5):
+def _restore_faces_frame(img, boxes, sess, mode, blend, fidelity=0.75):
     """Restore every detected face in one BGR/RGB uint8 frame (numpy), blend back.
 
-    v1.4.2 fixes: (1) aspect-preserving letterbox resize into 512x512 so the
-    face is never anisotropically stretched (stretched crops corrupt GFPGAN /
-    CodeFormer reconstruction and cause ghosting / missing features after the
-    blend); (2) elliptical blend mask centred on the face bbox instead of the
-    crop centre; (3) wider pad (esp. vertically) to keep chin/forehead inside.
+    v1.7.0 upgrades (对标 Topaz / FlashVSR 的自然脸):
+      (1) fidelity-first defaults (blend 0.65 / fidelity 0.75): keep original
+          structure, only gently regenerate — no more hallucinated features;
+      (2) adaptive strength: the smaller / more distant the face, the LOWER the
+          replacement strength and the HIGHER the fidelity — tiny faces are
+          barely touched instead of being redrawn into broken/misshapen ones;
+      (3) input enhancement: LANCZOS upsample + horizontal-flip TTA averaging
+          to stabilise reconstruction and suppress asymmetry / artifacts.
+    Also keeps v1.4.2 fixes: aspect-preserving letterbox into 512x512 (no
+    anisotropic stretch), elliptical blend mask centred on the face bbox, and
+    generous vertical padding to keep chin/forehead inside.
     """
     H, W = img.shape[:2]
     out = img.copy()
@@ -823,6 +866,20 @@ def _restore_faces_frame(img, boxes, sess, mode, blend, fidelity=0.5):
         w, h = x2 - x1, y2 - y1
         if w < 8 or h < 8:
             continue
+        # ---- (2) adaptive strength from face size (relative to frame) ----
+        ratio = (w * h) / float(max(H * W, 1))
+        if ratio >= 0.02:
+            strength = 1.0
+        else:
+            strength = max(0.35, ratio / 0.02)
+        blend_eff = blend * strength
+        fid_eff = fidelity
+        if mode == "CodeFormer":
+            # small/distant faces: push toward structure-preserving (less regen)
+            fid_eff = min(1.0, fidelity + (1.0 - strength) * 0.30)
+        if strength < 0.5:
+            # very small faces: barely touch (avoid hallucinating features)
+            blend_eff *= 0.6
         # generous pad (more vertical) so the whole face stays inside the crop
         pad_w, pad_h = 0.45 * w, 0.50 * h
         cx1 = max(0, int(x1 - pad_w)); cy1 = max(0, int(y1 - pad_h))
@@ -833,20 +890,27 @@ def _restore_faces_frame(img, boxes, sess, mode, blend, fidelity=0.5):
         S = 512
         scale = min(S / float(ch), S / float(cw))
         nh = max(1, int(round(ch * scale))); nw = max(1, int(round(cw * scale)))
-        resized = cv2.resize(crop, (nw, nh), interpolation=cv2.INTER_CUBIC)
+        resized = cv2.resize(crop, (nw, nh), interpolation=cv2.INTER_LANCZOS4)
         canvas = np.zeros((S, S, 3), dtype=np.uint8)
         dx, dy = (S - nw) // 2, (S - nh) // 2
         canvas[dy:dy + nh, dx:dx + nw] = resized
         inp = canvas.astype(np.float32) / 255.0
         inp = inp.transpose(2, 0, 1)[None]
-        feed = {sess.get_inputs()[0].name: inp}
-        if len(sess.get_inputs()) > 1:  # CodeFormer: weight (fidelity)
-            feed[sess.get_inputs()[1].name] = np.array([float(fidelity)], dtype=np.float64)
-        o = sess.run(None, feed)[0][0].transpose(1, 2, 0)
-        o = np.clip(o, 0, 1)
+
+        def _run(t):
+            feed = {sess.get_inputs()[0].name: t}
+            if len(sess.get_inputs()) > 1:  # CodeFormer: weight (fidelity)
+                feed[sess.get_inputs()[1].name] = np.array([float(fid_eff)], dtype=np.float64)
+            return sess.run(None, feed)[0][0].transpose(1, 2, 0)
+
+        # --- (3) flip-TTA averaging to stabilise reconstruction ----
+        o = np.clip(_run(inp), 0, 1)
+        if strength >= 0.5:
+            of = np.clip(_run(inp[:, :, :, ::-1].copy()), 0, 1)
+            o = 0.5 * (o + of[:, :, ::-1])
         o = (o * 255.0).astype(np.uint8)
         restored = o[dy:dy + nh, dx:dx + nw]            # drop letterbox padding
-        restored = cv2.resize(restored, (cw, ch), interpolation=cv2.INTER_CUBIC)
+        restored = cv2.resize(restored, (cw, ch), interpolation=cv2.INTER_LANCZOS4)
         # --- elliptical mask centred on the FACE bbox (not crop centre) ---
         fx = (x1 + x2) / 2.0 - cx1
         fy = (y1 + y2) / 2.0 - cy1
@@ -856,12 +920,12 @@ def _restore_faces_frame(img, boxes, sess, mode, blend, fidelity=0.5):
         m = np.clip(1.0 - np.sqrt(sx * sx + sy * sy), 0.0, 1.0)
         m = cv2.GaussianBlur(m, (0, 0), sigmaX=max(2.0, min(cw, ch) / 28.0))
         m = m[..., None].astype(np.float32)
-        fused = blend * restored.astype(np.float32) + (1.0 - blend) * crop.astype(np.float32)
+        fused = blend_eff * restored.astype(np.float32) + (1.0 - blend_eff) * crop.astype(np.float32)
         out[cy1:cy2, cx1:cx2] = (m * fused + (1.0 - m) * crop.astype(np.float32)).astype(np.uint8)
     return out
 
 
-def _face_restore_frames(out_tensor, mode, det_conf, blend, fidelity=0.5):
+def _face_restore_frames(out_tensor, mode, det_conf, blend, fidelity=0.75):
     """Apply face restoration to an SR tensor [n,H,W,3] float 0-1 (CPU).
 
     Returns (out_tensor, total_faces_detected)."""
@@ -938,12 +1002,19 @@ class BSAI_H3_Upscale4K:
                 # including tiny distant faces; may add false positives).
                 "face_det_conf": ("FLOAT", {"default": 0.25, "min": 0.05, "max": 0.95, "step": 0.05}),
                 # How strongly the restored face is blended over the original
-                # crop. 1.0 = full restore, ~0.8 keeps a touch of original skin.
-                "face_blend": ("FLOAT", {"default": 0.85, "min": 0.1, "max": 1.0, "step": 0.05}),
+                # crop. 1.0 = full restore, ~0.65 = fidelity-first (keep skin
+                # and original structure; smaller faces are blended even less).
+                "face_blend": ("FLOAT", {"default": 0.65, "min": 0.1, "max": 1.0, "step": 0.05}),
                 # CodeFormer fidelity (0 = heavy regeneration for badly-broken
                 # faces, 1 = preserve original structure/details). Ignored by
-                # GFPGANv1.4.
-                "face_fidelity": ("FLOAT", {"default": 0.50, "min": 0.0, "max": 1.0, "step": 0.05}),
+                # GFPGANv1.4. Default 0.75 = fidelity-first: avoids the AI
+                # 'hallucinated' distorted features seen on small/distant faces.
+                "face_fidelity": ("FLOAT", {"default": 0.75, "min": 0.0, "max": 1.0, "step": 0.05}),
+                # Detail rebuild mode: classic = unsharp mask only; smart =
+                # unsharp + light local-contrast rebuild (generative-style
+                # texture, gated to avoid halos) — reads closer to Topaz /
+                # FlashVSR's reconstructed texture.
+                "detail_mode": (["classic", "smart"], {"default": "classic"}),
             },
         }
 
@@ -963,8 +1034,9 @@ class BSAI_H3_Upscale4K:
     def upscale(self, images, model_name, scale, tile_size, tile_pad, batch_frames,
                 use_fp16, use_compile=True, temporal_strength=0.20,
                 detail_amount=0.30, detail_radius=1.5, softness=0.30,
-                face_restore="Off", face_det_conf=0.25, face_blend=0.85,
-                face_fidelity=0.50):
+                detail_mode="classic",
+                face_restore="Off", face_det_conf=0.25, face_blend=0.65,
+                face_fidelity=0.75):
         t0 = time.time()
         path = ensure_model(model_name)
         if use_compile and torch.cuda.is_available():
@@ -1003,7 +1075,7 @@ class BSAI_H3_Upscale4K:
         # Temporal consistency (motion-compensated neighbour blend) + detail USM
         t_td = time.time()
         out = _video_temporal_detail(out, lr_np, temporal_strength, detail_amount,
-                                     detail_radius, eff_scale)
+                                     detail_radius, eff_scale, detail_mode)
         td_elapsed = time.time() - t_td
 
         # Softness (Topaz-style) — GPU, then back to CPU
@@ -1023,7 +1095,8 @@ class BSAI_H3_Upscale4K:
             f"model: {model_name} (scale={model.scale}) | "
             f"output: {bw}x{bh} | eff_scale: {eff_scale:.3f}x | "
             f"fp16: {use_fp16} | compile: {use_compile} | tile: {tile_size} pad:{tile_pad} | "
-            f"temporal: {temporal_strength} | detail: {detail_amount}@{detail_radius} | "
+            f"temporal: {temporal_strength} | detail: {detail_amount}@{detail_radius} "
+            f"({detail_mode}) | "
             f"softness: {softness} | "
             f"face: {face_restore} (conf={face_det_conf}, blend={face_blend}, fid={face_fidelity}) | "
             f"frames: {images.shape[0]} | time: {elapsed:.2f}s "
@@ -1434,8 +1507,8 @@ class BSAI_H3_FaceRestore:
                 "images": ("IMAGE",),
                 "face_restore": (["Off", "GFPGANv1.4", "CodeFormer"], {"default": "GFPGANv1.4"}),
                 "face_det_conf": ("FLOAT", {"default": 0.25, "min": 0.05, "max": 0.95, "step": 0.05}),
-                "face_blend": ("FLOAT", {"default": 0.85, "min": 0.1, "max": 1.0, "step": 0.05}),
-                "face_fidelity": ("FLOAT", {"default": 0.50, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "face_blend": ("FLOAT", {"default": 0.65, "min": 0.1, "max": 1.0, "step": 0.05}),
+                "face_fidelity": ("FLOAT", {"default": 0.75, "min": 0.0, "max": 1.0, "step": 0.05}),
             },
         }
 
@@ -1446,11 +1519,14 @@ class BSAI_H3_FaceRestore:
     DESCRIPTION = (
         "独立人脸修复节点：YOLOv8-Face 检测 + GFPGAN/CodeFormer 重建五官，\n"
         "解决 H3 中远景小脸崩坏 / 五官模糊丢失，可在任意工作流单独使用。\n"
+        "v1.7.0: 保真优先（blend 0.65 / fidelity 0.75）+ 自适应强度（小脸几乎不动，\n"
+        "避免 AI 幻觉出变形五官）+ 翻转 TTA 平均，对标 Topaz / FlashVSR 自然脸。\n"
         "Standalone face restoration for any frames: YOLOv8-Face detect +\n"
-        "GFPGAN/CodeFormer regenerate, fixes small/distant broken faces."
+        "GFPGAN/CodeFormer regenerate, fixes small/distant broken faces.\n"
+        "v1.7.0: fidelity-first + adaptive strength + flip-TTA for natural faces."
     )
 
-    def restore(self, images, face_restore, face_det_conf, face_blend, face_fidelity=0.50):
+    def restore(self, images, face_restore, face_det_conf, face_blend, face_fidelity=0.75):
         t0 = time.time()
         out, nf = _face_restore_frames(images, face_restore, face_det_conf, face_blend, face_fidelity)
         info = (

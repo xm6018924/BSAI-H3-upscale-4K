@@ -51,8 +51,9 @@
 | `softness` | **柔和度**（借鉴 Topaz 星光 softness）：细节增强后混入少量高斯模糊副本，抑制锐化过冲/块状伪影（0=关，0.3=柔和，1=很软） | 0.30 |
 | `face_restore` | **人脸修复**：YOLOv8-Face 检测 + GFPGAN/CodeFormer 重建五官，解决 H3 **远景小脸崩坏/模糊**（Off / GFPGANv1.4 / CodeFormer） | Off |
 | `face_det_conf` | 人脸检测置信度（调低可检出更小的远脸，可能增加误检） | 0.25 |
-| `face_blend` | 修复结果与原始融合强度（1=全替换，~0.8 保留一点原皮肤） | 0.85 |
-| `face_fidelity` | **CodeFormer fidelity**（0=强重建适合严重崩坏脸，1=保留原结构细节；GFPGANv1.4 忽略） | 0.50 |
+| `face_blend` | 修复结果与原始融合强度（1=全替换，0.65=保真优先；小脸自动再降） | 0.65 |
+| `face_fidelity` | **CodeFormer fidelity**（0=强重建适合严重崩坏脸，1=保留原结构细节；GFPGANv1.4 忽略） | 0.75 |
+| `detail_mode` | **细节重建模式**：classic=USM 锐化；smart=USM+轻量局部对比度重建（生成式质感、边缘门控无光晕，更接近 Topaz/FlashVSR） | classic |
 
 > **模型选择 / Model pick（RTX 5090 实测，960×544 → 4K，compile + FP16）**
 > | 模型 | 质量 | 速度（12s/24fps 视频 ≈288 帧） |
@@ -116,7 +117,7 @@ H3 解码 / 任意视频帧 → [BSAI H3 Face Restore] → 修复后帧
 | `images` | 任意视频/图片帧 `[B,H,W,3]` | — |
 | `face_restore` | GFPGANv1.4 / CodeFormer / Off | GFPGANv1.4 |
 | `face_det_conf` | 人脸检测置信度（调低检出更小远脸） | 0.25 |
-| `face_blend` | 修复融合强度（1=全替换，~0.8 保留原皮肤） | 0.85 |
+| `face_blend` | 修复融合强度（1=全替换，0.65=保真优先；小脸自动再降） | 0.65 |
 
 **输出**: `IMAGE`（修复后帧）、`faces_detected`（检测人脸总数）、`info`
 
@@ -164,6 +165,18 @@ H3 生成 → 二采 latent 放大(路线B) → VAE Decode → [BSAI H3 upscale 
 ---
 
 ## 📝 更新日志 / Changelog
+
+### v1.7.0 — 人脸修复保真化 + 自适应强度 + 生成式细节重建（对标 Topaz/FlashVSR）
+- **人脸修复保真优先**（解决「我们最差」：CodeFormer/GFPGAN 把脸修出眯眼/不对称/比例失真）：
+  - `face_blend` 0.85 → **0.65**（少替换原脸），`face_fidelity` 0.5 → **0.75**（重结构轻幻觉）
+  - **自适应强度**：按检测脸大小自动调节——远景小脸几乎不动（强度 0.35），
+    近景大脸才做正常重建，从根上避免 AI 幻觉出变形五官
+  - **输入增强**：LANCZOS 上采样 + 水平翻转 TTA 平均（两次推理求均值），
+    稳定重建、抑制左右不对称
+- **生成式细节重建（`detail_mode` 新参数）**：`classic`=原 USM；`smart`=USM +
+  轻量局部对比度重建（GPU 可分卷积，边缘门控无光晕），质感更接近 Topaz / FlashVSR
+- 对比实测（TOP1=TopazStarlight / TOP2=FlashVSR / 我们）：统一同尺寸后我们整体锐度
+  ≈ TOP1、略低于 TOP2，瓶颈不在「糊」而在「人脸硬换失真」，v1.7.0 针对性修复
 
 ### v1.6.0 — Latent 节点升级为学习型 3D 卷积超分 / Learned latent upscaler
 - **`BSAI H3 upscale 4K Latent` 新增 `learned-3d` 模式**（默认）：

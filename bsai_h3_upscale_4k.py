@@ -1553,9 +1553,14 @@ import uuid
 
 
 def _topaz_engine_dir():
+    """Topaz 引擎目录：默认 <ComfyUI>/models/Topaz_Engine，兼容旧 <ComfyUI>/topaz_engine。"""
     here = os.path.dirname(os.path.abspath(__file__))
     comfy = os.path.dirname(os.path.dirname(here))
-    return os.path.join(comfy, "topaz_engine")
+    for cand in (os.path.join(comfy, "models", "Topaz_Engine"),
+                 os.path.join(comfy, "topaz_engine")):
+        if os.path.exists(cand):
+            return cand
+    return os.path.join(comfy, "models", "Topaz_Engine")
 
 
 def _topaz_ffmpeg():
@@ -1564,7 +1569,7 @@ def _topaz_ffmpeg():
         p = os.path.join(eng, sub, "ffmpeg.exe")
         if os.path.exists(p):
             return p, os.path.join(eng, sub, "ffprobe.exe")
-    raise RuntimeError("topaz_engine/bin/ffmpeg.exe not found - 请把 topaz_engine 放到 ComfyUI 目录")
+    raise RuntimeError("Topaz 引擎 ffmpeg 未找到 - 请把引擎包放到 ComfyUI/models/Topaz_Engine (或旧路径 ComfyUI/topaz_engine)")
 
 
 def _topaz_write_video(frames, fps, path, qp=14):
@@ -1599,11 +1604,16 @@ def _topaz_read_video(path):
 
 
 def _topaz_run(in_path, out_path, scale, frames, w, h, strength, max_gpu_mem, model_id="slp-26"):
-    """Run Topaz neuroserver (Starlight 2.6) on a video file."""
+    """Run Topaz neuroserver (Starlight / Astra) on a video file."""
+    ASTRA_MODELS = ('astra', 'astrahq', 'astrasharp', 'astrafast')
+    if model_id in ASTRA_MODELS and frames < 9:
+        raise RuntimeError(
+            f'Astra 系列模型需要至少 9 帧输入 (当前 {frames} 帧), '
+            '两版引擎的短视频路径均存在缺陷。请用更长的视频。')
     eng = _topaz_engine_dir()
     ns = os.path.join(eng, "neuroserver171", "neuroserver.exe")
     if not os.path.exists(ns):
-        raise RuntimeError("neuroserver.exe not found - 引擎包不完整")
+        raise RuntimeError(f"neuroserver.exe 未找到: {ns} - 请把 Topaz 引擎包放到 ComfyUI/models/Topaz_Engine")
     model_store = os.path.join(eng, "models")
     tvmd = os.path.join(eng, "tvmd")
     lic = os.path.join(tvmd, "VR.lic") if os.path.exists(os.path.join(tvmd, "VR.lic")) \
@@ -1614,8 +1624,11 @@ def _topaz_run(in_path, out_path, scale, frames, w, h, strength, max_gpu_mem, mo
     env['TOPAZ_MODEL_STORE'] = model_store
     env['TVAI_MODEL_DIR'] = tvmd
     env['TOPAZLABS_LICENSE'] = lic
-    # 星光带 softness=1（官方默认），Astra 家族不带（slp-26 足够）
-    filters = '[{"model": "%s", "enhancement_strength": %s, "softness": 1}]' % (model_id, strength)
+    # 星光带 softness=1（官方默认），Astra 家族不带
+    if model_id == 'slp-26':
+        filters = '[{"model": "%s", "enhancement_strength": %s, "softness": 1}]' % (model_id, strength)
+    else:
+        filters = '[{"model": "%s", "enhancement_strength": %s}]' % (model_id, strength)
     ow = int(round(w * scale)); ow += ow % 2
     oh = int(round(h * scale)); oh += oh % 2
     NS_ENC = ('-c:v h264_nvenc -profile:v high -pix_fmt yuv420p -g 30 -preset p7 -tune hq '
@@ -1640,8 +1653,8 @@ def _topaz_run(in_path, out_path, scale, frames, w, h, strength, max_gpu_mem, mo
         raise RuntimeError('neuroserver produced no output file')
 
 
-def _topaz_upscale(frames, fps, scale, strength, max_gpu_mem, qp=14):
-    """frames (B,H,W,3) uint8 RGB -> Topaz Starlight upscaled (B,H',W',3) uint8."""
+def _topaz_upscale(frames, fps, scale, strength, max_gpu_mem, qp=14, model_id="slp-26"):
+    """frames (B,H,W,3) uint8 RGB -> Topaz engine upscaled (B,H',W',3) uint8."""
     tag = uuid.uuid4().hex[:10]
     tmp = tempfile.gettempdir()
     in_v = os.path.join(tmp, f'topaz_in_{tag}.mp4')
@@ -1649,7 +1662,7 @@ def _topaz_upscale(frames, fps, scale, strength, max_gpu_mem, qp=14):
     b, h, w, c = frames.shape
     try:
         _topaz_write_video(frames, fps, in_v, qp)
-        _topaz_run(in_v, out_v, scale, b, w, h, strength, max_gpu_mem)
+        _topaz_run(in_v, out_v, scale, b, w, h, strength, max_gpu_mem, model_id)
         return _topaz_read_video(out_v)
     finally:
         for f in (in_v, out_v):
@@ -1660,19 +1673,26 @@ def _topaz_upscale(frames, fps, scale, strength, max_gpu_mem, qp=14):
                 pass
 
 
-class BSAI_H3_Upscale4K_Topaz:
-    """Topaz 星光引擎档：生成式放大（完美底子）+ 可选人脸修复 / 细节增强叠加。
+class BSAI_TopazEngine_FaceRestore:
+    """Topaz Engine (星光/Astra 神经引擎) 放大 + 人脸修复叠加。
 
-    底座=Topaz 星光 2.6 神经引擎（调用本机 topaz_engine，需自备引擎包）。
-    在星光输出上继续叠加本插件优化：人脸修复（保真模式）+ 细节增强，实现
-    「在其基础上继续优化高清放大与修复脸部细节」。
+    底座=Topaz 神经引擎（默认 ComfyUI/models/Topaz_Engine，兼容旧 topaz_engine）。
+    可选模型：星光 2.6 / Astra 家族（自由选择）。在引擎输出上继续叠加本插件
+    优化：人脸修复（保真模式）+ 细节增强，实现「在其基础上继续优化高清放大
+    与修复脸部细节」。
     """
+
+    TOPAZ_MODELS = ["星光 2.6", "Astra", "Astra HQ", "Astra Sharp", "Astra Fast"]
+    TOPAZ_MODEL_IDS = {"星光 2.6": "slp-26", "Astra": "astra", "Astra HQ": "astrahq",
+                       "Astra Sharp": "astrasharp", "Astra Fast": "astrafast"}
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
                 "images": ("IMAGE",),
+                "model": (cls.TOPAZ_MODELS, {"default": "星光 2.6",
+                                             "tooltip": "星光2.6=默认最佳；Astra系列需≥9帧"}),
                 "scale": ("FLOAT", {"default": 2.0, "min": 1.0, "max": 4.0, "step": 0.01}),
                 "enhancement_strength": ("FLOAT", {"default": 1.0, "min": 0.5, "max": 1.5, "step": 0.1}),
                 "max_gpu_mem": ("FLOAT", {"default": 14.0, "min": 8.0, "max": 16.0, "step": 0.1}),
@@ -1694,22 +1714,24 @@ class BSAI_H3_Upscale4K_Topaz:
     FUNCTION = "run"
     CATEGORY = "BSAI/H3"
     DESCRIPTION = (
-        "Topaz 星光引擎档（完美档）：调用本机 topaz_engine 星光 2.6 生成式放大，\n"
-        "再叠加本插件的人脸修复（保真模式）+ 细节增强。底座效果对标 Topaz 官方，\n"
-        "在其基础上继续优化脸部细节。需 ComfyUI/topaz_engine 引擎包（自备）。\n"
-        "Topaz Starlight engine tier: generative upscale (Topaz 2.6) + our\n"
-        "fidelity-first face restore + optional detail/softness on top."
+        "BSAI Topaz Engine Face Restore：调用本机 Topaz 神经引擎（星光 2.6 / Astra，\n"
+        "默认 ComfyUI/models/Topaz_Engine）生成式放大，再叠加本插件的人脸修复\n"
+        "（保真模式）+ 细节增强。底座效果对标 Topaz 官方，在其基础上继续优化\n"
+        "脸部细节。Topaz engine tier: generative upscale (Starlight/Astra) +\n"
+        "our fidelity-first face restore + optional detail/softness on top."
     )
 
-    def run(self, images, scale, enhancement_strength, max_gpu_mem, fps, qp,
+    def run(self, images, model="星光 2.6", scale=2.0, enhancement_strength=1.0,
+            max_gpu_mem=14.0, fps=24, qp=14,
             face_restore="Off", face_det_conf=0.25, face_blend=0.65, face_fidelity=0.75,
             detail_amount=0.0, detail_radius=1.5, softness=0.0, detail_mode="classic"):
         t0 = time.time()
         b, h, w, c = images.shape
         if c != 3:
             raise ValueError(f"Topaz 档需要 RGB 3 通道, got {c}")
+        model_id = self.TOPAZ_MODEL_IDS.get(model, "slp-26")
         frames = (images * 255.0).clamp(0, 255).cpu().numpy().astype(np.uint8)
-        out = _topaz_upscale(frames, fps, scale, enhancement_strength, max_gpu_mem, qp)
+        out = _topaz_upscale(frames, fps, scale, enhancement_strength, max_gpu_mem, qp, model_id)
         out_t = torch.from_numpy(out.astype(np.float32) / 255.0)
         nf = 0
         if face_restore != "Off":
@@ -1726,7 +1748,7 @@ class BSAI_H3_Upscale4K_Topaz:
         used = float(out_t.shape[2]) / float(w)
         elapsed = time.time() - t0
         info = (
-            f"Topaz 星光引擎: {scale}x (strength={enhancement_strength}, softness=1) | "
+            f"Topaz Engine [{model_id}]: {scale}x (strength={enhancement_strength}) | "
             f"output: {bw}x{bh} | scale_used: {used:.3f}x | "
             f"face: {face_restore} (blend={face_blend}, fid={face_fidelity}, faces={nf}) | "
             f"detail: {detail_amount}@{detail_radius} ({detail_mode}) | softness: {softness} | "
@@ -1739,12 +1761,12 @@ NODE_CLASS_MAPPINGS = {
     "BSAI_H3_Upscale4K": BSAI_H3_Upscale4K,
     "BSAI_H3_Upscale4K_Latent": BSAI_H3_Upscale4K_Latent,
     "BSAI_H3_FaceRestore": BSAI_H3_FaceRestore,
-    "BSAI_H3_Upscale4K_Topaz": BSAI_H3_Upscale4K_Topaz,
+    "BSAI Topaz Engine Face Restore": BSAI_TopazEngine_FaceRestore,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "BSAI_H3_Upscale4K": "BSAI H3 upscale 4K / 视频超分",
     "BSAI_H3_Upscale4K_Latent": "BSAI H3 upscale 4K Latent / H3潜空间放大",
     "BSAI_H3_FaceRestore": "BSAI H3 Face Restore / 人脸修复",
-    "BSAI_H3_Upscale4K_Topaz": "BSAI H3 upscale 4K Topaz星光 / 完美档",
+    "BSAI Topaz Engine Face Restore": "BSAI Topaz Engine Face Restore",
 }

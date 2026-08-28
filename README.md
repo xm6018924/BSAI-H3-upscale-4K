@@ -124,31 +124,33 @@ H3 解码 / 任意视频帧 → [BSAI H3 Face Restore] → 修复后帧
 > 与超分节点的 `face_restore` 参数共用同一套检测/修复引擎与模型缓存；
 > 模型缺失或未启用时自动原样透传，不会崩工作流。
 
-### 4️⃣ BSAI H3 upscale 4K Topaz 星光（完美档 / Topaz Starlight engine tier）
+### 4️⃣ BSAI Topaz Engine Face Restore（Topaz 引擎完美档 / Topaz Engine tier）
 
-**以 Topaz 星光 2.6 神经引擎为放大底座**（生成式扩散重绘，效果对标 Topaz 官方），
+**以 Topaz 神经引擎为放大底座**（生成式扩散重绘，效果对标 Topaz 官方），
 再叠加本插件的优化——人脸修复（保真模式）+ 细节增强，实现「在 Topaz 基础上
-继续优化高清放大与修复脸部细节」。
+继续优化高清放大与修复脸部细节」。**可自由选择模型**（星光 2.6 / Astra 家族）。
 
 ```
-任意视频帧 → [BSAI H3 upscale 4K Topaz] → 完美档 4K 帧（+人脸修复/细节）
+任意视频帧 → [BSAI Topaz Engine Face Restore] → 完美档 4K 帧（+人脸修复/细节）
 ```
 
 | 参数 | 说明 | 默认 |
 |---|---|---|
 | `images` | 视频帧序列 `[B,H,W,3]` | — |
+| `model` | **模型自由选择**：星光 2.6（默认最佳）/ Astra / Astra HQ / Astra Sharp / Astra Fast（Astra 家族需 ≥9 帧） | 星光 2.6 |
 | `scale` | 放大倍数 1.0–4.0（支持小数精确档位，自动偶数对齐） | 2.0 |
-| `enhancement_strength` | 星光"敢不敢重画"：0.7 柔和（人脸/文字安全）/ 1.0 默认 / 1.3 细节最猛 | 1.0 |
+| `enhancement_strength` | 引擎"敢不敢重画"：0.7 柔和（人脸/文字安全）/ 1.0 默认 / 1.3 细节最猛 | 1.0 |
 | `max_gpu_mem` | 神经引擎显存上限（GiB，可小数）。16G 卡建议 14 | 14.0 |
 | `fps` | 与视频实际帧率一致（影响中间编码） | 24 |
-| `qp` | 输入编码质量（越小越无损，星光"看得清不清"） | 14 |
-| `face_restore` | 星光输出后叠加人脸修复（Off/GFPGANv1.4/CodeFormer） | Off |
+| `qp` | 输入编码质量（越小越无损，引擎"看得清不清"） | 14 |
+| `face_restore` | 引擎输出后叠加人脸修复（Off/GFPGANv1.4/CodeFormer） | Off |
 | `face_det_conf` / `face_blend` / `face_fidelity` | 同主节点人脸修复参数 | 0.25 / 0.65 / 0.75 |
-| `detail_amount` / `detail_radius` / `detail_mode` | 星光输出后叠加细节增强（smart=生成式质感） | 0 / 1.5 / classic |
-| `softness` | 星光输出后柔和（默认 0=不动，星光自带 softness=1） | 0 |
+| `detail_amount` / `detail_radius` / `detail_mode` | 引擎输出后叠加细节增强（smart=生成式质感） | 0 / 1.5 / classic |
+| `softness` | 引擎输出后柔和（默认 0=不动，星光自带 softness=1） | 0 |
 
-> **引擎依赖**：需本机 `ComfyUI/topaz_engine/`（neuroserver171 + 星光 2.6 权重，
-> 商业引擎自备，节点仅本机调用，不随插件分发任何引擎/权重）。缺失时节点报错提示。
+> **引擎依赖**：需本机 **`ComfyUI/models/Topaz_Engine/`**（默认路径，兼容旧
+> `ComfyUI/topaz_engine/`）——含 neuroserver171 引擎 + 星光 2.6/Astra 权重，
+> 商业引擎自备，节点仅本机调用，不随插件分发任何引擎/权重。缺失时节点报错提示。
 > **速度**：星光 2.6 是 7B 扩散模型，首帧含加载约数分钟，之后逐帧生成式重绘
 > （RTX 5090 实测 8 帧 608×352→1216×704 首跑约 7 分钟）——与 Topaz 官方一致，
 > 这是追求"完美画质"的代价；需要速度请用节点 1️⃣（极速档）。
@@ -175,13 +177,15 @@ H3 第一次采样(低分辨率 latent)
 H3 生成 → 二采 latent 放大(路线B) → VAE Decode → [BSAI H3 upscale 4K] → 4K
 ```
 
-**路线 D — Topaz 星光完美档（画质天花板，速度换画质）**
+**路线 D — Topaz 引擎完美档（画质天花板，速度换画质）**
 ```
-H3 生成 → VAE Decode → [BSAI H3 upscale 4K Topaz](scale=2, face_restore=CodeFormer)
+H3 生成 → VAE Decode → [BSAI Topaz Engine Face Restore](model=星光 2.6, scale=2,
+   face_restore=CodeFormer)
    → Save Video
 ```
-> 需 `ComfyUI/topaz_engine/` 引擎包。生成式重绘带来最自然的人脸与细节，
-> 远处人脸崩坏由星光生成式修复 + 本插件人脸保真重建双保险。
+> 需 `ComfyUI/models/Topaz_Engine/` 引擎包（兼容旧 `ComfyUI/topaz_engine/`）。
+> 生成式重绘带来最自然的人脸与细节，远处人脸崩坏由星光生成式修复 +
+> 本插件人脸保真重建双保险。可自由切换星光 2.6 / Astra 家族模型。
 
 ---
 
@@ -202,6 +206,12 @@ H3 生成 → VAE Decode → [BSAI H3 upscale 4K Topaz](scale=2, face_restore=Co
 ---
 
 ## 📝 更新日志 / Changelog
+
+### v1.8.1 — 节点更名 + 模型自由选择 + 引擎路径默认化
+- 节点更名为 **`BSAI Topaz Engine Face Restore`**（插件子节点）。
+- **新增 `model` 下拉**：自由选择星光 2.6 / Astra / Astra HQ / Astra Sharp /
+  Astra Fast（Astra 家族需 ≥9 帧，节点自动拦截）。
+- **引擎路径默认 `ComfyUI/models/Topaz_Engine/`**（兼容旧 `ComfyUI/topaz_engine/`）。
 
 ### v1.8.0 — Topaz 星光完美档 / Topaz Starlight engine tier
 - **推倒重来的方向落地**：新增 `BSAI H3 upscale 4K Topaz` 节点，以 **Topaz 星光 2.6

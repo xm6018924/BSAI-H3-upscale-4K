@@ -622,25 +622,35 @@ def _flow_motion_weight(ft):
 
 def _detail_enhance_gpu(frames, amount, radius):
     """
-    frames [n,3,H,W] cuda -> separable-Gaussian unsharp mask, same shape/dtype.
-    Clamps the detail layer to avoid halos / overshoot on 4K video.
+    frames [n,H,W,3] or [n,3,H,W] cuda -> separable-Gaussian unsharp mask, same
+    shape/dtype. Shape-agnostic (accepts either layout defensively). Clamps the
+    detail layer to avoid halos / overshoot on 4K video.
     """
     if amount <= 0:
         return frames
-    n, C, H, W = frames.shape
+    is_chw = (frames.ndim == 4 and frames.shape[1] == 3 and frames.shape[3] != 3)
+    if is_chw:
+        x = frames
+        n, C, H, W = x.shape
+    else:
+        x = frames.permute(0, 3, 1, 2)  # [n,3,H,W]
+        n, C, H, W = x.shape
     sig = max(0.5, float(radius))
     ks = int(math.ceil(sig * 4)) | 1
     half = ks // 2
-    dev, dt = frames.device, frames.dtype
+    dev, dt = x.device, x.dtype
     ax = torch.arange(-half, half + 1, dtype=torch.float32, device=dev)
     g = torch.exp(-(ax * ax) / (2 * sig * sig))
     g = (g / g.sum()).to(dt)
     k1 = g.view(1, 1, -1, 1).repeat(C, 1, 1, 1)  # [C,1,ks,1]
     k2 = g.view(1, 1, 1, -1).repeat(C, 1, 1, 1)  # [C,1,1,ks]
-    xb = F.conv2d(frames, k1, padding=(half, 0), groups=C)
+    # depthwise separable blur: [n,3,H,W] with groups=C blurs each channel plane
+    # independently with the same Gaussian kernel (never reshape-stacks channels).
+    xb = F.conv2d(x, k1, padding=(half, 0), groups=C)
     xb = F.conv2d(xb, k2, padding=(0, half), groups=C)
-    detail = frames - xb
-    return frames + amount * torch.clamp(detail, -0.3, 0.3)
+    detail = x - xb
+    out = x + amount * torch.clamp(detail, -0.3, 0.3)
+    return out if is_chw else out.permute(0, 2, 3, 1)
 
 
 def _video_temporal_detail(sr_cpu, lr_np, temporal_strength, detail_amount, detail_radius, scale):

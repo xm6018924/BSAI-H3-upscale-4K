@@ -375,15 +375,34 @@ _compiled_cache = {}
 _compiled_cache_lock = threading.Lock()
 
 
+def _detect_cuda_malloc_async():
+    """Detect whether the current CUDA allocator is cudaMallocAsync, which is
+    incompatible with torch.instrument cudagraph_trees (raises
+    'cudaMallocAsync does not yet support checkPoolLiveAllocations').
+    Returns True if cudaMallocAsync is in use.
+    """
+    if not torch.cuda.is_available():
+        return False
+    conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
+    if "cudaMallocAsync" in conf:
+        return True
+    try:
+        backend = torch.cuda.memory._get_allocator_backend()
+        return "async" in str(backend).lower()
+    except Exception:
+        pass
+    return False
+
+
 class _CompiledWrapper(nn.Module):
     """Expose model.scale/parameters while running the torch.compile graph."""
 
-    def __init__(self, model):
+    def __init__(self, model, mode="reduce-overhead"):
         super().__init__()
         self._m = model
         self.scale = model.scale
         self.num_block = getattr(model, "num_block", None)
-        self._compiled = torch.compile(model, mode="reduce-overhead", dynamic=False)
+        self._compiled = torch.compile(model, mode=mode, dynamic=False)
 
     def forward(self, x):
         return self._compiled(x)
@@ -400,11 +419,26 @@ def _load_model_compiled(path, use_fp16):
             return _compiled_cache[key]
     try:
         model = _load_model(path, use_fp16)
-        # NOTE: no dummy warmup here. torch.compile captures the CUDA graph on the
-        # FIRST real call with the actual video-frame shape; a differently-shaped
-        # dummy would force a re-compile later (slower). First real run pays the
-        # one-time compile cost, then every subsequent same-shape run is fast.
-        wrapped = _CompiledWrapper(model)
+        # cudaMallocAsync compatibility: cudagraph_trees calls
+        # checkPoolLiveAllocations which is unsupported on cudaMallocAsync.
+        # Disable cudagraph_trees and fall back to mode="default" (no CUDA graph)
+        # when cudaMallocAsync is detected (e.g. ComfyUI started without
+        # --disable-cuda-malloc on RTX 50xx + cu130).
+        if _detect_cuda_malloc_async():
+            try:
+                torch._inductor.config.triton.cudagraph_trees = False
+            except Exception:
+                pass
+            print("[BSAI H3 UPSCAL 4K] cudaMallocAsync detected: using torch.compile "
+                  "mode='default' (cudagraph disabled) for compatibility.", flush=True)
+            wrapped = _CompiledWrapper(model, mode="default")
+        else:
+            # NOTE: no dummy warmup here. torch.compile captures the CUDA graph on
+            # the FIRST real call with the actual video-frame shape; a differently-
+            # shaped dummy would force a re-compile later (slower). First real run
+            # pays the one-time compile cost, then every subsequent same-shape run
+            # is fast.
+            wrapped = _CompiledWrapper(model)
     except Exception as e:
         print(f"[BSAI H3 UPSCAL 4K] torch.compile unavailable, falling back to eager "
               f"({type(e).__name__}: {e})", flush=True)

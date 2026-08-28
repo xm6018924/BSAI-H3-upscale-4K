@@ -207,6 +207,14 @@ H3 生成 → VAE Decode → [BSAI Topaz Engine Face Restore](model=星光 2.6, 
 
 ## 📝 更新日志 / Changelog
 
+### v1.9.1 — cudaMallocAsync 兼容性修复 / cudaMallocAsync compat fix
+- 修复 `RuntimeError: cudaMallocAsync does not yet support checkPoolLiveAllocations`：
+  当 ComfyUI 未加 `--disable-cuda-malloc`（默认启用 cudaMallocAsync，如 RTX 50xx +
+  cu130）时，`torch.compile(mode="reduce-overhead")` 的 cudagraph_trees 会调用不兼容
+  的 `checkPoolLiveAllocations`。现在自动检测 cudaMallocAsync，检测到时禁用
+  cudagraph_trees 并降级为 `mode="default"`（无 CUDA graph），保证插件在两种启动
+  配置下都能正常运行。
+
 ### v1.9.0 — 多尺度细节重建算法 / Multi-scale detail rebuild
 - 将 `_detail_enhance_gpu` 从"单尺度 USM 锐化"升级为**亮度域多尺度 DoG 细节重建**
   （小尺度 + 中尺度双高斯差），并以**局部方差自适应掩膜**门控：纹理/边缘区增强、

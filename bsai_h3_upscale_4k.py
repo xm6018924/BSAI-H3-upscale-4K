@@ -653,6 +653,34 @@ def _detail_enhance_gpu(frames, amount, radius):
     return out if is_chw else out.permute(0, 2, 3, 1)
 
 
+def _soften_gpu(frames, softness, radius=1.2):
+    """Light softening blend to balance sharpening overshoot / blocky artifacts.
+
+    Method borrowed from Topaz Starlight's "softness" control (its 星光 model ships
+    with softness=1): after the detail-enhancement pass, blend a small fraction of
+    a Gaussian-blurred copy back in. frames [n,H,W,3] or [n,3,H,W]; returns same
+    layout/dtype/device. GPU separable Gaussian, reuse the same kernel builder.
+    """
+    if softness <= 0:
+        return frames
+    is_chw = (frames.ndim == 4 and frames.shape[1] == 3 and frames.shape[3] != 3)
+    x = frames if is_chw else frames.permute(0, 3, 1, 2)
+    n, C, H, W = x.shape
+    sig = max(0.5, float(radius))
+    ks = int(math.ceil(sig * 4)) | 1
+    half = ks // 2
+    dev, dt = x.device, x.dtype
+    ax = torch.arange(-half, half + 1, dtype=torch.float32, device=dev)
+    g = torch.exp(-(ax * ax) / (2 * sig * sig))
+    g = (g / g.sum()).to(dt)
+    k1 = g.view(1, 1, -1, 1).repeat(C, 1, 1, 1)
+    k2 = g.view(1, 1, 1, -1).repeat(C, 1, 1, 1)
+    xb = F.conv2d(x, k1, padding=(half, 0), groups=C)
+    xb = F.conv2d(xb, k2, padding=(0, half), groups=C)
+    out = x * (1.0 - softness) + xb * softness
+    return out if is_chw else out.permute(0, 2, 3, 1)
+
+
 def _video_temporal_detail(sr_cpu, lr_np, temporal_strength, detail_amount, detail_radius, scale):
     """
     sr_cpu: [B,H,W,3] float32 CPU 0-1 (already upscaled).
@@ -878,7 +906,11 @@ class BSAI_H3_Upscale4K:
                 # general-x4v3 default: ~8x faster than x4plus with nearly identical
                 # quality (PSNR ~39 dB on test frames). x4plus = max quality, slowest.
                 "model_name": (models, {"default": "realesr-general-x4v3.pth"}),
-                "scale": ("INT", {"default": 4, "min": 2, "max": 4, "step": 1}),
+                # Scale supports any value 1.0-8.0 (incl. Topaz-style precise ratios
+                # like 2.67 / 3.0): integer multiples of the model run directly,
+                # other ratios are super-resolved to the next model integer scale and
+                # then resized to the exact target (even-pixel aligned). 4 = 4K class.
+                "scale": ("FLOAT", {"default": 4.0, "min": 1.0, "max": 8.0, "step": 0.01}),
                 # tile_size=0 => full-image fast path (recommended on RTX 30xx+).
                 # Use a positive tile only if you run out of VRAM.
                 "tile_size": ("INT", {"default": 0, "min": 0, "max": 2048, "step": 16}),
@@ -894,6 +926,10 @@ class BSAI_H3_Upscale4K:
                 # Detail enhancement: separable-Gaussian unsharp mask on SR. 0 = off.
                 "detail_amount": ("FLOAT", {"default": 0.30, "min": 0.0, "max": 1.5, "step": 0.05}),
                 "detail_radius": ("FLOAT", {"default": 1.5, "min": 0.3, "max": 8.0, "step": 0.1}),
+                # Softness (borrowed from Topaz Starlight): after detail USM, blend
+                # back a small fraction of a Gaussian-blurred copy to tame overshoot
+                # and blocky artifacts. 0 = off, ~0.3 gentle, 1.0 very soft.
+                "softness": ("FLOAT", {"default": 0.30, "min": 0.0, "max": 1.0, "step": 0.05}),
                 # Face restoration: detects faces (YOLOv8-Face) then regenerates
                 # facial structure with GFPGAN / CodeFormer (ONNX, GPU, zero new
                 # pip deps). Fixes H3's small / distant broken faces.
@@ -926,7 +962,7 @@ class BSAI_H3_Upscale4K:
 
     def upscale(self, images, model_name, scale, tile_size, tile_pad, batch_frames,
                 use_fp16, use_compile=True, temporal_strength=0.20,
-                detail_amount=0.30, detail_radius=1.5,
+                detail_amount=0.30, detail_radius=1.5, softness=0.30,
                 face_restore="Off", face_det_conf=0.25, face_blend=0.85,
                 face_fidelity=0.50):
         t0 = time.time()
@@ -935,26 +971,45 @@ class BSAI_H3_Upscale4K:
             model = _load_model_compiled(path, use_fp16)
         else:
             model = _load_model(path, use_fp16)
-        eff_scale = min(scale, model.scale)
+        scale = float(scale)
+        ms = int(model.scale)
 
         # keep the original LR frames around (needed by the temporal pass for flow)
         lr_np = None
         if temporal_strength > 0 and _HAS_CV2 and images.shape[0] > 1:
             lr_np = np.ascontiguousarray(images.float().numpy(), dtype=np.float32)
 
-        if model.scale == 2 and scale == 4:
-            # 2x model but user asked 4x -> run twice
-            first = _upscale_batch(model, images, tile_size, tile_pad, batch_frames)
-            out = _upscale_batch(model, first, tile_size, tile_pad, batch_frames)
-            eff_scale = 4
-        else:
-            out = _upscale_batch(model, images, tile_size, tile_pad, batch_frames)
+        # --- scale plan (Topaz-style arbitrary ratios) -------------------------
+        # Super-resolve to the smallest model-integer power >= requested scale,
+        # then (only if the ratio is not an exact model multiple) precisely resize
+        # to the target with even-pixel alignment.
+        n = 0
+        sr = 1.0
+        while sr < scale - 1e-6:
+            sr *= ms
+            n += 1
+        out = images
+        for _ in range(max(1, n)):
+            out = _upscale_batch(model, out, tile_size, tile_pad, batch_frames)
+        if abs(sr - scale) > 1e-3:
+            in_h, in_w = images.shape[1], images.shape[2]
+            th = int(round(in_h * scale)); tw = int(round(in_w * scale))
+            th += th % 2; tw += tw % 2
+            out = F.interpolate(out.permute(0, 3, 1, 2), size=(th, tw),
+                                mode="bilinear", align_corners=False)
+            out = out.permute(0, 2, 3, 1).contiguous()
+        eff_scale = float(out.shape[1] / float(images.shape[1]))
 
         # Temporal consistency (motion-compensated neighbour blend) + detail USM
         t_td = time.time()
         out = _video_temporal_detail(out, lr_np, temporal_strength, detail_amount,
                                      detail_radius, eff_scale)
         td_elapsed = time.time() - t_td
+
+        # Softness (Topaz-style) — GPU, then back to CPU
+        if softness > 0 and torch.cuda.is_available():
+            dev = torch.cuda.current_device()
+            out = _soften_gpu(out.to(dev), softness).cpu()
 
         # Face restoration (small / distant broken faces) - optional, on the SR frames
         t_fr = time.time()
@@ -966,9 +1021,10 @@ class BSAI_H3_Upscale4K:
         elapsed = time.time() - t0
         info = (
             f"model: {model_name} (scale={model.scale}) | "
-            f"output: {bw}x{bh} | eff_scale: {eff_scale}x | "
+            f"output: {bw}x{bh} | eff_scale: {eff_scale:.3f}x | "
             f"fp16: {use_fp16} | compile: {use_compile} | tile: {tile_size} pad:{tile_pad} | "
             f"temporal: {temporal_strength} | detail: {detail_amount}@{detail_radius} | "
+            f"softness: {softness} | "
             f"face: {face_restore} (conf={face_det_conf}, blend={face_blend}, fid={face_fidelity}) | "
             f"frames: {images.shape[0]} | time: {elapsed:.2f}s "
             f"(temporal+detail: {td_elapsed:.2f}s, face: {fr_elapsed:.2f}s) | "

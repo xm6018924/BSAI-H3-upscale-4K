@@ -3125,6 +3125,7 @@
         0.25,
         0.45,
         1.8,
+        0.3,
         "Off",
         0.25,
         0.85,
@@ -3132,7 +3133,7 @@
       ],
       "widgets_values_named": {
         "model_name": "RealESRGAN_x4plus.pth",
-        "scale": 4,
+        "scale": 4.0,
         "tile_size": 0,
         "tile_pad": 16,
         "batch_frames": 4,
@@ -3144,7 +3145,8 @@
         "face_restore": "Off",
         "face_det_conf": 0.25,
         "face_blend": 0.85,
-        "face_fidelity": 0.5
+        "face_fidelity": 0.5,
+        "softness": 0.3
       },
       "title": "BSAI H3 upscale 4K (v1.5 纯超分 baseline)"
     },

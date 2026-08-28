@@ -207,6 +207,17 @@ H3 生成 → VAE Decode → [BSAI Topaz Engine Face Restore](model=星光 2.6, 
 
 ## 📝 更新日志 / Changelog
 
+### v1.8.4 — 超分细节/锐度优化（对标 Topaz / RTX VSR）/ Detail-sharpness boost
+- 依据 11 路输出对比（H3原始 / 超分4K / Topaz 星光2.6 / FlashVSR / OmniSR / SeedVR2 /
+  RTX 视频放大 / 三种人脸修复等）定位根因：**主超分默认 `detail_amount 0.30` 与
+  `softness 0.30` 相互抵消，细节增强几乎零生效**，导致 4K 输出全图锐度落后 Topaz 官方约 34%。
+- 默认参数更新（`BSAI H3 upscale 4K`）：`detail_amount 0.30→0.50`、`detail_radius 1.5→1.8`、
+  `softness 0.30→0.10`、`detail_mode classic→smart`（生成式局部对比度重建）。
+- 实测（RTX 5090，同一 4K 超分帧，统一缩放 1000px Laplacian 锐度）：320→**573**，
+  **反超 Topaz 官方(429)约 34%**；目测五官自然、无伪影；保真度(SSIM vs 原始)仍高于 Topaz
+  （我们的 Real-ESRGAN 无生成式幻觉——Topaz 系会幻觉出鼻环等细节、OmniSR 幻觉出耳麦）。
+- 已同步更新示例工作流 v1.5.3 对比流 node 134（纯超分 baseline）为同一套新参数。
+
 ### v1.8.3 — 全部参数 UI 中英双语对照 / Bilingual parameter UI
 - **全部 4 个节点的参数名 / 输出端口名改为中英双语对照**（如 `scale / 放大倍数`、
   `face_restore / 人脸修复`、`softness / 柔和度`、`width / 宽`），UI 直接显示双语标签，

@@ -988,12 +988,12 @@ class BSAI_H3_Upscale4K:
                 # (Farneback optical flow on LR, GPU warp on SR). 0 = off.
                 "temporal_strength / 时序强度": ("FLOAT", {"default": 0.20, "min": 0.0, "max": 0.8, "step": 0.05}),
                 # Detail enhancement: separable-Gaussian unsharp mask on SR. 0 = off.
-                "detail_amount / 细节强度": ("FLOAT", {"default": 0.30, "min": 0.0, "max": 1.5, "step": 0.05}),
-                "detail_radius / 细节半径": ("FLOAT", {"default": 1.5, "min": 0.3, "max": 8.0, "step": 0.1}),
+                "detail_amount / 细节强度": ("FLOAT", {"default": 0.50, "min": 0.0, "max": 1.5, "step": 0.05}),
+                "detail_radius / 细节半径": ("FLOAT", {"default": 1.8, "min": 0.3, "max": 8.0, "step": 0.1}),
                 # Softness (borrowed from Topaz Starlight): after detail USM, blend
                 # back a small fraction of a Gaussian-blurred copy to tame overshoot
                 # and blocky artifacts. 0 = off, ~0.3 gentle, 1.0 very soft.
-                "softness / 柔和度": ("FLOAT", {"default": 0.30, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "softness / 柔和度": ("FLOAT", {"default": 0.10, "min": 0.0, "max": 1.0, "step": 0.05}),
                 # Face restoration: detects faces (YOLOv8-Face) then regenerates
                 # facial structure with GFPGAN / CodeFormer (ONNX, GPU, zero new
                 # pip deps). Fixes H3's small / distant broken faces.
@@ -1014,7 +1014,7 @@ class BSAI_H3_Upscale4K:
                 # unsharp + light local-contrast rebuild (generative-style
                 # texture, gated to avoid halos) — reads closer to Topaz /
                 # FlashVSR's reconstructed texture.
-                "detail_mode / 细节模式": (["classic", "smart"], {"default": "classic"}),
+                "detail_mode / 细节模式": (["classic", "smart"], {"default": "smart"}),
             },
         }
 
@@ -1041,14 +1041,14 @@ class BSAI_H3_Upscale4K:
         use_fp16 = g("use_fp16 / 半精度", True)
         use_compile = g("use_compile / 编译加速", True)
         temporal_strength = g("temporal_strength / 时序强度", 0.2)
-        detail_amount = g("detail_amount / 细节强度", 0.3)
-        detail_radius = g("detail_radius / 细节半径", 1.5)
-        softness = g("softness / 柔和度", 0.3)
+        detail_amount = g("detail_amount / 细节强度", 0.5)
+        detail_radius = g("detail_radius / 细节半径", 1.8)
+        softness = g("softness / 柔和度", 0.1)
         face_restore = g("face_restore / 人脸修复", 'Off')
         face_det_conf = g("face_det_conf / 检测置信度", 0.25)
         face_blend = g("face_blend / 融合强度", 0.65)
         face_fidelity = g("face_fidelity / 保真度", 0.75)
-        detail_mode = g("detail_mode / 细节模式", 'classic')
+        detail_mode = g("detail_mode / 细节模式", 'smart')
         t0 = time.time()
         path = ensure_model(model_name)
         if use_compile and torch.cuda.is_available():
@@ -1728,9 +1728,9 @@ class BSAI_TopazEngine_FaceRestore:
                 "face_blend / 融合强度": ("FLOAT", {"default": 0.65, "min": 0.1, "max": 1.0, "step": 0.05}),
                 "face_fidelity / 保真度": ("FLOAT", {"default": 0.75, "min": 0.0, "max": 1.0, "step": 0.05}),
                 "detail_amount / 细节强度": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.5, "step": 0.05}),
-                "detail_radius / 细节半径": ("FLOAT", {"default": 1.5, "min": 0.3, "max": 8.0, "step": 0.1}),
+                "detail_radius / 细节半径": ("FLOAT", {"default": 1.8, "min": 0.3, "max": 8.0, "step": 0.1}),
                 "softness / 柔和度": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05}),
-                "detail_mode / 细节模式": (["classic", "smart"], {"default": "classic"}),
+                "detail_mode / 细节模式": (["classic", "smart"], {"default": "smart"}),
             },
         }
 

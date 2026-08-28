@@ -15,6 +15,7 @@
 - 🔲 **Tile + Pad 无缝分块** — 大分辨率 / 长视频不爆显存，重叠区自动加权混合消除接缝
 - 🧬 **双架构自适应** — 同时支持标准 RRDBNet 与 compact（`body.N.rdb1/2/3`）结构
 - 🎞️ **H3 latent 二次采样放大** — 32 像素对齐，供 H3 第二遍采样补细节（保持人物一致性）
+- 🧑 **人脸修复 / Face restore** — YOLOv8-Face 检测 + GFPGAN / CodeFormer（ONNX·GPU·零新依赖），一键解决 H3 中远景**小脸崩坏、五官模糊丢失**
 - 🌐 **中英双语节点与文档 / Bilingual nodes & docs**
 - 📦 **零额外依赖** — 仅用 PyTorch + ComfyUI 自带环境，经典 API，最大兼容性
 
@@ -47,6 +48,9 @@
 | `temporal_strength` | **光流时序一致性**：Farneback 光流运动补偿，与前后帧混合消除闪烁/抖动（0=关） | 0.20 |
 | `detail_amount` | **细节增强**：可分高斯 USM 锐化强度（0=关） | 0.30 |
 | `detail_radius` | 细节增强高斯半径（σ，越大越"粗"） | 1.5 |
+| `face_restore` | **人脸修复**：YOLOv8-Face 检测 + GFPGAN/CodeFormer 重建五官，解决 H3 **远景小脸崩坏/模糊**（Off / GFPGANv1.4 / CodeFormer） | Off |
+| `face_det_conf` | 人脸检测置信度（调低可检出更小的远脸，可能增加误检） | 0.25 |
+| `face_blend` | 修复结果与原始融合强度（1=全替换，~0.8 保留一点原皮肤） | 0.85 |
 
 > **模型选择 / Model pick（RTX 5090 实测，960×544 → 4K，compile + FP16）**
 > | 模型 | 质量 | 速度（12s/24fps 视频 ≈288 帧） |
@@ -133,6 +137,20 @@ H3 生成 → 二采 latent 放大(路线B) → VAE Decode → [BSAI H3 upscale 
 ---
 
 ## 📝 更新日志 / Changelog
+
+### v1.4.0 — 人脸修复 / Face restoration
+- **新增人脸修复**（`face_restore` / `face_det_conf` / `face_blend`）：
+  - 检测：**YOLOv8-Face**（`face_yolov8m.pt`，ultralytics，GPU）
+  - 修复：**GFPGAN v1.4** / **CodeFormer**（ONNX + onnxruntime CUDA，零新增 pip 依赖——
+    自动复用 torch 自带的 cudnn/cublas DLL 启用 GPU 推理）
+  - 流程：超分→时序→细节后，对人脸 bbox 扩边裁剪 → 512² 重建五官 → 径向高斯 mask 无缝融合回 4K 帧
+  - 实测：16×22px 极小远脸即可**重建出可辨认的眼睛/鼻子/嘴唇**；单脸 GPU 修复 ~90ms
+- **解决 H3 中远景小脸崩坏 / 五官模糊丢失**：GFPGAN/CodeFormer 为生成式修复，能重建超分无法恢复的崩坏结构
+- **容错**：人脸模型缺失或加载失败时自动跳过，不影响主超分
+
+### v1.3.1 — 防御性修复 / Defensive fix
+- `_detail_enhance_gpu` 形状自适应（`[n,3,H,W]` 与 `[n,H,W,3]` 均兼容），
+  彻底消除 `expected input to have 3 channels` 崩溃（旧版 reshape 堆叠通道路径已删除）
 
 ### v1.3.0 — 时序一致性 + 细节增强 / Temporal consistency + detail
 - **新增光流时序一致性**（`temporal_strength`）：Farneback 光流在 LR 域计算、放大到 SR，

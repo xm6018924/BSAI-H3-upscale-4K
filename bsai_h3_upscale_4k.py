@@ -719,6 +719,129 @@ def _video_temporal_detail(sr_cpu, lr_np, temporal_strength, detail_amount, deta
 
 
 # ---------------------------------------------------------------------------
+# Face restoration (small / distant broken faces)
+# YOLOv8-Face detect -> GFPGAN / CodeFormer ONNX restore -> seamless blend back.
+# Zero new pip deps: uses bundled ultralytics + onnxruntime + torch's cudnn.
+# ---------------------------------------------------------------------------
+_FACE_CACHE: dict = {}
+_ORT_DLL_READY: list = [False]
+
+
+def _ensure_ort_dll() -> None:
+    """onnxruntime CUDA EP needs cudnn/cublas DLLs; they ship inside torch/lib."""
+    if _ORT_DLL_READY[0]:
+        return
+    try:
+        import site
+        for p in site.getsitepackages():
+            d = os.path.join(p, "torch", "lib")
+            if os.path.isdir(d) and os.path.exists(os.path.join(d, "cudnn64_9.dll")):
+                os.add_dll_directory(d)
+                break
+    except Exception:
+        pass
+    _ORT_DLL_READY[0] = True
+
+
+def _face_models(mode: str):
+    """Lazy-load (and cache) detector + restorer for a face mode."""
+    key = mode
+    if key in _FACE_CACHE:
+        return _FACE_CACHE[key]
+    _ensure_ort_dll()
+    import onnxruntime as ort
+    from ultralytics import YOLO
+    base = getattr(folder_paths, "models_dir", "models")
+    det_path = os.path.join(base, "ultralytics", "bbox", "face_yolov8m.pt")
+    if not os.path.exists(det_path):
+        for cand in ("face_yolov8s.pt", "face_yolov8n.pt"):
+            p2 = os.path.join(base, "ultralytics", "bbox", cand)
+            if os.path.exists(p2):
+                det_path = p2
+                break
+    if mode == "CodeFormer":
+        onnx_path = os.path.join(base, "insightface", "codeformer.onnx")
+        if not os.path.exists(onnx_path):
+            onnx_path = os.path.join(base, "facerestore_models", "codeformer.onnx")
+    else:
+        onnx_path = os.path.join(base, "facerestore_models", "GFPGANv1.4.onnx")
+        if not os.path.exists(onnx_path):
+            onnx_path = os.path.join(base, "facerestore_models", "GFPGANv1.3.onnx")
+    if not os.path.exists(det_path):
+        raise FileNotFoundError("face detector not found (ultralytics/bbox/face_yolov8*.pt)")
+    if not os.path.exists(onnx_path):
+        raise FileNotFoundError(f"face restore model not found: {onnx_path}")
+    sess = ort.InferenceSession(
+        onnx_path,
+        providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
+    det = YOLO(det_path)
+    _FACE_CACHE[key] = (det, sess)
+    return det, sess
+
+
+def _restore_faces_frame(img, boxes, sess, mode, blend):
+    """Restore every detected face in one BGR/RGB uint8 frame (numpy), blend back."""
+    H, W = img.shape[:2]
+    out = img.copy()
+    for b in boxes:
+        x1, y1, x2, y2 = [float(v) for v in b]
+        w, h = x2 - x1, y2 - y1
+        if w < 8 or h < 8:
+            continue
+        pad = 0.35 * max(w, h)
+        cx1 = max(0, int(x1 - pad)); cy1 = max(0, int(y1 - pad))
+        cx2 = min(W, int(x2 + pad)); cy2 = min(H, int(y2 + pad))
+        crop = img[cy1:cy2, cx1:cx2]
+        ch, cw = crop.shape[:2]
+        r = cv2.resize(crop, (512, 512), interpolation=cv2.INTER_CUBIC)
+        inp = r.astype(np.float32) / 255.0
+        inp = inp.transpose(2, 0, 1)[None]
+        feed = {sess.get_inputs()[0].name: inp}
+        if len(sess.get_inputs()) > 1:  # CodeFormer: weight (fidelity)
+            feed[sess.get_inputs()[1].name] = np.array([0.5], dtype=np.float64)
+        o = sess.run(None, feed)[0][0].transpose(1, 2, 0)
+        o = np.clip(o, 0, 1)
+        o = (o * 255.0).astype(np.uint8)
+        o = cv2.resize(o, (cw, ch), interpolation=cv2.INTER_CUBIC)
+        # radial Gaussian mask: full-strength in the face centre, feather at edges
+        yy, xx = np.mgrid[0:ch, 0:cw].astype(np.float32)
+        sy = (yy - ch / 2.0) / max(ch / 2.0, 1.0)
+        sx = (xx - cw / 2.0) / max(cw / 2.0, 1.0)
+        m = np.clip(1.0 - np.sqrt(sy * sy + sx * sx) ** 1.5, 0.0, 1.0)
+        m = cv2.GaussianBlur(m, (0, 0), sigmaX=max(2.0, cw / 24.0))
+        m = m[..., None].astype(np.float32)
+        fused = blend * o.astype(np.float32) + (1.0 - blend) * crop.astype(np.float32)
+        out[cy1:cy2, cx1:cx2] = (m * fused + (1.0 - m) * crop.astype(np.float32)).astype(np.uint8)
+    return out
+
+
+def _face_restore_frames(out_tensor, mode, det_conf, blend):
+    """Apply face restoration to an SR tensor [n,H,W,3] float 0-1 (CPU)."""
+    if mode == "Off" or not _HAS_CV2 or not torch.cuda.is_available():
+        return out_tensor
+    try:
+        det, sess = _face_models(mode)
+    except Exception as e:  # never crash the main upscale on face issues
+        print(f"[BSAI-H3] face restore unavailable ({e}); skipping")
+        return out_tensor
+    n = out_tensor.shape[0]
+    det_bs = min(8, n)
+    chunks = []
+    for s in range(0, n, det_bs):
+        seg = out_tensor[s:s + det_bs]
+        frames = (seg.clamp(0, 1).numpy() * 255.0).astype(np.uint8)
+        # pass as a list so ultralytics letterboxes each frame independently
+        res = det.predict([frames[i] for i in range(len(frames))],
+                          conf=det_conf, imgsz=1280, verbose=False)
+        for i in range(len(frames)):
+            boxes = res[i].boxes.xyxy.cpu().numpy() if (res[i].boxes is not None) else np.zeros((0, 4))
+            if len(boxes):
+                frames[i] = _restore_faces_frame(frames[i], boxes, sess, mode, blend)
+        chunks.append(torch.from_numpy(frames).float() / 255.0)
+    return torch.cat(chunks, dim=0)
+
+
+# ---------------------------------------------------------------------------
 # Main node: video frames -> AI upscaled frames
 # ---------------------------------------------------------------------------
 class BSAI_H3_Upscale4K:
@@ -749,6 +872,16 @@ class BSAI_H3_Upscale4K:
                 # Detail enhancement: separable-Gaussian unsharp mask on SR. 0 = off.
                 "detail_amount": ("FLOAT", {"default": 0.30, "min": 0.0, "max": 1.5, "step": 0.05}),
                 "detail_radius": ("FLOAT", {"default": 1.5, "min": 0.3, "max": 8.0, "step": 0.1}),
+                # Face restoration: detects faces (YOLOv8-Face) then regenerates
+                # facial structure with GFPGAN / CodeFormer (ONNX, GPU, zero new
+                # pip deps). Fixes H3's small / distant broken faces.
+                "face_restore": (["Off", "GFPGANv1.4", "CodeFormer"], {"default": "Off"}),
+                # Face detector confidence threshold (lower = more detections,
+                # including tiny distant faces; may add false positives).
+                "face_det_conf": ("FLOAT", {"default": 0.25, "min": 0.05, "max": 0.95, "step": 0.05}),
+                # How strongly the restored face is blended over the original
+                # crop. 1.0 = full restore, ~0.8 keeps a touch of original skin.
+                "face_blend": ("FLOAT", {"default": 0.85, "min": 0.1, "max": 1.0, "step": 0.05}),
             },
         }
 
@@ -757,15 +890,18 @@ class BSAI_H3_Upscale4K:
     FUNCTION = "upscale"
     CATEGORY = "BSAI/H3"
     DESCRIPTION = (
-        "H3 视频专用 AI 超分（像素域）：Real-ESRGAN 极速放大 + 光流时序一致性 + 细节增强。\n"
+        "H3 视频专用 AI 超分（像素域）：Real-ESRGAN 极速放大 + 光流时序一致性 + 细节增强\n"
+        "+ 人脸修复（YOLOv8-Face 检测 + GFPGAN/CodeFormer，解决 H3 远景小脸崩坏模糊）。\n"
         "Tile 分块 + FP16 半精度 + torch.compile + 帧批量并行 + 模型常驻缓存。\n"
         "Video-only AI super-resolution for MiniMax H3: Real-ESRGAN extreme-speed upscale,\n"
-        "with optical-flow temporal consistency and unsharp detail enhancement."
+        "with optical-flow temporal consistency, unsharp detail enhancement and\n"
+        "optional face restoration (YOLOv8-Face + GFPGAN/CodeFormer) for small/distant faces."
     )
 
     def upscale(self, images, model_name, scale, tile_size, tile_pad, batch_frames,
                 use_fp16, use_compile=True, temporal_strength=0.20,
-                detail_amount=0.30, detail_radius=1.5):
+                detail_amount=0.30, detail_radius=1.5,
+                face_restore="Off", face_det_conf=0.25, face_blend=0.85):
         t0 = time.time()
         path = ensure_model(model_name)
         if use_compile and torch.cuda.is_available():
@@ -793,6 +929,12 @@ class BSAI_H3_Upscale4K:
                                      detail_radius, eff_scale)
         td_elapsed = time.time() - t_td
 
+        # Face restoration (small / distant broken faces) - optional, on the SR frames
+        t_fr = time.time()
+        if face_restore != "Off":
+            out = _face_restore_frames(out, face_restore, face_det_conf, face_blend)
+        fr_elapsed = time.time() - t_fr
+
         bh, bw = out.shape[1], out.shape[2]
         elapsed = time.time() - t0
         info = (
@@ -800,7 +942,9 @@ class BSAI_H3_Upscale4K:
             f"output: {bw}x{bh} | eff_scale: {eff_scale}x | "
             f"fp16: {use_fp16} | compile: {use_compile} | tile: {tile_size} pad:{tile_pad} | "
             f"temporal: {temporal_strength} | detail: {detail_amount}@{detail_radius} | "
-            f"frames: {images.shape[0]} | time: {elapsed:.2f}s (temporal+detail: {td_elapsed:.2f}s) | "
+            f"face: {face_restore} (conf={face_det_conf}, blend={face_blend}) | "
+            f"frames: {images.shape[0]} | time: {elapsed:.2f}s "
+            f"(temporal+detail: {td_elapsed:.2f}s, face: {fr_elapsed:.2f}s) | "
             f"device: {'cuda' if torch.cuda.is_available() else 'cpu'}"
         )
         return (out, bw, bh, float(eff_scale), info)

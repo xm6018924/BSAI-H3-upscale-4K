@@ -124,6 +124,35 @@ H3 解码 / 任意视频帧 → [BSAI H3 Face Restore] → 修复后帧
 > 与超分节点的 `face_restore` 参数共用同一套检测/修复引擎与模型缓存；
 > 模型缺失或未启用时自动原样透传，不会崩工作流。
 
+### 4️⃣ BSAI H3 upscale 4K Topaz 星光（完美档 / Topaz Starlight engine tier）
+
+**以 Topaz 星光 2.6 神经引擎为放大底座**（生成式扩散重绘，效果对标 Topaz 官方），
+再叠加本插件的优化——人脸修复（保真模式）+ 细节增强，实现「在 Topaz 基础上
+继续优化高清放大与修复脸部细节」。
+
+```
+任意视频帧 → [BSAI H3 upscale 4K Topaz] → 完美档 4K 帧（+人脸修复/细节）
+```
+
+| 参数 | 说明 | 默认 |
+|---|---|---|
+| `images` | 视频帧序列 `[B,H,W,3]` | — |
+| `scale` | 放大倍数 1.0–4.0（支持小数精确档位，自动偶数对齐） | 2.0 |
+| `enhancement_strength` | 星光"敢不敢重画"：0.7 柔和（人脸/文字安全）/ 1.0 默认 / 1.3 细节最猛 | 1.0 |
+| `max_gpu_mem` | 神经引擎显存上限（GiB，可小数）。16G 卡建议 14 | 14.0 |
+| `fps` | 与视频实际帧率一致（影响中间编码） | 24 |
+| `qp` | 输入编码质量（越小越无损，星光"看得清不清"） | 14 |
+| `face_restore` | 星光输出后叠加人脸修复（Off/GFPGANv1.4/CodeFormer） | Off |
+| `face_det_conf` / `face_blend` / `face_fidelity` | 同主节点人脸修复参数 | 0.25 / 0.65 / 0.75 |
+| `detail_amount` / `detail_radius` / `detail_mode` | 星光输出后叠加细节增强（smart=生成式质感） | 0 / 1.5 / classic |
+| `softness` | 星光输出后柔和（默认 0=不动，星光自带 softness=1） | 0 |
+
+> **引擎依赖**：需本机 `ComfyUI/topaz_engine/`（neuroserver171 + 星光 2.6 权重，
+> 商业引擎自备，节点仅本机调用，不随插件分发任何引擎/权重）。缺失时节点报错提示。
+> **速度**：星光 2.6 是 7B 扩散模型，首帧含加载约数分钟，之后逐帧生成式重绘
+> （RTX 5090 实测 8 帧 608×352→1216×704 首跑约 7 分钟）——与 Topaz 官方一致，
+> 这是追求"完美画质"的代价；需要速度请用节点 1️⃣（极速档）。
+
 ---
 
 ## 🎬 H3 工作流推荐用法 / Recommended H3 workflow
@@ -146,6 +175,14 @@ H3 第一次采样(低分辨率 latent)
 H3 生成 → 二采 latent 放大(路线B) → VAE Decode → [BSAI H3 upscale 4K] → 4K
 ```
 
+**路线 D — Topaz 星光完美档（画质天花板，速度换画质）**
+```
+H3 生成 → VAE Decode → [BSAI H3 upscale 4K Topaz](scale=2, face_restore=CodeFormer)
+   → Save Video
+```
+> 需 `ComfyUI/topaz_engine/` 引擎包。生成式重绘带来最自然的人脸与细节，
+> 远处人脸崩坏由星光生成式修复 + 本插件人脸保真重建双保险。
+
 ---
 
 ## 🧪 性能参考 / Performance (RTX 5090 Laptop, FP16 + compile)
@@ -165,6 +202,18 @@ H3 生成 → 二采 latent 放大(路线B) → VAE Decode → [BSAI H3 upscale 
 ---
 
 ## 📝 更新日志 / Changelog
+
+### v1.8.0 — Topaz 星光完美档 / Topaz Starlight engine tier
+- **推倒重来的方向落地**：新增 `BSAI H3 upscale 4K Topaz` 节点，以 **Topaz 星光 2.6
+  神经引擎（生成式扩散重绘）为放大底座**，效果对标 Topaz 官方"完美"画质；
+  并在其输出上继续叠加本插件优化——人脸修复（保真模式）+ 细节增强/softness，
+  实现「在 Topaz 基础上继续优化高清放大与修复脸部细节」。
+- 引擎复用本机 `ComfyUI/topaz_engine/`（neuroserver171 + 星光 2.6 权重），
+  节点仅本机调用、不随插件分发任何商业引擎/权重；引擎缺失时明确报错。
+- 参数：scale 1.0–4.0（小数精确档位）、enhancement_strength、max_gpu_mem、
+  fps、qp、face_restore/blend/fidelity（叠加人脸保真修复）、
+  detail_amount/radius/mode、softness。
+- 已验证：8 帧 608×352 → 1216×704（2x），生成式管线完整跑通，授权有效。
 
 ### v1.7.0 — 人脸修复保真化 + 自适应强度 + 生成式细节重建（对标 Topaz/FlashVSR）
 - **人脸修复保真优先**（解决「我们最差」：CodeFormer/GFPGAN 把脸修出眯眼/不对称/比例失真）：

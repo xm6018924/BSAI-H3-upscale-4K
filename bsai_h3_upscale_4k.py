@@ -966,60 +966,60 @@ class BSAI_H3_Upscale4K:
         models = list_available_models()
         return {
             "required": {
-                "images": ("IMAGE",),
+                "images / 图像": ("IMAGE",),
                 # general-x4v3 default: ~8x faster than x4plus with nearly identical
                 # quality (PSNR ~39 dB on test frames). x4plus = max quality, slowest.
-                "model_name": (models, {"default": "realesr-general-x4v3.pth"}),
+                "model_name / 模型": (models, {"default": "realesr-general-x4v3.pth"}),
                 # Scale supports any value 1.0-8.0 (incl. Topaz-style precise ratios
                 # like 2.67 / 3.0): integer multiples of the model run directly,
                 # other ratios are super-resolved to the next model integer scale and
                 # then resized to the exact target (even-pixel aligned). 4 = 4K class.
-                "scale": ("FLOAT", {"default": 4.0, "min": 1.0, "max": 8.0, "step": 0.01}),
+                "scale / 放大倍数": ("FLOAT", {"default": 4.0, "min": 1.0, "max": 8.0, "step": 0.01}),
                 # tile_size=0 => full-image fast path (recommended on RTX 30xx+).
                 # Use a positive tile only if you run out of VRAM.
-                "tile_size": ("INT", {"default": 0, "min": 0, "max": 2048, "step": 16}),
-                "tile_pad": ("INT", {"default": 16, "min": 0, "max": 128, "step": 4}),
-                "batch_frames": ("INT", {"default": 4, "min": 1, "max": 128, "step": 1}),
-                "use_fp16": ("BOOLEAN", {"default": True}),
+                "tile_size / 分块大小": ("INT", {"default": 0, "min": 0, "max": 2048, "step": 16}),
+                "tile_pad / 分块重叠": ("INT", {"default": 16, "min": 0, "max": 128, "step": 4}),
+                "batch_frames / 批帧数": ("INT", {"default": 4, "min": 1, "max": 128, "step": 1}),
+                "use_fp16 / 半精度": ("BOOLEAN", {"default": True}),
                 # torch.compile: ~1.6-1.9x faster on fixed-size video frames.
                 # One-time compile cost on first run, then cached process-wide.
-                "use_compile": ("BOOLEAN", {"default": True}),
+                "use_compile / 编译加速": ("BOOLEAN", {"default": True}),
                 # Temporal consistency: motion-compensated blend with neighbours
                 # (Farneback optical flow on LR, GPU warp on SR). 0 = off.
-                "temporal_strength": ("FLOAT", {"default": 0.20, "min": 0.0, "max": 0.8, "step": 0.05}),
+                "temporal_strength / 时序强度": ("FLOAT", {"default": 0.20, "min": 0.0, "max": 0.8, "step": 0.05}),
                 # Detail enhancement: separable-Gaussian unsharp mask on SR. 0 = off.
-                "detail_amount": ("FLOAT", {"default": 0.30, "min": 0.0, "max": 1.5, "step": 0.05}),
-                "detail_radius": ("FLOAT", {"default": 1.5, "min": 0.3, "max": 8.0, "step": 0.1}),
+                "detail_amount / 细节强度": ("FLOAT", {"default": 0.30, "min": 0.0, "max": 1.5, "step": 0.05}),
+                "detail_radius / 细节半径": ("FLOAT", {"default": 1.5, "min": 0.3, "max": 8.0, "step": 0.1}),
                 # Softness (borrowed from Topaz Starlight): after detail USM, blend
                 # back a small fraction of a Gaussian-blurred copy to tame overshoot
                 # and blocky artifacts. 0 = off, ~0.3 gentle, 1.0 very soft.
-                "softness": ("FLOAT", {"default": 0.30, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "softness / 柔和度": ("FLOAT", {"default": 0.30, "min": 0.0, "max": 1.0, "step": 0.05}),
                 # Face restoration: detects faces (YOLOv8-Face) then regenerates
                 # facial structure with GFPGAN / CodeFormer (ONNX, GPU, zero new
                 # pip deps). Fixes H3's small / distant broken faces.
-                "face_restore": (["Off", "GFPGANv1.4", "CodeFormer"], {"default": "Off"}),
+                "face_restore / 人脸修复": (["Off", "GFPGANv1.4", "CodeFormer"], {"default": "Off"}),
                 # Face detector confidence threshold (lower = more detections,
                 # including tiny distant faces; may add false positives).
-                "face_det_conf": ("FLOAT", {"default": 0.25, "min": 0.05, "max": 0.95, "step": 0.05}),
+                "face_det_conf / 检测置信度": ("FLOAT", {"default": 0.25, "min": 0.05, "max": 0.95, "step": 0.05}),
                 # How strongly the restored face is blended over the original
                 # crop. 1.0 = full restore, ~0.65 = fidelity-first (keep skin
                 # and original structure; smaller faces are blended even less).
-                "face_blend": ("FLOAT", {"default": 0.65, "min": 0.1, "max": 1.0, "step": 0.05}),
+                "face_blend / 融合强度": ("FLOAT", {"default": 0.65, "min": 0.1, "max": 1.0, "step": 0.05}),
                 # CodeFormer fidelity (0 = heavy regeneration for badly-broken
                 # faces, 1 = preserve original structure/details). Ignored by
                 # GFPGANv1.4. Default 0.75 = fidelity-first: avoids the AI
                 # 'hallucinated' distorted features seen on small/distant faces.
-                "face_fidelity": ("FLOAT", {"default": 0.75, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "face_fidelity / 保真度": ("FLOAT", {"default": 0.75, "min": 0.0, "max": 1.0, "step": 0.05}),
                 # Detail rebuild mode: classic = unsharp mask only; smart =
                 # unsharp + light local-contrast rebuild (generative-style
                 # texture, gated to avoid halos) — reads closer to Topaz /
                 # FlashVSR's reconstructed texture.
-                "detail_mode": (["classic", "smart"], {"default": "classic"}),
+                "detail_mode / 细节模式": (["classic", "smart"], {"default": "classic"}),
             },
         }
 
     RETURN_TYPES = ("IMAGE", "INT", "INT", "FLOAT", "STRING")
-    RETURN_NAMES = ("IMAGE", "width", "height", "scale_used", "info")
+    RETURN_NAMES = ("IMAGE / 图像", "width / 宽", "height / 高", "scale_used / 实际倍率", "info / 信息")
     FUNCTION = "upscale"
     CATEGORY = "BSAI/H3"
     DESCRIPTION = (
@@ -1030,13 +1030,25 @@ class BSAI_H3_Upscale4K:
         "with optical-flow temporal consistency, unsharp detail enhancement and\n"
         "optional face restoration (YOLOv8-Face + GFPGAN/CodeFormer) for small/distant faces."
     )
-
-    def upscale(self, images, model_name, scale, tile_size, tile_pad, batch_frames,
-                use_fp16, use_compile=True, temporal_strength=0.20,
-                detail_amount=0.30, detail_radius=1.5, softness=0.30,
-                detail_mode="classic",
-                face_restore="Off", face_det_conf=0.25, face_blend=0.65,
-                face_fidelity=0.75):
+    def upscale(self, **kw):
+        g = kw.get
+        images = g("images / 图像")
+        model_name = g("model_name / 模型")
+        scale = g("scale / 放大倍数", 4.0)
+        tile_size = g("tile_size / 分块大小", 0)
+        tile_pad = g("tile_pad / 分块重叠", 16)
+        batch_frames = g("batch_frames / 批帧数", 4)
+        use_fp16 = g("use_fp16 / 半精度", True)
+        use_compile = g("use_compile / 编译加速", True)
+        temporal_strength = g("temporal_strength / 时序强度", 0.2)
+        detail_amount = g("detail_amount / 细节强度", 0.3)
+        detail_radius = g("detail_radius / 细节半径", 1.5)
+        softness = g("softness / 柔和度", 0.3)
+        face_restore = g("face_restore / 人脸修复", 'Off')
+        face_det_conf = g("face_det_conf / 检测置信度", 0.25)
+        face_blend = g("face_blend / 融合强度", 0.65)
+        face_fidelity = g("face_fidelity / 保真度", 0.75)
+        detail_mode = g("detail_mode / 细节模式", 'classic')
         t0 = time.time()
         path = ensure_model(model_name)
         if use_compile and torch.cuda.is_available():
@@ -1375,16 +1387,16 @@ class BSAI_H3_Upscale4K_Latent:
             model_def = model_opts[0]
         return {
             "required": {
-                "samples": ("LATENT",),
-                "upscale_method": (cls.upscale_methods, {"default": "learned-3d"}),
-                "scale_by": ("FLOAT", {"default": 1.5, "min": 1.0, "max": 8.0, "step": 0.01}),
-                "model_name": (model_opts, {"default": model_def}),
-                "precision": (["fp32", "fp16", "bf16"], {"default": "fp16"}),
+                "samples / 潜空间": ("LATENT",),
+                "upscale_method / 放大方法": (cls.upscale_methods, {"default": "learned-3d"}),
+                "scale_by / 放大倍数": ("FLOAT", {"default": 1.5, "min": 1.0, "max": 8.0, "step": 0.01}),
+                "model_name / 模型": (model_opts, {"default": model_def}),
+                "precision / 精度": (["fp32", "fp16", "bf16"], {"default": "fp16"}),
             },
         }
 
     RETURN_TYPES = ("LATENT", "INT", "INT", "FLOAT", "STRING")
-    RETURN_NAMES = ("LATENT", "width", "height", "effective_scale", "info")
+    RETURN_NAMES = ("LATENT / 潜空间", "width / 宽", "height / 高", "effective_scale / 实际倍率", "info / 信息")
     FUNCTION = "upscale"
     CATEGORY = "BSAI/H3"
     DESCRIPTION = (
@@ -1472,8 +1484,13 @@ class BSAI_H3_Upscale4K_Latent:
                 f"{w_out * ds}x{h_out * ds} | eff_scale {eff_actual:.4f}x | "
                 f"learned-3d: {name} | {precision}")
         return (result, w_out * ds, h_out * ds, float(eff_actual), info)
-
-    def upscale(self, samples, upscale_method, scale_by, model_name="", precision="fp16"):
+    def upscale(self, **kw):
+        g = kw.get
+        samples = g("samples / 潜空间")
+        upscale_method = g("upscale_method / 放大方法", 'learned-3d')
+        scale_by = g("scale_by / 放大倍数", 1.5)
+        model_name = g("model_name / 模型")
+        precision = g("precision / 精度", 'fp16')
         import comfy.utils
         source = samples["samples"]
         lw, lh = source.shape[-1], source.shape[-2]
@@ -1504,16 +1521,16 @@ class BSAI_H3_FaceRestore:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "images": ("IMAGE",),
-                "face_restore": (["Off", "GFPGANv1.4", "CodeFormer"], {"default": "GFPGANv1.4"}),
-                "face_det_conf": ("FLOAT", {"default": 0.25, "min": 0.05, "max": 0.95, "step": 0.05}),
-                "face_blend": ("FLOAT", {"default": 0.65, "min": 0.1, "max": 1.0, "step": 0.05}),
-                "face_fidelity": ("FLOAT", {"default": 0.75, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "images / 图像": ("IMAGE",),
+                "face_restore / 人脸修复": (["Off", "GFPGANv1.4", "CodeFormer"], {"default": "GFPGANv1.4"}),
+                "face_det_conf / 检测置信度": ("FLOAT", {"default": 0.25, "min": 0.05, "max": 0.95, "step": 0.05}),
+                "face_blend / 融合强度": ("FLOAT", {"default": 0.65, "min": 0.1, "max": 1.0, "step": 0.05}),
+                "face_fidelity / 保真度": ("FLOAT", {"default": 0.75, "min": 0.0, "max": 1.0, "step": 0.05}),
             },
         }
 
     RETURN_TYPES = ("IMAGE", "INT", "STRING")
-    RETURN_NAMES = ("IMAGE", "faces_detected", "info")
+    RETURN_NAMES = ("IMAGE / 图像", "faces_detected / 检测人脸数", "info / 信息")
     FUNCTION = "restore"
     CATEGORY = "BSAI/H3"
     DESCRIPTION = (
@@ -1525,8 +1542,13 @@ class BSAI_H3_FaceRestore:
         "GFPGAN/CodeFormer regenerate, fixes small/distant broken faces.\n"
         "v1.7.0: fidelity-first + adaptive strength + flip-TTA for natural faces."
     )
-
-    def restore(self, images, face_restore, face_det_conf, face_blend, face_fidelity=0.75):
+    def restore(self, **kw):
+        g = kw.get
+        images = g("images / 图像")
+        face_restore = g("face_restore / 人脸修复", 'Off')
+        face_det_conf = g("face_det_conf / 检测置信度", 0.25)
+        face_blend = g("face_blend / 融合强度", 0.65)
+        face_fidelity = g("face_fidelity / 保真度", 0.75)
         t0 = time.time()
         out, nf = _face_restore_frames(images, face_restore, face_det_conf, face_blend, face_fidelity)
         info = (
@@ -1690,27 +1712,30 @@ class BSAI_TopazEngine_FaceRestore:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "images": ("IMAGE",),
-                "model": (cls.TOPAZ_MODELS, {"default": "星光 2.6",
-                                             "tooltip": "星光2.6=默认最佳；Astra系列需≥9帧"}),
-                "scale": ("FLOAT", {"default": 2.0, "min": 1.0, "max": 4.0, "step": 0.01}),
-                "enhancement_strength": ("FLOAT", {"default": 1.0, "min": 0.5, "max": 1.5, "step": 0.1}),
-                "max_gpu_mem": ("FLOAT", {"default": 14.0, "min": 8.0, "max": 16.0, "step": 0.1}),
-                "fps": ("INT", {"default": 24, "min": 1, "max": 120}),
-                "qp": ("INT", {"default": 14, "min": 0, "max": 40}),
-                "face_restore": (["Off", "GFPGANv1.4", "CodeFormer"], {"default": "Off"}),
-                "face_det_conf": ("FLOAT", {"default": 0.25, "min": 0.05, "max": 0.95, "step": 0.05}),
-                "face_blend": ("FLOAT", {"default": 0.65, "min": 0.1, "max": 1.0, "step": 0.05}),
-                "face_fidelity": ("FLOAT", {"default": 0.75, "min": 0.0, "max": 1.0, "step": 0.05}),
-                "detail_amount": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.5, "step": 0.05}),
-                "detail_radius": ("FLOAT", {"default": 1.5, "min": 0.3, "max": 8.0, "step": 0.1}),
-                "softness": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05}),
-                "detail_mode": (["classic", "smart"], {"default": "classic"}),
+                "images / 图像": ("IMAGE",),
+                "model / 模型": (cls.TOPAZ_MODELS, {"default": "星光 2.6",
+                                    "tooltip": "星光2.6=默认最佳；Astra系列需≥9帧 / Starlight2.6 default, Astra needs >=9 frames"}),
+                "scale / 放大倍数": ("FLOAT", {"default": 2.0, "min": 1.0, "max": 4.0, "step": 0.01,
+                                              "tooltip": "输出放大倍数 1-4（支持小数）/ Upscale factor 1-4 (fraction ok)"}),
+                "enhancement_strength / 增强强度": ("FLOAT", {"default": 1.0, "min": 0.5, "max": 1.5, "step": 0.1,
+                                                              "tooltip": "0.7柔和 / 1.0默认 / 1.3细节最猛"}),
+                "max_gpu_mem / 显存上限": ("FLOAT", {"default": 14.0, "min": 8.0, "max": 16.0, "step": 0.1}),
+                "fps / 帧率": ("INT", {"default": 24, "min": 1, "max": 120}),
+                "qp / 输入质量": ("INT", {"default": 14, "min": 0, "max": 40,
+                                         "tooltip": "输入编码质量，越小越无损 / lower = more lossless"}),
+                "face_restore / 人脸修复": (["Off", "GFPGANv1.4", "CodeFormer"], {"default": "Off"}),
+                "face_det_conf / 检测置信度": ("FLOAT", {"default": 0.25, "min": 0.05, "max": 0.95, "step": 0.05}),
+                "face_blend / 融合强度": ("FLOAT", {"default": 0.65, "min": 0.1, "max": 1.0, "step": 0.05}),
+                "face_fidelity / 保真度": ("FLOAT", {"default": 0.75, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "detail_amount / 细节强度": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.5, "step": 0.05}),
+                "detail_radius / 细节半径": ("FLOAT", {"default": 1.5, "min": 0.3, "max": 8.0, "step": 0.1}),
+                "softness / 柔和度": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "detail_mode / 细节模式": (["classic", "smart"], {"default": "classic"}),
             },
         }
 
     RETURN_TYPES = ("IMAGE", "INT", "INT", "FLOAT", "STRING")
-    RETURN_NAMES = ("IMAGE", "width", "height", "scale_used", "info")
+    RETURN_NAMES = ("IMAGE / 图像", "width / 宽", "height / 高", "scale_used / 实际倍率", "info / 信息")
     FUNCTION = "run"
     CATEGORY = "BSAI/H3"
     DESCRIPTION = (
@@ -1718,13 +1743,27 @@ class BSAI_TopazEngine_FaceRestore:
         "默认 ComfyUI/models/Topaz_Engine）生成式放大，再叠加本插件的人脸修复\n"
         "（保真模式）+ 细节增强。底座效果对标 Topaz 官方，在其基础上继续优化\n"
         "脸部细节。Topaz engine tier: generative upscale (Starlight/Astra) +\n"
-        "our fidelity-first face restore + optional detail/softness on top."
+        "our fidelity-first face restore + optional detail/softness on top.\n"
+        "参数名中英双语 / Parameters bilingual (EN / 中文)."
     )
 
-    def run(self, images, model="星光 2.6", scale=2.0, enhancement_strength=1.0,
-            max_gpu_mem=14.0, fps=24, qp=14,
-            face_restore="Off", face_det_conf=0.25, face_blend=0.65, face_fidelity=0.75,
-            detail_amount=0.0, detail_radius=1.5, softness=0.0, detail_mode="classic"):
+    def run(self, **kw):
+        g = kw.get
+        images = g("images / 图像")
+        model = g("model / 模型", "星光 2.6")
+        scale = g("scale / 放大倍数", 2.0)
+        enhancement_strength = g("enhancement_strength / 增强强度", 1.0)
+        max_gpu_mem = g("max_gpu_mem / 显存上限", 14.0)
+        fps = g("fps / 帧率", 24)
+        qp = g("qp / 输入质量", 14)
+        face_restore = g("face_restore / 人脸修复", "Off")
+        face_det_conf = g("face_det_conf / 检测置信度", 0.25)
+        face_blend = g("face_blend / 融合强度", 0.65)
+        face_fidelity = g("face_fidelity / 保真度", 0.75)
+        detail_amount = g("detail_amount / 细节强度", 0.0)
+        detail_radius = g("detail_radius / 细节半径", 1.5)
+        softness = g("softness / 柔和度", 0.0)
+        detail_mode = g("detail_mode / 细节模式", "classic")
         t0 = time.time()
         b, h, w, c = images.shape
         if c != 3:

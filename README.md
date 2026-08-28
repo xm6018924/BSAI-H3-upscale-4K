@@ -207,6 +207,17 @@ H3 生成 → VAE Decode → [BSAI Topaz Engine Face Restore](model=星光 2.6, 
 
 ## 📝 更新日志 / Changelog
 
+### v1.8.3 — 全部参数 UI 中英双语对照 / Bilingual parameter UI
+- **全部 4 个节点的参数名 / 输出端口名改为中英双语对照**（如 `scale / 放大倍数`、
+  `face_restore / 人脸修复`、`softness / 柔和度`、`width / 宽`），UI 直接显示双语标签，
+  符合中英双语用户习惯。
+- 覆盖节点：`BSAI H3 upscale 4K`(17 参)、`BSAI H3 upscale 4K Latent`(5 参)、
+  `BSAI H3 Face Restore`(5 参)、`BSAI Topaz Engine Face Restore`(15 参)。
+- 兼容性：输入 key 与保存顺序保持不变，旧工作流（v1.5.x 及以前）加载后
+  自动按新标签重建，链接 / 参数值 100% 兼容，无需手动改工作流。
+- 已同步更新最新示例工作流 v1.5.3 对比流（BSAI 节点 input 名 + 清理 3 条残留
+  dangling output link 引用，75 节点 / 68 连线 / 0 错误）。
+
 ### v1.8.2 — Topaz 引擎统一共用目录 / Shared engine dir
 - 引擎路径统一为 **`ComfyUI/models/Topaz_Engine`**（相对 ComfyUI 根动态解析，
   不写死绝对路径），与第三方 TopazStarlight 节点**共用同一引擎**。

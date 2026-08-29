@@ -1006,10 +1006,10 @@ def _face_restore_frames(out_tensor, mode, det_conf, blend, fidelity=0.75):
 # plugin still imports fine if any engine is missing.
 # ---------------------------------------------------------------------------
 def _load_plugin_package(plugin_dir, pkg_name):
-    """Load a ComfyUI custom_nodes plugin as a package (supports relative imports)."""
+    """Load a ComfyUI custom_nodes plugin as a package (supports relative imports).
+    No explicit 'plugin not installed' error — if the plugin is missing the subsequent
+    import raises naturally. We only proactively error on missing model weights."""
     import importlib.util
-    if not os.path.isdir(plugin_dir):
-        raise RuntimeError(f"Plugin not found: {plugin_dir}")
     if pkg_name not in sys.modules:
         init_path = os.path.join(plugin_dir, "__init__.py")
         spec = importlib.util.spec_from_file_location(
@@ -1024,6 +1024,18 @@ def _load_plugin_package(plugin_dir, pkg_name):
 def _flashvsr_upscale(frames, scale, seed=42):
     """FlashVSR-v1.1 diffusion video SR. Weights: ComfyUI/models/FlashVSR-v1.1/ (unchanged)."""
     import importlib
+    model_dir = os.path.join(folder_paths.models_dir, "FlashVSR-v1.1")
+    required = ["diffusion_pytorch_model_streaming_dmd.safetensors", "Wan2.1_VAE.pth",
+                "LQ_proj_in.ckpt", "TCDecoder.ckpt"]
+    missing = [f for f in required if not os.path.isfile(os.path.join(model_dir, f))]
+    if missing:
+        raise RuntimeError(
+            "FlashVSR-v1.1 模型权重缺失 / FlashVSR-v1.1 weights missing:\n"
+            f"  缺失 / Missing: {', '.join(missing)}\n"
+            "  下载 / Download: https://huggingface.co/JunhaoZhuang/FlashVSR\n"
+            f"  放置路径 / Place in: {model_dir}\n"
+            f"  需要文件 / Required: {', '.join(required)}"
+        )
     flash_dir = os.path.join(folder_paths.base_path, "custom_nodes", "ComfyUI-FlashVSR_Ultra_Fast")
     _load_plugin_package(flash_dir, "_bsai_flashvsr")
     nodes_mod = importlib.import_module("_bsai_flashvsr.nodes")
@@ -1039,19 +1051,31 @@ def _flashvsr_upscale(frames, scale, seed=42):
 def _seedvr2_upscale(frames, scale, seed=42):
     """SeedVR2 7B diffusion video SR. Weights: ComfyUI/models/SEEDVR2/ (unchanged)."""
     import importlib
+    model_dir = os.path.join(folder_paths.models_dir, "SEEDVR2")
+    dit_file = "seedvr2_ema_7b_fp8_e4m3fn_mixed_block35_fp16.safetensors"
+    vae_file = "ema_vae_fp16.safetensors"
+    missing = [f for f in [dit_file, vae_file] if not os.path.isfile(os.path.join(model_dir, f))]
+    if missing:
+        raise RuntimeError(
+            "SeedVR2 模型权重缺失 / SeedVR2 weights missing:\n"
+            f"  缺失 / Missing: {', '.join(missing)}\n"
+            "  下载 / Download: https://huggingface.co/ByteDance/SeedVR2-7B (或社区镜像)\n"
+            f"  放置路径 / Place in: {model_dir}\n"
+            f"  需要文件 / Required: {dit_file}, {vae_file}"
+        )
     seed_dir = os.path.join(folder_paths.base_path, "custom_nodes", "ComfyUI-SeedVR2_VideoUpscaler")
     _load_plugin_package(seed_dir, "_bsai_seedvr2")
     up_mod = importlib.import_module("_bsai_seedvr2.src.interfaces.video_upscaler")
     SeedVR2VideoUpscaler = up_mod.SeedVR2VideoUpscaler
     dev = "cuda:0" if torch.cuda.is_available() else "cpu"
     dit = {
-        "model": "seedvr2_ema_7b_fp8_e4m3fn_mixed_block35_fp16.safetensors",
+        "model": dit_file,
         "device": dev, "offload_device": "none", "cache_model": False,
         "blocks_to_swap": 0, "swap_io_components": False, "attention_mode": "sdpa",
         "torch_compile_args": None, "node_id": "bsai_unified",
     }
     vae = {
-        "model": "ema_vae_fp16.safetensors",
+        "model": vae_file,
         "device": dev, "offload_device": "none", "cache_model": False,
         "encode_tiled": False, "encode_tile_size": 512, "encode_tile_overlap": 64,
         "decode_tiled": False, "decode_tile_size": 512, "decode_tile_overlap": 64,

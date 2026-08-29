@@ -990,28 +990,31 @@ def _face_restore_frames(out_tensor, mode, det_conf, blend, fidelity=0.75):
     only tiny / no detections) to catch distant small faces that the single
     1280 pass misses.
 
+    v2.3.0: temporal stability — face boxes are EMA-smoothed across frames
+    (IOU-tracked) and restored face regions are lightly blended with the
+    previous frame (0.15) to eliminate frame-to-frame face flicker that
+    plagues diffusion SR engines (SeedVR2 / FlashVSR) when face_restore
+    runs per-frame independently.
+
     Returns (out_tensor, total_faces_detected)."""
     if mode == "Off" or not _HAS_CV2 or not torch.cuda.is_available():
         return out_tensor, 0
     try:
         det, sess = _face_models(mode)
-    except Exception as e:  # never crash the main upscale on face issues
+    except Exception as e:
         print(f"[BSAI-H3] face restore unavailable ({e}); skipping")
         return out_tensor, 0
     n = out_tensor.shape[0]
+    # ---- Phase 1: detect faces in ALL frames first ----
+    all_boxes = []
     det_bs = min(8, n)
-    chunks = []
-    total = 0
     for s in range(0, n, det_bs):
         seg = out_tensor[s:s + det_bs]
         frames = (seg.clamp(0, 1).numpy() * 255.0).astype(np.uint8)
-        # pass as a list so ultralytics letterboxes each frame independently
         res = det.predict([frames[i] for i in range(len(frames))],
                           conf=det_conf, imgsz=1280, verbose=False)
         for i in range(len(frames)):
             boxes = res[i].boxes.xyxy.cpu().numpy() if (res[i].boxes is not None) else np.zeros((0, 4))
-            # ---- multi-scale re-scan: if no face or only tiny faces (<3% frame),
-            # re-run at 1920 to catch distant small faces ----
             H, W = frames[i].shape[:2]
             frame_area = float(H * W)
             has_large = any(((b[2]-b[0])*(b[3]-b[1]) / frame_area) >= 0.03 for b in boxes) if len(boxes) else False
@@ -1020,7 +1023,6 @@ def _face_restore_frames(out_tensor, mode, det_conf, blend, fidelity=0.75):
                                     imgsz=1920, verbose=False)
                 boxes2 = res2[0].boxes.xyxy.cpu().numpy() if (res2[0].boxes is not None) else np.zeros((0, 4))
                 if len(boxes2):
-                    # merge: keep boxes2 that don't significantly overlap existing
                     if len(boxes) == 0:
                         boxes = boxes2
                     else:
@@ -1040,9 +1042,82 @@ def _face_restore_frames(out_tensor, mode, det_conf, blend, fidelity=0.75):
                                 keep.append(b2)
                         if keep:
                             boxes = np.vstack([boxes, np.array(keep)])
+            all_boxes.append(boxes)
+
+    # ---- Phase 2: temporal EMA smoothing of face boxes (IOU-tracked) ----
+    EMA_ALPHA = 0.55
+    smoothed_boxes = []
+    prev_boxes = np.zeros((0, 4))
+    miss_count = 0
+    for fi in range(n):
+        cur = all_boxes[fi]
+        if len(cur) == 0:
+            if len(prev_boxes) > 0 and miss_count < 3:
+                smoothed_boxes.append(prev_boxes.copy())
+                miss_count += 1
+            else:
+                smoothed_boxes.append(np.zeros((0, 4)))
+                prev_boxes = np.zeros((0, 4))
+                miss_count = 0
+            continue
+        miss_count = 0
+        if len(prev_boxes) == 0:
+            smoothed_boxes.append(cur.copy())
+            prev_boxes = cur.copy()
+            continue
+        smoothed = cur.copy()
+        for ci in range(len(cur)):
+            best_iou = 0.0
+            best_pi = -1
+            cx1, cy1, cx2, cy2 = cur[ci]
+            carea = max((cx2-cx1)*(cy2-cy1), 1)
+            for pi in range(len(prev_boxes)):
+                px1, py1, px2, py2 = prev_boxes[pi]
+                ix1 = max(cx1, px1); iy1 = max(cy1, py1)
+                ix2 = min(cx2, px2); iy2 = min(cy2, py2)
+                if ix2 > ix1 and iy2 > iy1:
+                    inter = (ix2-ix1)*(iy2-iy1)
+                    parea = max((px2-px1)*(py2-py1), 1)
+                    iou = inter / (carea + parea - inter)
+                    if iou > best_iou:
+                        best_iou = iou
+                        best_pi = pi
+            if best_pi >= 0 and best_iou > 0.3:
+                smoothed[ci] = EMA_ALPHA * cur[ci] + (1.0 - EMA_ALPHA) * prev_boxes[best_pi]
+        smoothed_boxes.append(smoothed)
+        prev_boxes = smoothed.copy()
+
+    # ---- Phase 3: restore faces with smoothed boxes + temporal result blend ----
+    TEMP_BLEND = 0.15
+    chunks = []
+    total = 0
+    prev_restored = None
+    for s in range(0, n, det_bs):
+        seg = out_tensor[s:s + det_bs]
+        frames = (seg.clamp(0, 1).numpy() * 255.0).astype(np.uint8)
+        for i in range(len(frames)):
+            fi = s + i
+            boxes = smoothed_boxes[fi]
             if len(boxes):
                 total += len(boxes)
-                frames[i] = _restore_faces_frame(frames[i], boxes, sess, mode, blend, fidelity)
+                restored = _restore_faces_frame(frames[i], boxes, sess, mode, blend, fidelity)
+                if prev_restored is not None and prev_restored.shape == restored.shape:
+                    blended = restored.copy()
+                    for b in boxes:
+                        x1, y1, x2, y2 = [int(max(0, v)) for v in b]
+                        x2 = min(x2, restored.shape[1]); y2 = min(y2, restored.shape[0])
+                        if x2 > x1 and y2 > y1:
+                            blended[y1:y2, x1:x2] = (
+                                (1.0 - TEMP_BLEND) * restored[y1:y2, x1:x2].astype(np.float32)
+                                + TEMP_BLEND * prev_restored[y1:y2, x1:x2].astype(np.float32)
+                            ).astype(np.uint8)
+                    frames[i] = blended
+                    prev_restored = blended
+                else:
+                    frames[i] = restored
+                    prev_restored = restored
+            else:
+                prev_restored = None
         chunks.append(torch.from_numpy(frames).float() / 255.0)
     return torch.cat(chunks, dim=0), total
 

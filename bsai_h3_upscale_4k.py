@@ -1915,7 +1915,13 @@ def _topaz_read_video(path):
 
 
 def _topaz_run(in_path, out_path, scale, frames, w, h, strength, max_gpu_mem, model_id="slp-26"):
-    """Run Topaz neuroserver (Starlight / Astra) on a video file."""
+    """Run Topaz neuroserver (Starlight / Astra) on a video file.
+
+    v2.2.1: retry on neuroserver crash (exit 3221225478 = STATUS_IN_PAGE_ERROR,
+    common on consecutive Astra runs when GPU memory isn't fully released).
+    Retry strategy: up to 2 retries, each with 5s cooldown + torch CUDA cache
+    clear + progressively lower max_gpu_mem (14 -> 12 -> 10) to reduce OOM/crash.
+    """
     ASTRA_MODELS = ('astra', 'astrahq', 'astrasharp', 'astrafast')
     if model_id in ASTRA_MODELS and frames < 9:
         raise RuntimeError(
@@ -1944,24 +1950,66 @@ def _topaz_run(in_path, out_path, scale, frames, w, h, strength, max_gpu_mem, mo
     oh = int(round(h * scale)); oh += oh % 2
     NS_ENC = ('-c:v h264_nvenc -profile:v high -pix_fmt yuv420p -g 30 -preset p7 -tune hq '
               '-rc constqp -qp 18 -rc-lookahead 20 -spatial_aq 1 -aq-strength 15 -b:v 0 -bf 0')
-    cmd = [ns, '--once', '--input-path', in_path, '--output-path', out_path,
-           '--start-frame-idx', '0', '--end-frame-idx', str(frames),
-           '--max-gpu-mem', str(max_gpu_mem), '--filters', filters,
-           '--output-width', str(ow), '--output-height', str(oh),
-           '--upscale-factor', str(scale), '--ffmpeg-encoding', NS_ENC]
-    print(f"[BSAI-H3/Topaz] 星光引擎: {ns} | 模型: {model_id} | {frames}帧 {w}x{h} -> {ow}x{oh} (x{scale})")
-    proc = subprocess.Popen(cmd, env=env, cwd=os.path.dirname(ns),
-                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                            encoding='utf-8', errors='replace')
-    for line in proc.stdout:
-        line = line.rstrip()
-        if line:
-            print("  [Topaz] " + line)
-    proc.wait()
-    if proc.returncode != 0:
-        raise RuntimeError(f'neuroserver failed (exit {proc.returncode})')
-    if not os.path.isfile(out_path):
-        raise RuntimeError('neuroserver produced no output file')
+
+    max_attempts = 3
+    last_err = None
+    for attempt in range(max_attempts):
+        # progressively lower GPU memory on retries to reduce crash probability
+        gpu_mem = max_gpu_mem if attempt == 0 else max(8.0, max_gpu_mem - 2.0 * attempt)
+        cmd = [ns, '--once', '--input-path', in_path, '--output-path', out_path,
+               '--start-frame-idx', '0', '--end-frame-idx', str(frames),
+               '--max-gpu-mem', str(gpu_mem), '--filters', filters,
+               '--output-width', str(ow), '--output-height', str(oh),
+               '--upscale-factor', str(scale), '--ffmpeg-encoding', NS_ENC]
+        if attempt == 0:
+            print(f"[BSAI-H3/Topaz] 星光引擎: {ns} | 模型: {model_id} | {frames}帧 {w}x{h} -> {ow}x{oh} (x{scale})")
+        else:
+            print(f"[BSAI-H3/Topaz] 重试 {attempt}/{max_attempts-1} | max_gpu_mem={gpu_mem} | 模型: {model_id}")
+        # clear torch CUDA cache before each neuroserver launch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+        try:
+            proc = subprocess.Popen(cmd, env=env, cwd=os.path.dirname(ns),
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                    encoding='utf-8', errors='replace')
+            for line in proc.stdout:
+                line = line.rstrip()
+                if line:
+                    print("  [Topaz] " + line)
+            proc.wait()
+            if proc.returncode != 0:
+                last_err = RuntimeError(f'neuroserver failed (exit {proc.returncode})')
+                if attempt < max_attempts - 1:
+                    print(f"[BSAI-H3/Topaz] neuroserver 崩溃 (exit {proc.returncode}), 5秒后重试...")
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    time.sleep(5)
+                    continue
+                else:
+                    raise last_err
+            if not os.path.isfile(out_path):
+                last_err = RuntimeError('neuroserver produced no output file')
+                if attempt < max_attempts - 1:
+                    time.sleep(3)
+                    continue
+                else:
+                    raise last_err
+            # success
+            if attempt > 0:
+                print(f"[BSAI-H3/Topaz] 重试成功 (attempt {attempt})")
+            return
+        except RuntimeError:
+            raise
+        except Exception as e:
+            last_err = e
+            if attempt < max_attempts - 1:
+                print(f"[BSAI-H3/Topaz] 异常: {e}, 重试...")
+                time.sleep(5)
+                continue
+            else:
+                raise
+    raise last_err or RuntimeError('neuroserver failed after all retries')
 
 
 def _topaz_upscale(frames, fps, scale, strength, max_gpu_mem, qp=14, model_id="slp-26"):
@@ -2012,10 +2060,10 @@ class BSAI_TopazEngine_FaceRestore:
                 "fps / 帧率": ("INT", {"default": 24, "min": 1, "max": 120}),
                 "qp / 输入质量": ("INT", {"default": 14, "min": 0, "max": 40,
                                          "tooltip": "输入编码质量，越小越无损 / lower = more lossless"}),
-                "face_restore / 人脸修复": (["Off", "GFPGANv1.4", "CodeFormer"], {"default": "Off"}),
-                "face_det_conf / 检测置信度": ("FLOAT", {"default": 0.25, "min": 0.05, "max": 0.95, "step": 0.05}),
-                "face_blend / 融合强度": ("FLOAT", {"default": 0.65, "min": 0.1, "max": 1.0, "step": 0.05}),
-                "face_fidelity / 保真度": ("FLOAT", {"default": 0.75, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "face_restore / 人脸修复": (["Off", "GFPGANv1.4", "CodeFormer", "小脸增强(CodeFormer)"], {"default": "Off"}),
+                "face_det_conf / 检测置信度": ("FLOAT", {"default": 0.15, "min": 0.05, "max": 0.95, "step": 0.05}),
+                "face_blend / 融合强度": ("FLOAT", {"default": 0.70, "min": 0.1, "max": 1.0, "step": 0.05}),
+                "face_fidelity / 保真度": ("FLOAT", {"default": 0.60, "min": 0.0, "max": 1.0, "step": 0.05}),
                 "detail_amount / 细节强度": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.5, "step": 0.05}),
                 "detail_radius / 细节半径": ("FLOAT", {"default": 1.8, "min": 0.3, "max": 8.0, "step": 0.1}),
                 "softness / 柔和度": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05}),
@@ -2046,9 +2094,9 @@ class BSAI_TopazEngine_FaceRestore:
         fps = g("fps / 帧率", 24)
         qp = g("qp / 输入质量", 14)
         face_restore = g("face_restore / 人脸修复", "Off")
-        face_det_conf = g("face_det_conf / 检测置信度", 0.25)
-        face_blend = g("face_blend / 融合强度", 0.65)
-        face_fidelity = g("face_fidelity / 保真度", 0.75)
+        face_det_conf = g("face_det_conf / 检测置信度", 0.15)
+        face_blend = g("face_blend / 融合强度", 0.70)
+        face_fidelity = g("face_fidelity / 保真度", 0.60)
         detail_amount = g("detail_amount / 细节强度", 0.0)
         detail_radius = g("detail_radius / 细节半径", 1.5)
         softness = g("softness / 柔和度", 0.0)
@@ -2063,7 +2111,16 @@ class BSAI_TopazEngine_FaceRestore:
         out_t = torch.from_numpy(out.astype(np.float32) / 255.0)
         nf = 0
         if face_restore != "Off":
-            out_t, nf = _face_restore_frames(out_t, face_restore, face_det_conf, face_blend, face_fidelity)
+            fr_mode = face_restore
+            fr_conf = face_det_conf
+            fr_blend = face_blend
+            fr_fid = face_fidelity
+            if face_restore == "小脸增强(CodeFormer)":
+                fr_mode = "CodeFormer"
+                fr_conf = min(0.12, float(face_det_conf))
+                fr_blend = max(0.80, float(face_blend))
+                fr_fid = min(0.40, float(face_fidelity))
+            out_t, nf = _face_restore_frames(out_t, fr_mode, fr_conf, fr_blend, fr_fid)
         if (detail_amount > 0 or softness > 0) and torch.cuda.is_available():
             dev = torch.cuda.current_device()
             x = out_t.to(dev).permute(0, 3, 1, 2)

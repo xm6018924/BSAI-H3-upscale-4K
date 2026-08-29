@@ -990,11 +990,11 @@ def _face_restore_frames(out_tensor, mode, det_conf, blend, fidelity=0.75):
     only tiny / no detections) to catch distant small faces that the single
     1280 pass misses.
 
-    v2.3.0: temporal stability — face boxes are EMA-smoothed across frames
-    (IOU-tracked) and restored face regions are lightly blended with the
-    previous frame (0.15) to eliminate frame-to-frame face flicker that
-    plagues diffusion SR engines (SeedVR2 / FlashVSR) when face_restore
-    runs per-frame independently.
+    v2.3.1: temporal stability — face boxes are EMA-smoothed across frames
+    (IOU-tracked, alpha=0.70, 1-frame persistence) to eliminate frame-to-frame
+    face detection flicker in diffusion SR engines (SeedVR2 / FlashVSR).
+    Frame-to-frame result blending was REMOVED in v2.3.1 because it caused
+    ghosting/double-image artifacts on moving faces.
 
     Returns (out_tensor, total_faces_detected)."""
     if mode == "Off" or not _HAS_CV2 or not torch.cuda.is_available():
@@ -1045,14 +1045,15 @@ def _face_restore_frames(out_tensor, mode, det_conf, blend, fidelity=0.75):
             all_boxes.append(boxes)
 
     # ---- Phase 2: temporal EMA smoothing of face boxes (IOU-tracked) ----
-    EMA_ALPHA = 0.55
+    EMA_ALPHA = 0.70  # 70% current + 30% prev: stable but responsive (less lag)
     smoothed_boxes = []
     prev_boxes = np.zeros((0, 4))
     miss_count = 0
     for fi in range(n):
         cur = all_boxes[fi]
         if len(cur) == 0:
-            if len(prev_boxes) > 0 and miss_count < 3:
+            # Only persist for 1 frame on missed detection (avoid ghosting on fast motion)
+            if len(prev_boxes) > 0 and miss_count < 1:
                 smoothed_boxes.append(prev_boxes.copy())
                 miss_count += 1
             else:
@@ -1087,11 +1088,13 @@ def _face_restore_frames(out_tensor, mode, det_conf, blend, fidelity=0.75):
         smoothed_boxes.append(smoothed)
         prev_boxes = smoothed.copy()
 
-    # ---- Phase 3: restore faces with smoothed boxes + temporal result blend ----
-    TEMP_BLEND = 0.15
+    # ---- Phase 3: restore faces with EMA-smoothed boxes ----
+    # NOTE: frame-to-frame result blending is intentionally NOT done here —
+    # blending 15% of the previous frame's restored face causes ghosting/
+    # double-image artifacts when the face moves. Box EMA smoothing alone
+    # (Phase 2) is sufficient to eliminate detection flicker without ghosting.
     chunks = []
     total = 0
-    prev_restored = None
     for s in range(0, n, det_bs):
         seg = out_tensor[s:s + det_bs]
         frames = (seg.clamp(0, 1).numpy() * 255.0).astype(np.uint8)
@@ -1100,24 +1103,7 @@ def _face_restore_frames(out_tensor, mode, det_conf, blend, fidelity=0.75):
             boxes = smoothed_boxes[fi]
             if len(boxes):
                 total += len(boxes)
-                restored = _restore_faces_frame(frames[i], boxes, sess, mode, blend, fidelity)
-                if prev_restored is not None and prev_restored.shape == restored.shape:
-                    blended = restored.copy()
-                    for b in boxes:
-                        x1, y1, x2, y2 = [int(max(0, v)) for v in b]
-                        x2 = min(x2, restored.shape[1]); y2 = min(y2, restored.shape[0])
-                        if x2 > x1 and y2 > y1:
-                            blended[y1:y2, x1:x2] = (
-                                (1.0 - TEMP_BLEND) * restored[y1:y2, x1:x2].astype(np.float32)
-                                + TEMP_BLEND * prev_restored[y1:y2, x1:x2].astype(np.float32)
-                            ).astype(np.uint8)
-                    frames[i] = blended
-                    prev_restored = blended
-                else:
-                    frames[i] = restored
-                    prev_restored = restored
-            else:
-                prev_restored = None
+                frames[i] = _restore_faces_frame(frames[i], boxes, sess, mode, blend, fidelity)
         chunks.append(torch.from_numpy(frames).float() / 255.0)
     return torch.cat(chunks, dim=0), total
 

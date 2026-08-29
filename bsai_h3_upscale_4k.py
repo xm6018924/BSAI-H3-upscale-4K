@@ -924,14 +924,16 @@ def _restore_faces_frame(img, boxes, sess, mode, blend, fidelity=0.75):
         elif ratio >= 0.02:
             strength = 0.85 + (ratio - 0.02) / 0.03 * 0.15  # 0.85 -> 1.0
         else:
-            strength = min(1.0, 0.75 + ratio * 12)  # 0.75 -> ~0.99
+            strength = min(0.85, 0.65 + ratio * 10)  # 0.65 -> 0.85 (v2.3.2: reduced)
         blend_eff = blend * strength
         fid_eff = fidelity
         if mode == "CodeFormer":
             if is_small:
-                # (2) small faces: lower fidelity = more regeneration
-                # map ratio 0.02->fidelity, 0.002->fidelity-0.45 (clamp 0.25)
-                fid_eff = max(0.25, fidelity - (0.02 - ratio) * 25)
+                # (2) small faces: slight fidelity reduction for regeneration,
+                # but v2.3.2 reduces the drop from -0.45 to -0.15 to prevent
+                # frame-to-frame ghosting from aggressive generative restoration.
+                # map ratio 0.02->fidelity, 0.002->fidelity-0.15 (clamp 0.55)
+                fid_eff = max(0.55, fidelity - (0.02 - ratio) * 7.5)
             else:
                 fid_eff = min(1.0, fidelity + (1.0 - strength) * 0.15)
         # generous pad (more vertical) so the whole face stays inside the crop
@@ -990,11 +992,15 @@ def _face_restore_frames(out_tensor, mode, det_conf, blend, fidelity=0.75):
     only tiny / no detections) to catch distant small faces that the single
     1280 pass misses.
 
+    v2.3.2: anti-ghosting — reduced small-face restoration aggressiveness to
+    eliminate frame-to-face ghosting/flicker. Root cause: small-face preset
+    forced blend=0.80 + fidelity=0.40, and per-frame adaptive logic further
+    dropped small-face fidelity to 0.25, causing massive inter-frame variation.
+    Fix: small-face preset blend cap 0.80->0.45, fidelity floor 0.40->0.75;
+    per-frame small-face strength cap 0.99->0.85, fidelity drop -0.45->-0.15.
     v2.3.1: temporal stability — face boxes are EMA-smoothed across frames
-    (IOU-tracked, alpha=0.70, 1-frame persistence) to eliminate frame-to-frame
-    face detection flicker in diffusion SR engines (SeedVR2 / FlashVSR).
-    Frame-to-frame result blending was REMOVED in v2.3.1 because it caused
-    ghosting/double-image artifacts on moving faces.
+    (IOU-tracked, alpha=0.70, 1-frame persistence). Frame-to-frame result
+    blending removed (caused ghosting on moving faces).
 
     Returns (out_tensor, total_faces_detected)."""
     if mode == "Off" or not _HAS_CV2 or not torch.cuda.is_available():
@@ -1433,11 +1439,14 @@ class BSAI_H3_Upscale4K:
             fr_blend = face_blend
             fr_fid = face_fidelity
             if face_restore == "小脸增强(CodeFormer)":
-                # small-face preset: lower det threshold, higher blend, lower fidelity
+                # small-face preset: lower det threshold to catch tiny faces, but
+                # KEEP blend moderate and fidelity high to prevent frame-to-frame
+                # ghosting/flicker caused by aggressive generative restoration.
+                # v2.3.2: blend cap lowered 0.80->0.45, fidelity floor raised 0.40->0.75.
                 fr_mode = "CodeFormer"
                 fr_conf = min(0.12, float(face_det_conf))
-                fr_blend = max(0.80, float(face_blend))
-                fr_fid = min(0.40, float(face_fidelity))
+                fr_blend = min(0.45, float(face_blend))
+                fr_fid = max(0.75, float(face_fidelity))
             out, _ = _face_restore_frames(out, fr_mode, fr_conf, fr_blend, fr_fid)
         fr_elapsed = time.time() - t_fr
 

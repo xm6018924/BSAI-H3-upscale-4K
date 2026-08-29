@@ -20,6 +20,7 @@ Classic ComfyUI API (INPUT_TYPES / NODE_CLASS_MAPPINGS) for max compatibility
 with ComfyUI 0.34.x and community builds.
 """
 import os
+import sys
 import math
 import time
 import threading
@@ -1000,10 +1001,111 @@ def _face_restore_frames(out_tensor, mode, det_conf, blend, fidelity=0.75):
 
 
 # ---------------------------------------------------------------------------
+# Unified third-party engine wrappers (FlashVSR / SeedVR2 / NVIDIA RTX)
+# Each keeps its own model weights path unchanged; loaded lazily so the
+# plugin still imports fine if any engine is missing.
+# ---------------------------------------------------------------------------
+def _load_plugin_package(plugin_dir, pkg_name):
+    """Load a ComfyUI custom_nodes plugin as a package (supports relative imports)."""
+    import importlib.util
+    if not os.path.isdir(plugin_dir):
+        raise RuntimeError(f"Plugin not found: {plugin_dir}")
+    if pkg_name not in sys.modules:
+        init_path = os.path.join(plugin_dir, "__init__.py")
+        spec = importlib.util.spec_from_file_location(
+            pkg_name, init_path if os.path.exists(init_path) else os.path.join(plugin_dir, "nodes.py"),
+            submodule_search_locations=[plugin_dir])
+        pkg = importlib.util.module_from_spec(spec)
+        sys.modules[pkg_name] = pkg
+        spec.loader.exec_module(pkg)
+    return sys.modules[pkg_name]
+
+
+def _flashvsr_upscale(frames, scale, seed=42):
+    """FlashVSR-v1.1 diffusion video SR. Weights: ComfyUI/models/FlashVSR-v1.1/ (unchanged)."""
+    import importlib
+    flash_dir = os.path.join(folder_paths.base_path, "custom_nodes", "ComfyUI-FlashVSR_Ultra_Fast")
+    _load_plugin_package(flash_dir, "_bsai_flashvsr")
+    nodes_mod = importlib.import_module("_bsai_flashvsr.nodes")
+    dev = "cuda:0" if torch.cuda.is_available() else "cpu"
+    pipe = nodes_mod.init_pipeline("FlashVSR-v1.1", "tiny", dev, torch.bfloat16)
+    s = max(2, min(4, int(round(float(scale)))))
+    out = nodes_mod.flashvsr(pipe, frames, s, True, True, True, 256, 24, False, 2.0, 3.0, 11, seed, True)
+    if out.is_cuda:
+        out = out.cpu()
+    return out.float().clamp(0, 1)
+
+
+def _seedvr2_upscale(frames, scale, seed=42):
+    """SeedVR2 7B diffusion video SR. Weights: ComfyUI/models/SEEDVR2/ (unchanged)."""
+    import importlib
+    seed_dir = os.path.join(folder_paths.base_path, "custom_nodes", "ComfyUI-SeedVR2_VideoUpscaler")
+    _load_plugin_package(seed_dir, "_bsai_seedvr2")
+    up_mod = importlib.import_module("_bsai_seedvr2.src.interfaces.video_upscaler")
+    SeedVR2VideoUpscaler = up_mod.SeedVR2VideoUpscaler
+    dev = "cuda:0" if torch.cuda.is_available() else "cpu"
+    dit = {
+        "model": "seedvr2_ema_7b_fp8_e4m3fn_mixed_block35_fp16.safetensors",
+        "device": dev, "offload_device": "none", "cache_model": False,
+        "blocks_to_swap": 0, "swap_io_components": False, "attention_mode": "sdpa",
+        "torch_compile_args": None, "node_id": "bsai_unified",
+    }
+    vae = {
+        "model": "ema_vae_fp16.safetensors",
+        "device": dev, "offload_device": "none", "cache_model": False,
+        "encode_tiled": False, "encode_tile_size": 512, "encode_tile_overlap": 64,
+        "decode_tiled": False, "decode_tile_size": 512, "decode_tile_overlap": 64,
+        "tile_debug": False, "torch_compile_args": None, "node_id": "bsai_unified",
+    }
+    h, w = frames.shape[1], frames.shape[2]
+    target_res = int(round(min(h, w) * float(scale)))
+    target_res = max(16, target_res - target_res % 2)
+    result = SeedVR2VideoUpscaler.execute(
+        image=frames, dit=dit, vae=vae, seed=seed,
+        resolution=target_res, max_resolution=0, batch_size=5,
+        uniform_batch_size=False, temporal_overlap=0, prepend_frames=0,
+        color_correction="lab", input_noise_scale=0.0, latent_noise_scale=0.0,
+        offload_device="cpu", enable_debug=False,
+    )
+    out = result[0] if isinstance(result, (tuple, list)) else result
+    if hasattr(out, "result"):
+        out = out.result
+    if torch.is_tensor(out):
+        if out.is_cuda:
+            out = out.cpu()
+        if out.dtype != torch.float32:
+            out = out.float()
+        return out.clamp(0, 1)
+    return frames
+
+
+def _rtx_upscale(frames, scale, quality="超高"):
+    """NVIDIA RTX Video Super Resolution (nvidia-vfx, no model files)."""
+    import importlib
+    yuan_dir = os.path.join(folder_paths.base_path, "custom_nodes", "ComfyUI-Yuan-Tool")
+    _load_plugin_package(yuan_dir, "_bsai_yuan")
+    rtx_mod = importlib.import_module("_bsai_yuan.Yuan_RTX_Upscale")
+    YuanRTXVideoUpscaleH3 = rtx_mod.YuanRTXVideoUpscaleH3
+    resize_params = {"resize_type": "按倍数缩放", "scale": float(scale), "width": 0, "height": 0}
+    out = YuanRTXVideoUpscaleH3._run_super_resolution(frames, resize_params, quality)
+    if out.is_cuda:
+        out = out.cpu()
+    return out.float().clamp(0, 1)
+
+
+# ---------------------------------------------------------------------------
 # Main node: video frames -> AI upscaled frames
 # ---------------------------------------------------------------------------
 class BSAI_H3_Upscale4K:
     """Video frame AI super-resolution for MiniMax H3 (pixel domain, extremely fast)."""
+
+    # Third-party diffusion / GPU engine options (prepended to the model list).
+    # Each keeps its own weights path unchanged; loaded lazily via wrappers above.
+    ENGINE_OPTIONS = {
+        "FlashVSR-v1.1 (扩散视频超分)": "flashvsr",
+        "SeedVR2 7B (扩散视频超分)": "seedvr2",
+        "NVIDIA RTX Video Super Res": "rtx",
+    }
 
     # Generative Topaz engine options (prepended to the Real-ESRGAN model list).
     # When selected, the node routes to _topaz_upscale (neuroserver) instead of
@@ -1016,7 +1118,7 @@ class BSAI_H3_Upscale4K:
 
     @classmethod
     def INPUT_TYPES(cls):
-        models = list(cls.TOPAZ_OPTIONS.keys()) + list_available_models()
+        models = list(cls.ENGINE_OPTIONS.keys()) + list(cls.TOPAZ_OPTIONS.keys()) + list_available_models()
         return {
             "required": {
                 "images / 图像": ("IMAGE",),
@@ -1076,13 +1178,15 @@ class BSAI_H3_Upscale4K:
     FUNCTION = "upscale"
     CATEGORY = "BSAI/H3"
     DESCRIPTION = (
-        "H3 视频专用 AI 超分（像素域）：双引擎可选\n"
+        "H3 视频专用 AI 超分（像素域）：多引擎集合节点\n"
         "  • Real-ESRGAN 极速档：general-x4v3 / x4plus，光流时序 + 多尺度细节 + 人脸修复\n"
+        "  • FlashVSR-v1.1 / SeedVR2 7B：扩散式视频超分（各自权重路径不变）\n"
+        "  • NVIDIA RTX Video Super Res：nvidia-vfx GPU 超分（无模型文件）\n"
         "  • Topaz 生成式完美档：星光 2.6 / Astra 神经引擎（本机 ComfyUI/models/Topaz_Engine），\n"
         "    单节点即可达 Topaz 官方级人脸细节与纹理，后续 detail/softness/face_restore 仍可叠加。\n"
-        "Video-only AI super-resolution for MiniMax H3. Dual engine: Real-ESRGAN fast tier "
-        "(optical-flow temporal + multi-scale detail + face restore), or Topaz generative tier "
-        "(Starlight 2.6 / Astra neuroserver, single-node perfect-tier) with our post-processing on top."
+        "Unified multi-engine video super-resolution node: Real-ESRGAN fast tier, "
+        "FlashVSR / SeedVR2 diffusion tiers (own weight paths), NVIDIA RTX VSR, "
+        "and Topaz generative tier (Starlight 2.6 / Astra), all with our post-processing on top."
     )
     def upscale(self, **kw):
         g = kw.get
@@ -1104,9 +1208,28 @@ class BSAI_H3_Upscale4K:
         face_fidelity = g("face_fidelity / 保真度", 0.75)
         detail_mode = g("detail_mode / 细节模式", 'smart')
         t0 = time.time()
+        _engine = self.ENGINE_OPTIONS.get(model_name)
         _is_topaz = model_name in self.TOPAZ_OPTIONS
 
-        if _is_topaz:
+        if _engine == "flashvsr":
+            # --- FlashVSR-v1.1 diffusion path -------------------------------
+            out = _flashvsr_upscale(images, scale)
+            eff_scale = float(out.shape[1] / float(images.shape[1]))
+            temporal_strength = 0.0  # engine handles temporal consistency
+            lr_np = None
+        elif _engine == "seedvr2":
+            # --- SeedVR2 7B diffusion path ----------------------------------
+            out = _seedvr2_upscale(images, scale)
+            eff_scale = float(out.shape[1] / float(images.shape[1]))
+            temporal_strength = 0.0
+            lr_np = None
+        elif _engine == "rtx":
+            # --- NVIDIA RTX Video Super Resolution path ---------------------
+            out = _rtx_upscale(images, scale)
+            eff_scale = float(out.shape[1] / float(images.shape[1]))
+            temporal_strength = 0.0
+            lr_np = None
+        elif _is_topaz:
             # --- Topaz generative engine path (生成式完美档) -------------------
             # Routes to _topaz_upscale (neuroserver, Starlight 2.6 / Astra).
             # Topaz engine already does temporal consistency, so our optical-flow

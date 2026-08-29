@@ -207,6 +207,20 @@ H3 生成 → VAE Decode → [BSAI Topaz Engine Face Restore](model=星光 2.6, 
 
 ## 📝 更新日志 / Changelog
 
+### v2.1.0 — 通用超分集合节点：融合 FlashVSR / SeedVR2 / NVIDIA RTX / Unified multi-engine node
+- `BSAI_H3_Upscale4K` 的 `model_name / 模型` 下拉新增三个第三方引擎选项：
+  - **FlashVSR-v1.1 (扩散视频超分)** — 调用本机 FlashVSR 插件（tiny 模式，bf16），
+    权重路径保持 `ComfyUI/models/FlashVSR-v1.1/` 不变。
+  - **SeedVR2 7B (扩散视频超分)** — 调用本机 SeedVR2 插件（7B FP8 DiT + FP16 VAE，
+    lab 色彩校正），权重路径保持 `ComfyUI/models/SEEDVR2/` 不变。
+  - **NVIDIA RTX Video Super Res** — 调用 nvidia-vfx（超高画质档），无模型文件，
+    极速 GPU 超分。
+- 三个引擎均通过懒加载 import 封装，插件未安装时给出明确报错，不影响其他选项。
+- 选择任一第三方引擎时自动跳过 Real-ESRGAN 路径与时序光流（引擎自身有时序一致性），
+  后续 `detail / softness / face_restore` 仍可叠加微调。
+- 至此一个节点通用全网最常用放大模型与方法：Real-ESRGAN（极速）+ FlashVSR + SeedVR2
+  + NVIDIA RTX + Topaz 生成式（完美档）。
+
 ### v2.0.0 — 主超分节点集成 Topaz 生成式引擎（单节点完美档）/ Topaz engine in main node
 - `BSAI_H3_Upscale4K` 的 `model_name / 模型` 下拉新增两个生成式选项：
   - **Topaz 星光 2.6 (生成式完美档)** — 调用本机 Topaz neuroserver（slp-26），

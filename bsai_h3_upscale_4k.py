@@ -892,17 +892,17 @@ def _face_models(mode: str):
 def _restore_faces_frame(img, boxes, sess, mode, blend, fidelity=0.75):
     """Restore every detected face in one BGR/RGB uint8 frame (numpy), blend back.
 
-    v1.7.0 upgrades (对标 Topaz / FlashVSR 的自然脸):
-      (1) fidelity-first defaults (blend 0.65 / fidelity 0.75): keep original
-          structure, only gently regenerate — no more hallucinated features;
-      (2) adaptive strength: the smaller / more distant the face, the LOWER the
-          replacement strength and the HIGHER the fidelity — tiny faces are
-          barely touched instead of being redrawn into broken/misshapen ones;
-      (3) input enhancement: LANCZOS upsample + horizontal-flip TTA averaging
-          to stabilise reconstruction and suppress asymmetry / artifacts.
-    Also keeps v1.4.2 fixes: aspect-preserving letterbox into 512x512 (no
-    anisotropic stretch), elliptical blend mask centred on the face bbox, and
-    generous vertical padding to keep chin/forehead inside.
+    v2.2.0 small-face overhaul (针对全身照中远景小脸模糊/变形):
+      (1) inverted adaptive strength: SMALL faces get STRONGER restoration
+          (they carry too little real detail and need generative rebuild),
+          while large faces stay fidelity-first;
+      (2) small-face CodeFormer fidelity is lowered (more regeneration) so
+          broken tiny features are actually reconstructed instead of preserved;
+      (3) flip-TTA is always on for small faces (stability on tiny crops);
+      (4) small-face crops get an extra 2x pre-upscale before letterbox so
+          the face occupies more of the 512x512 input canvas.
+    Also keeps: aspect-preserving letterbox into 512x512, elliptical blend
+    mask centred on the face bbox, generous vertical padding.
     """
     H, W = img.shape[:2]
     out = img.copy()
@@ -911,26 +911,39 @@ def _restore_faces_frame(img, boxes, sess, mode, blend, fidelity=0.75):
         w, h = x2 - x1, y2 - y1
         if w < 8 or h < 8:
             continue
-        # ---- (2) adaptive strength from face size (relative to frame) ----
+        # ---- (1) inverted adaptive strength ----
+        # Large face (>5% of frame): fidelity-first, full blend.
+        # Medium (2-5%): slightly reduced blend to keep identity.
+        # Small (<2%): STRONGER restoration — tiny faces lack real detail
+        # and need generative rebuild; lowering strength here was the root
+        # cause of "small faces stay blurry / misshapen".
         ratio = (w * h) / float(max(H * W, 1))
-        if ratio >= 0.02:
+        is_small = ratio < 0.02
+        if ratio >= 0.05:
             strength = 1.0
+        elif ratio >= 0.02:
+            strength = 0.85 + (ratio - 0.02) / 0.03 * 0.15  # 0.85 -> 1.0
         else:
-            strength = max(0.35, ratio / 0.02)
+            strength = min(1.0, 0.75 + ratio * 12)  # 0.75 -> ~0.99
         blend_eff = blend * strength
         fid_eff = fidelity
         if mode == "CodeFormer":
-            # small/distant faces: push toward structure-preserving (less regen)
-            fid_eff = min(1.0, fidelity + (1.0 - strength) * 0.30)
-        if strength < 0.5:
-            # very small faces: barely touch (avoid hallucinating features)
-            blend_eff *= 0.6
+            if is_small:
+                # (2) small faces: lower fidelity = more regeneration
+                # map ratio 0.02->fidelity, 0.002->fidelity-0.45 (clamp 0.25)
+                fid_eff = max(0.25, fidelity - (0.02 - ratio) * 25)
+            else:
+                fid_eff = min(1.0, fidelity + (1.0 - strength) * 0.15)
         # generous pad (more vertical) so the whole face stays inside the crop
         pad_w, pad_h = 0.45 * w, 0.50 * h
         cx1 = max(0, int(x1 - pad_w)); cy1 = max(0, int(y1 - pad_h))
         cx2 = min(W, int(x2 + pad_w)); cy2 = min(H, int(y2 + pad_h))
         crop = img[cy1:cy2, cx1:cx2]
         ch, cw = crop.shape[:2]
+        # (4) small-face extra 2x pre-upscale so the face fills more of 512
+        if is_small and min(ch, cw) < 256:
+            crop = cv2.resize(crop, (cw * 2, ch * 2), interpolation=cv2.INTER_CUBIC)
+            ch, cw = crop.shape[:2]
         # --- aspect-preserving letterbox into 512x512 (no anisotropic stretch) ---
         S = 512
         scale = min(S / float(ch), S / float(cw))
@@ -948,9 +961,9 @@ def _restore_faces_frame(img, boxes, sess, mode, blend, fidelity=0.75):
                 feed[sess.get_inputs()[1].name] = np.array([float(fid_eff)], dtype=np.float64)
             return sess.run(None, feed)[0][0].transpose(1, 2, 0)
 
-        # --- (3) flip-TTA averaging to stabilise reconstruction ----
+        # --- (3) flip-TTA: always on for small faces, else strength>=0.5 ---
         o = np.clip(_run(inp), 0, 1)
-        if strength >= 0.5:
+        if is_small or strength >= 0.5:
             of = np.clip(_run(inp[:, :, :, ::-1].copy()), 0, 1)
             o = 0.5 * (o + of[:, :, ::-1])
         o = (o * 255.0).astype(np.uint8)
@@ -973,6 +986,10 @@ def _restore_faces_frame(img, boxes, sess, mode, blend, fidelity=0.75):
 def _face_restore_frames(out_tensor, mode, det_conf, blend, fidelity=0.75):
     """Apply face restoration to an SR tensor [n,H,W,3] float 0-1 (CPU).
 
+    v2.2.0: multi-scale detection (1280 then 1920 re-scan on frames with
+    only tiny / no detections) to catch distant small faces that the single
+    1280 pass misses.
+
     Returns (out_tensor, total_faces_detected)."""
     if mode == "Off" or not _HAS_CV2 or not torch.cuda.is_available():
         return out_tensor, 0
@@ -993,6 +1010,36 @@ def _face_restore_frames(out_tensor, mode, det_conf, blend, fidelity=0.75):
                           conf=det_conf, imgsz=1280, verbose=False)
         for i in range(len(frames)):
             boxes = res[i].boxes.xyxy.cpu().numpy() if (res[i].boxes is not None) else np.zeros((0, 4))
+            # ---- multi-scale re-scan: if no face or only tiny faces (<3% frame),
+            # re-run at 1920 to catch distant small faces ----
+            H, W = frames[i].shape[:2]
+            frame_area = float(H * W)
+            has_large = any(((b[2]-b[0])*(b[3]-b[1]) / frame_area) >= 0.03 for b in boxes) if len(boxes) else False
+            if not has_large and H * W > 500_000:
+                res2 = det.predict(frames[i], conf=max(0.08, det_conf * 0.6),
+                                    imgsz=1920, verbose=False)
+                boxes2 = res2[0].boxes.xyxy.cpu().numpy() if (res2[0].boxes is not None) else np.zeros((0, 4))
+                if len(boxes2):
+                    # merge: keep boxes2 that don't significantly overlap existing
+                    if len(boxes) == 0:
+                        boxes = boxes2
+                    else:
+                        keep = []
+                        for b2 in boxes2:
+                            x1, y1, x2, y2 = b2
+                            area2 = (x2-x1)*(y2-y1)
+                            overlap = False
+                            for b1 in boxes:
+                                ix1 = max(x1, b1[0]); iy1 = max(y1, b1[1])
+                                ix2 = min(x2, b1[2]); iy2 = min(y2, b1[3])
+                                if ix2 > ix1 and iy2 > iy1:
+                                    inter = (ix2-ix1)*(iy2-iy1)
+                                    if inter / max(area2, 1) > 0.5:
+                                        overlap = True; break
+                            if not overlap:
+                                keep.append(b2)
+                        if keep:
+                            boxes = np.vstack([boxes, np.array(keep)])
             if len(boxes):
                 total += len(boxes)
                 frames[i] = _restore_faces_frame(frames[i], boxes, sess, mode, blend, fidelity)
@@ -1173,22 +1220,24 @@ class BSAI_H3_Upscale4K:
                 # back a small fraction of a Gaussian-blurred copy to tame overshoot
                 # and blocky artifacts. 0 = off, ~0.3 gentle, 1.0 very soft.
                 "softness / 柔和度": ("FLOAT", {"default": 0.10, "min": 0.0, "max": 1.0, "step": 0.05}),
-                # Face restoration: detects faces (YOLOv8-Face) then regenerates
-                # facial structure with GFPGAN / CodeFormer (ONNX, GPU, zero new
-                # pip deps). Fixes H3's small / distant broken faces.
-                "face_restore / 人脸修复": (["Off", "GFPGANv1.4", "CodeFormer"], {"default": "Off"}),
+                # Face restoration: detects faces (YOLOv8-Face, multi-scale)
+                # then regenerates facial structure with GFPGAN / CodeFormer
+                # (ONNX, GPU). v2.2.0: small faces get STRONGER restoration
+                # (inverted adaptive strength + 2x pre-upscale + lower fidelity),
+                # fixing H3's distant small-face blur / deformation.
+                "face_restore / 人脸修复": (["Off", "GFPGANv1.4", "CodeFormer", "小脸增强(CodeFormer)"], {"default": "Off"}),
                 # Face detector confidence threshold (lower = more detections,
                 # including tiny distant faces; may add false positives).
-                "face_det_conf / 检测置信度": ("FLOAT", {"default": 0.25, "min": 0.05, "max": 0.95, "step": 0.05}),
+                # v2.2.0 default 0.15 + multi-scale 1920 re-scan catches small faces.
+                "face_det_conf / 检测置信度": ("FLOAT", {"default": 0.15, "min": 0.05, "max": 0.95, "step": 0.05}),
                 # How strongly the restored face is blended over the original
-                # crop. 1.0 = full restore, ~0.65 = fidelity-first (keep skin
-                # and original structure; smaller faces are blended even less).
-                "face_blend / 融合强度": ("FLOAT", {"default": 0.65, "min": 0.1, "max": 1.0, "step": 0.05}),
+                # crop. 1.0 = full restore, ~0.70 = balanced (small faces get
+                # adaptive strength boost in v2.2.0).
+                "face_blend / 融合强度": ("FLOAT", {"default": 0.70, "min": 0.1, "max": 1.0, "step": 0.05}),
                 # CodeFormer fidelity (0 = heavy regeneration for badly-broken
-                # faces, 1 = preserve original structure/details). Ignored by
-                # GFPGANv1.4. Default 0.75 = fidelity-first: avoids the AI
-                # 'hallucinated' distorted features seen on small/distant faces.
-                "face_fidelity / 保真度": ("FLOAT", {"default": 0.75, "min": 0.0, "max": 1.0, "step": 0.05}),
+                # faces, 1 = preserve original structure/details). v2.2.0
+                # default 0.60: small faces auto-push even lower (more rebuild).
+                "face_fidelity / 保真度": ("FLOAT", {"default": 0.60, "min": 0.0, "max": 1.0, "step": 0.05}),
                 # Detail rebuild mode: classic = unsharp mask only; smart =
                 # unsharp + light local-contrast rebuild (generative-style
                 # texture, gated to avoid halos) — reads closer to Topaz /
@@ -1318,7 +1367,17 @@ class BSAI_H3_Upscale4K:
         # Face restoration (small / distant broken faces) - optional, on the SR frames
         t_fr = time.time()
         if face_restore != "Off":
-            out, _ = _face_restore_frames(out, face_restore, face_det_conf, face_blend, face_fidelity)
+            fr_mode = face_restore
+            fr_conf = face_det_conf
+            fr_blend = face_blend
+            fr_fid = face_fidelity
+            if face_restore == "小脸增强(CodeFormer)":
+                # small-face preset: lower det threshold, higher blend, lower fidelity
+                fr_mode = "CodeFormer"
+                fr_conf = min(0.12, float(face_det_conf))
+                fr_blend = max(0.80, float(face_blend))
+                fr_fid = min(0.40, float(face_fidelity))
+            out, _ = _face_restore_frames(out, fr_mode, fr_conf, fr_blend, fr_fid)
         fr_elapsed = time.time() - t_fr
 
         bh, bw = out.shape[1], out.shape[2]
@@ -1742,10 +1801,10 @@ class BSAI_H3_FaceRestore:
         return {
             "required": {
                 "images / 图像": ("IMAGE",),
-                "face_restore / 人脸修复": (["Off", "GFPGANv1.4", "CodeFormer"], {"default": "GFPGANv1.4"}),
-                "face_det_conf / 检测置信度": ("FLOAT", {"default": 0.25, "min": 0.05, "max": 0.95, "step": 0.05}),
-                "face_blend / 融合强度": ("FLOAT", {"default": 0.65, "min": 0.1, "max": 1.0, "step": 0.05}),
-                "face_fidelity / 保真度": ("FLOAT", {"default": 0.75, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "face_restore / 人脸修复": (["Off", "GFPGANv1.4", "CodeFormer", "小脸增强(CodeFormer)"], {"default": "CodeFormer"}),
+                "face_det_conf / 检测置信度": ("FLOAT", {"default": 0.15, "min": 0.05, "max": 0.95, "step": 0.05}),
+                "face_blend / 融合强度": ("FLOAT", {"default": 0.70, "min": 0.1, "max": 1.0, "step": 0.05}),
+                "face_fidelity / 保真度": ("FLOAT", {"default": 0.60, "min": 0.0, "max": 1.0, "step": 0.05}),
             },
         }
 
@@ -1754,23 +1813,33 @@ class BSAI_H3_FaceRestore:
     FUNCTION = "restore"
     CATEGORY = "BSAI/H3"
     DESCRIPTION = (
-        "独立人脸修复节点：YOLOv8-Face 检测 + GFPGAN/CodeFormer 重建五官，\n"
+        "独立人脸修复节点：YOLOv8-Face 多尺度检测 + GFPGAN/CodeFormer 重建五官，\n"
         "解决 H3 中远景小脸崩坏 / 五官模糊丢失，可在任意工作流单独使用。\n"
-        "v1.7.0: 保真优先（blend 0.65 / fidelity 0.75）+ 自适应强度（小脸几乎不动，\n"
-        "避免 AI 幻觉出变形五官）+ 翻转 TTA 平均，对标 Topaz / FlashVSR 自然脸。\n"
-        "Standalone face restoration for any frames: YOLOv8-Face detect +\n"
+        "v2.2.0: 反转自适应强度（小脸更强重建）+ 小脸2x预放大 + 多尺度1920复检 +\n"
+        "小脸CodeFormer自动降保真 + 新增「小脸增强(CodeFormer)」预设，\n"
+        "对标 Topaz / FlashVSR 自然脸，专门修复全身照远景小脸模糊变形。\n"
+        "Standalone face restoration for any frames: YOLOv8-Face multi-scale detect +\n"
         "GFPGAN/CodeFormer regenerate, fixes small/distant broken faces.\n"
-        "v1.7.0: fidelity-first + adaptive strength + flip-TTA for natural faces."
+        "v2.2.0: inverted adaptive strength (small=stronger) + 2x pre-upscale + 1920 re-scan."
     )
     def restore(self, **kw):
         g = kw.get
         images = g("images / 图像")
         face_restore = g("face_restore / 人脸修复", 'Off')
-        face_det_conf = g("face_det_conf / 检测置信度", 0.25)
-        face_blend = g("face_blend / 融合强度", 0.65)
-        face_fidelity = g("face_fidelity / 保真度", 0.75)
+        face_det_conf = g("face_det_conf / 检测置信度", 0.15)
+        face_blend = g("face_blend / 融合强度", 0.70)
+        face_fidelity = g("face_fidelity / 保真度", 0.60)
         t0 = time.time()
-        out, nf = _face_restore_frames(images, face_restore, face_det_conf, face_blend, face_fidelity)
+        fr_mode = face_restore
+        fr_conf = face_det_conf
+        fr_blend = face_blend
+        fr_fid = face_fidelity
+        if face_restore == "小脸增强(CodeFormer)":
+            fr_mode = "CodeFormer"
+            fr_conf = min(0.12, float(face_det_conf))
+            fr_blend = max(0.80, float(face_blend))
+            fr_fid = min(0.40, float(face_fidelity))
+        out, nf = _face_restore_frames(images, fr_mode, fr_conf, fr_blend, fr_fid)
         info = (
             f"face restore: {face_restore} (conf={face_det_conf}, blend={face_blend}, fid={face_fidelity}) | "
             f"faces detected: {nf} | frames: {images.shape[0]} | "

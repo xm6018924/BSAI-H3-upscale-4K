@@ -1192,16 +1192,26 @@ def _seedvr2_upscale(frames, scale, seed=42):
     vae = {
         "model": vae_file,
         "device": dev, "offload_device": "none", "cache_model": False,
-        "encode_tiled": False, "encode_tile_size": 512, "encode_tile_overlap": 64,
-        "decode_tiled": False, "decode_tile_size": 512, "decode_tile_overlap": 64,
+        "encode_tiled": True, "encode_tile_size": 256, "encode_tile_overlap": 32,
+        "decode_tiled": True, "decode_tile_size": 256, "decode_tile_overlap": 32,
         "tile_debug": False, "torch_compile_args": None, "node_id": "bsai_unified",
     }
     h, w = frames.shape[1], frames.shape[2]
     target_res = int(round(min(h, w) * float(scale)))
     target_res = max(16, target_res - target_res % 2)
+    # Aggressive VRAM cleanup before SeedVR2 (7B DiT + VAE need ~18GB)
+    try:
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+            torch.cuda.synchronize()
+    except Exception:
+        pass
     result = SeedVR2VideoUpscaler.execute(
         image=frames, dit=dit, vae=vae, seed=seed,
-        resolution=target_res, max_resolution=0, batch_size=5,
+        resolution=target_res, max_resolution=0, batch_size=2,
         uniform_batch_size=False, temporal_overlap=0, prepend_frames=0,
         color_correction="lab", input_noise_scale=0.0, latent_noise_scale=0.0,
         offload_device="cpu", enable_debug=False,

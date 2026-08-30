@@ -19,6 +19,7 @@ A dedicated video super-resolution / upscaling plugin for MiniMax H3.
 Classic ComfyUI API (INPUT_TYPES / NODE_CLASS_MAPPINGS) for max compatibility
 with ComfyUI 0.34.x and community builds.
 """
+import comfy.model_management as model_management
 import os
 import sys
 import math
@@ -1348,6 +1349,16 @@ class BSAI_H3_Upscale4K:
         face_fidelity = g("face_fidelity / 保真度", 0.75)
         detail_mode = g("detail_mode / 细节模式", 'smart')
         t0 = time.time()
+        # Free GPU VRAM before upscaling: H3 diffusion model (~20GB) may still
+        # be resident from the previous generation node, which causes OOM when
+        # we stage 4K video frames for softness/detail passes.
+        try:
+            model_management.unload_all_models()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
+        except Exception:
+            pass
         _engine = self.ENGINE_OPTIONS.get(model_name)
         _is_topaz = model_name in self.TOPAZ_OPTIONS
 
@@ -1426,10 +1437,16 @@ class BSAI_H3_Upscale4K:
                                      detail_radius, eff_scale, detail_mode)
         td_elapsed = time.time() - t_td
 
-        # Softness (Topaz-style) — GPU, then back to CPU
+        # Softness (Topaz-style) — GPU, then back to CPU.
+        # OOM fallback: if GPU runs out (e.g. 4K 56-frame batch), process on CPU.
         if softness > 0 and torch.cuda.is_available():
             dev = torch.cuda.current_device()
-            out = _soften_gpu(out.to(dev), softness).cpu()
+            try:
+                out = _soften_gpu(out.to(dev), softness).cpu()
+            except torch.cuda.OutOfMemoryError:
+                print(f"[BSAI-H3-Upscale] GPU OOM in softness pass, falling back to CPU (frames={out.shape[0]}, size={out.shape[2]}x{out.shape[3]})")
+                torch.cuda.empty_cache()
+                out = _soften_gpu(out, softness)
 
         # Face restoration (small / distant broken faces) - optional, on the SR frames
         t_fr = time.time()

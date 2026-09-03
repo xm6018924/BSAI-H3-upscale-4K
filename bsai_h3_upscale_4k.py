@@ -11,10 +11,12 @@ A dedicated video super-resolution / upscaling plugin for MiniMax H3.
   - 帧批量（Batch）并行处理
   - 模型进程级 LRU 缓存（重复调用秒出）
   - H3 专属 latent 二次采样放大（32 像素对齐，供 H3 第二遍采样补细节）
+  - DLSS 5（NVIDIA 神经渲染超分）—— DLSS SR + Neural Rendering，经 video2dlssnr 管道驱动
 
 节点列表 / Node list:
   - BSAI H3 upscale 4K            : 视频帧 -> AI 超分高清视频帧 (pixel-domain upscale)
   - BSAI H3 upscale 4K Latent     : H3 latent -> 放大 latent (second-pass refine)
+  - BSAI H3 DLSS 5 Upscale        : 视频帧 -> DLSS 5 (SR + Neural Rendering) 放大
 
 Classic ComfyUI API (INPUT_TYPES / NODE_CLASS_MAPPINGS) for max compatibility
 with ComfyUI 0.34.x and community builds.
@@ -279,6 +281,15 @@ def _detect_arch(state):
         num_feat = state["body.0.weight"].shape[0]
         return "srvgg", dict(num_feat=num_feat)
 
+    # --- DAT (Dynamic Attention Transformer): layers.N.blocks.M.attn ---
+    if "conv_first.weight" in state and any(k.startswith("layers.0.blocks.0.attn.") for k in state):
+        num_layers = 0
+        while f"layers.{num_layers}.conv.weight" in state:
+            num_layers += 1
+        scale = 4 if "upsample.2.weight" in state else 2
+        num_feat = state["conv_first.weight"].shape[0]
+        return "dat", dict(num_layers=num_layers, scale=scale, num_feat=num_feat)
+
     raise RuntimeError(
         "[BSAI H3 UPSCAL 4K] Cannot recognize this model as a Real-ESRGAN family "
         "architecture. Only Real-ESRGAN x4plus / anime_6B / general-x4v3 are supported."
@@ -330,30 +341,130 @@ _model_cache = {}
 _model_cache_lock = threading.Lock()
 
 
+def _normalize_state_dict_keys(state):
+    """Normalize various community model key formats to the canonical
+    conv_first / body.N.rdbM.convK / conv_body / conv_upN / conv_hr / conv_last
+    format used by RRDBNet. Supports:
+      - model.0 / model.1.sub.N.RDBM.convK.0 (community ESRGAN sequential format)
+      - RRDB_trunk.N.RDBM.convK (old ESRGAN format)
+      - conv_first / body.N.rdbM.convK (canonical Real-ESRGAN format, passthrough)
+    """
+    keys = list(state.keys())
+    # Detect format
+    has_model_format = any(k.startswith("model.0.") for k in keys)
+    has_rrdb_trunk = any(k.startswith("RRDB_trunk.") for k in keys)
+
+    if not has_model_format and not has_rrdb_trunk:
+        return state  # already canonical
+
+    new_state = {}
+    for k, v in state.items():
+        nk = k
+        # Format 1: model.0 / model.1.sub.N.RDBM.convK.0 (community sequential)
+        if k.startswith("model.0."):
+            nk = "conv_first." + k[len("model.0."):]
+        elif k.startswith("model.1.sub."):
+            rest = k[len("model.1.sub."):]
+            # Check if it's an RRDB block: N.RDBM.convK.0.weight/bias
+            m = re.match(r"^(\d+)\.RDB(\d+)\.conv(\d+)\.0\.(weight|bias)$", rest)
+            if m:
+                block_idx, rdb_idx, conv_idx, wb = m.groups()
+                nk = f"body.{block_idx}.rdb{rdb_idx}.conv{conv_idx}.{wb}"
+            else:
+                # Last sub layer is conv_body (e.g. model.1.sub.23.weight)
+                m2 = re.match(r"^(\d+)\.(weight|bias)$", rest)
+                if m2:
+                    nk = "conv_body." + m2.group(2)
+                else:
+                    nk = k  # keep unknown
+        elif k.startswith("model.3."):
+            nk = "conv_up1." + k[len("model.3."):]
+        elif k.startswith("model.6."):
+            nk = "conv_up2." + k[len("model.6."):]
+        elif k.startswith("model.8."):
+            nk = "conv_hr." + k[len("model.8."):]
+        elif k.startswith("model.10."):
+            nk = "conv_last." + k[len("model.10."):]
+        # Format 2: RRDB_trunk.N.RDBM.convK (old ESRGAN)
+        elif k.startswith("RRDB_trunk."):
+            rest = k[len("RRDB_trunk."):]
+            m = re.match(r"^(\d+)\.RDB(\d+)\.conv(\d+)\.(weight|bias)$", rest)
+            if m:
+                block_idx, rdb_idx, conv_idx, wb = m.groups()
+                nk = f"body.{block_idx}.rdb{rdb_idx}.conv{conv_idx}.{wb}"
+            else:
+                nk = k
+        # Format 3: old ESRGAN top-level layer names
+        elif k.startswith("trunk_conv."):
+            nk = "conv_body." + k[len("trunk_conv."):]
+        elif k.startswith("upconv1."):
+            nk = "conv_up1." + k[len("upconv1."):]
+        elif k.startswith("upconv2."):
+            nk = "conv_up2." + k[len("upconv2."):]
+        elif k.startswith("HRconv."):
+            nk = "conv_hr." + k[len("HRconv."):]
+        # Keep canonical keys as-is
+        new_state[nk] = v
+
+    return new_state
+
+
 def _load_model(path, use_fp16):
     key = (path, use_fp16, torch.cuda.is_available())
     with _model_cache_lock:
         if key in _model_cache:
             return _model_cache[key]
-    state = torch.load(path, map_location="cpu", weights_only=False)
-    if "params_ema" in state:
-        state = state["params_ema"]
-    elif "params" in state:
-        state = state["params"]
-    state = {k: v for k, v in state.items() if k.startswith(("conv_", "body."))}
-    arch, params = _detect_arch(state)
-    if arch == "srvgg":
-        net = SRVGGNetCompact(state)
-        missing, unexpected = net.load_state_dict(state, strict=True)
+    if path.endswith(".safetensors"):
+        from safetensors.torch import load_file
+        state = load_file(path)
     else:
-        net = RRDBNet(**params)
-        missing, unexpected = net.load_state_dict(state, strict=False)
-        if missing:
-            raise RuntimeError(
-                f"[BSAI H3 UPSCAL 4K] Model weights mismatch for {os.path.basename(path)} "
-                f"(missing {len(missing)} keys, e.g. {missing[0]}). This may not be a "
-                "Real-ESRGAN (RRDBNet) checkpoint."
-            )
+        state = torch.load(path, map_location="cpu", weights_only=False)
+        if "params_ema" in state:
+            state = state["params_ema"]
+        elif "params" in state:
+            state = state["params"]
+    # Normalize community model key formats (model.0/model.1.sub, RRDB_trunk) to canonical
+    state = _normalize_state_dict_keys(state)
+    # Detect DAT before filtering (DAT uses layers.* keys, not conv_/body.)
+    is_dat = ("conv_first.weight" in state and
+               any(k.startswith("layers.0.blocks.0.attn.") for k in state))
+    if is_dat:
+        arch, params = "dat", {}
+        # Use spandrel library for DAT (Dynamic Attention Transformer) models
+        from spandrel import ModelLoader
+        descriptor = ModelLoader().load_from_file(path)
+        net = descriptor.model.eval()
+        net.scale = descriptor.scale
+        net._skip_compile = True  # DAT incompatible with torch.compile CUDA graphs (self.mean.type_as in-place)
+        missing, unexpected = [], []
+    else:
+        state = {k: v for k, v in state.items() if k.startswith(("conv_", "body."))}
+        try:
+            arch, params = _detect_arch(state)
+        except RuntimeError:
+            # Generic spandrel fallback: supports DAT, OmniSR, RealPLKSR, SwinIR, HAT, etc.
+            from spandrel import ModelLoader
+            descriptor = ModelLoader().load_from_file(path)
+            net = descriptor.model.eval()
+            net.scale = descriptor.scale
+            net._skip_compile = True  # spandrel models (OmniSR/RealPLKSR/etc) may be incompatible with torch.compile
+            missing, unexpected = [], []
+            arch = "spandrel_generic"
+            params = {}
+        if arch == "spandrel_generic":
+            pass  # already loaded above
+        elif arch == "srvgg":
+            net = SRVGGNetCompact(state)
+            missing, unexpected = net.load_state_dict(state, strict=True)
+        else:
+            net = RRDBNet(**params)
+            missing, unexpected = net.load_state_dict(state, strict=False)
+            if missing:
+                raise RuntimeError(
+                    f"[BSAI H3 UPSCAL 4K] Model weights mismatch for {os.path.basename(path)} "
+                    f"(missing {len(missing)} keys, e.g. {missing[0]}). This may not be a "
+                    "Real-ESRGAN (RRDBNet) checkpoint."
+                )
     net.eval()
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     net = net.to(dev)
@@ -404,11 +515,20 @@ class _CompiledWrapper(nn.Module):
         self._m = model
         self.scale = model.scale
         self.num_block = getattr(model, "num_block", None)
-        self._compiled = torch.compile(model, mode=mode, dynamic=False)
+        # Spandrel-loaded models (DAT/OmniSR/RealPLKSR) have in-place ops
+        # (e.g. self.mean = self.mean.type_as(x)) that break torch.compile
+        # CUDA graphs -> skip compilation, use eager mode directly.
+        if getattr(model, "_skip_compile", False):
+            self._compiled = None
+            print(f"[BSAI H3 UPSCAL 4K] {type(model).__name__}: _CompiledWrapper "
+                  f"detected _skip_compile, using eager mode.", flush=True)
+        else:
+            self._compiled = torch.compile(model, mode=mode, dynamic=False)
 
     def forward(self, x):
+        if self._compiled is None:
+            return self._m(x)
         return self._compiled(x)
-
     def parameters(self, recurse=True):
         return self._m.parameters(recurse)
 
@@ -419,8 +539,25 @@ def _load_model_compiled(path, use_fp16):
     with _compiled_cache_lock:
         if key in _compiled_cache:
             return _compiled_cache[key]
+    model = None
     try:
         model = _load_model(path, use_fp16)
+        # Spandrel-loaded models (DAT/OmniSR/RealPLKSR) may have in-place ops
+        # incompatible with torch.compile CUDA graphs -> skip compile, use eager
+        if getattr(model, "_skip_compile", False):
+            # DAT/OmniSR/RealPLKSR: in-place ops break CUDA graphs, and some
+            # environments lack omp.h for torch.compile C++ backend. Use eager
+            # mode directly — fp16 + full-image (tile_size=0) is fast enough.
+            print(f"[BSAI H3 UPSCAL 4K] {type(model).__name__}: _skip_compile detected, "
+                  f"using eager mode (fp16 if enabled).", flush=True)
+            with _compiled_cache_lock:
+                if len(_compiled_cache) >= 2:
+                    try:
+                        _compiled_cache.pop(next(iter(_compiled_cache)))
+                    except Exception:
+                        pass
+                _compiled_cache[key] = model
+            return model
         # cudaMallocAsync compatibility: cudagraph_trees calls
         # checkPoolLiveAllocations which is unsupported on cudaMallocAsync.
         # Disable cudagraph_trees and fall back to mode="default" (no CUDA graph)
@@ -442,6 +579,8 @@ def _load_model_compiled(path, use_fp16):
             # is fast.
             wrapped = _CompiledWrapper(model)
     except Exception as e:
+        if model is None:
+            raise
         print(f"[BSAI H3 UPSCAL 4K] torch.compile unavailable, falling back to eager "
               f"({type(e).__name__}: {e})", flush=True)
         wrapped = model
@@ -459,7 +598,7 @@ def _load_model_compiled(path, use_fp16):
 # Tile-based inference (VRAM friendly, seam-free, dtype-safe)
 # ---------------------------------------------------------------------------
 def _upscale_image(model, img):
-    """img [1,C,H,W] on CPU float32 -> [1,C,scaledH,scaledW] float32 (stays on GPU)."""
+    """img [B,C,H,W] on CPU float32 -> [B,C,scaledH,scaledW] float32 (stays on GPU). Batched inference."""
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dt = next(model.parameters()).dtype
     with torch.no_grad():
@@ -469,27 +608,31 @@ def _upscale_image(model, img):
 
 def _upscale_image_tiled(model, img, tile_size, tile_pad, device):
     """
-    img: torch [1, C, H, W] float32 in [0,1], on CPU.
-    Returns [1, C, H*scale, W*scale] float32 in [0,1] (stays on GPU).
+    img: torch [B, C, H, W] float32 in [0,1], on CPU. BATCHED inference.
+    Returns [B, C, H*scale, W*scale] float32 in [0,1] (stays on GPU).
     Tile loop pads the input first (seam-free, never cuts below kernel size).
     """
     scale = model.scale
+    B = img.shape[0]
     h0, w0 = img.shape[2], img.shape[3]
-    tile = int(tile_size)  # <=0  => full-image (no tiling, fastest on big-VRAM GPUs)
+    tile = int(tile_size)
     pad = max(0, int(tile_pad))
     if tile <= 0 or (h0 + 2 * pad <= tile and w0 + 2 * pad <= tile):
-        return _upscale_image(model, img)
+        try:
+            return _upscale_image(model, img)
+        except torch.cuda.OutOfMemoryError:
+            print(f"[BSAI-H3-Upscale] Full-image OOM ({h0}x{w0} batch={B}), falling back to tiled (512)")
+            torch.cuda.empty_cache()
+            tile = 512
+            if h0 + 2 * pad <= tile and w0 + 2 * pad <= tile:
+                return _upscale_image(model, img)
     dt = next(model.parameters()).dtype
 
-    # pad input with edge replication (safe even when dim < pad)
     inp = F.pad(img.to(device).to(dt), (pad, pad, pad, pad), mode="replicate")
     h_pad, w_pad = inp.shape[2], inp.shape[3]
 
-    # overlap weight map lives in OUTPUT space (repeat_interleave == exact pixel
-    # alignment with the accumulated `out`; a bilinear upscale would shift weights
-    # at tile borders and cause visible block/grid seams)
-    over = torch.zeros((1, 1, h_pad * scale, w_pad * scale), dtype=torch.float32, device=device)
-    out = torch.zeros((1, 3, h_pad * scale, w_pad * scale), dtype=torch.float32, device=device)
+    over = torch.zeros((B, 1, h_pad * scale, w_pad * scale), dtype=torch.float32, device=device)
+    out = torch.zeros((B, 3, h_pad * scale, w_pad * scale), dtype=torch.float32, device=device)
 
     if h_pad <= tile:
         rows = [0]
@@ -511,7 +654,6 @@ def _upscale_image_tiled(model, img, tile_size, tile_pad, device):
                 tw = min(tile, w_pad - c)
                 t_in = inp[:, :, r:r + th, c:c + tw]
                 t_out = model(t_in).float()
-                hh, ww = t_out.shape[2], t_out.shape[3]
                 wg = torch.ones((1, 1, th, tw), dtype=torch.float32, device=device)
                 p1 = min(pad, th)
                 p2 = min(pad, tw)
@@ -524,16 +666,13 @@ def _upscale_image_tiled(model, img, tile_size, tile_pad, device):
                 if c + tw < w_pad:
                     wg[:, :, :, -p2:] *= torch.linspace(1, 0, p2, device=device).view(1, 1, 1, p2)
                 wg_out = wg.repeat_interleave(scale, dim=2).repeat_interleave(scale, dim=3)
-                # weighted accumulate: out must carry the same weights as `over`,
-                # otherwise the normalized blend over tile overlaps produces
-                # visible brightness bands (block/grid seams)
                 out[:, :, r * scale:r * scale + th * scale, c * scale:c * scale + tw * scale] += t_out * wg_out
                 over[:, :, r * scale:r * scale + th * scale, c * scale:c * scale + tw * scale] += wg_out
 
     out = out[:, :, pad * scale:(pad + h0) * scale, pad * scale:(pad + w0) * scale]
     over = over[:, :, pad * scale:(pad + h0) * scale, pad * scale:(pad + w0) * scale]
     out = out / over.clamp_min(1e-6)
-    return out.float().clamp_(0, 1)  # stays on GPU
+    return out.float().clamp_(0, 1)
 
 
 def _upscale_batch(model, images, tile_size, tile_pad, batch_frames):
@@ -541,30 +680,39 @@ def _upscale_batch(model, images, tile_size, tile_pad, batch_frames):
     images: torch [B,H,W,C] float32 0..1 on CPU.
     Returns [B, H*scale, W*scale, C] float32 0..1 on CPU.
 
-    Fast path: frames are H2D-copied in chunks, then inferred ONE frame at a time
-    (measured fastest on RTX 5090 — batched conv is actually *slower* for these
-    small CNNs), with the compiled/eager model and NO torch.cuda.empty_cache()
-    between frames (empty_cache is a huge stall and was a major slowdown).
+    BATCHED inference: entire chunk is inferred in ONE forward pass (not per-frame),
+    eliminating per-frame GPU kernel launch overhead. Results stay on GPU within
+    the chunk, then one .cpu() per chunk keeps VRAM bounded for long videos.
     """
     if images.ndim != 4 or images.shape[3] != 3:
         raise ValueError("BSAI H3 UPSCAL 4K expects IMAGE frames of shape [B,H,W,3]")
     b = images.shape[0]
     device = "cuda" if torch.cuda.is_available() else "cpu"
     im = images.permute(0, 3, 1, 2).contiguous()  # [B,C,H,W] on CPU
-    dt = next(model.parameters()).dtype
 
     results = []
     chunk = max(1, int(batch_frames))
+    _batched_ok = True
     for start in range(0, b, chunk):
-        # stage a chunk on GPU at once (fewer H2D syncs), then infer frames singly.
-        # Results accumulate ON GPU within the chunk (no per-frame .cpu() stall),
-        # then one .cpu() per chunk keeps VRAM bounded for long videos.
-        gpu_chunk = im[start:start + chunk].to(device).to(dt)
-        chunk_res = []
-        for i in range(gpu_chunk.shape[0]):
-            chunk_res.append(_upscale_image_tiled(model, gpu_chunk[i:i + 1], tile_size, tile_pad, device))
-        del gpu_chunk
-        results.append(torch.cat(chunk_res, dim=0).cpu())
+        chunk_im = im[start:start + chunk]  # [chunk,C,H,W] on CPU
+        if _batched_ok:
+            try:
+                chunk_out = _upscale_image_tiled(model, chunk_im, tile_size, tile_pad, device)
+            except torch.cuda.OutOfMemoryError:
+                print(f"[BSAI-H3-Upscale] Batched OOM (chunk={chunk_im.shape[0]}), falling back to per-frame")
+                torch.cuda.empty_cache()
+                _batched_ok = False
+                chunk_out = None
+        if not _batched_ok:
+            # per-frame fallback
+            frame_outs = []
+            for fi in range(chunk_im.shape[0]):
+                fo = _upscale_image_tiled(model, chunk_im[fi:fi+1], tile_size, tile_pad, device)
+                frame_outs.append(fo)
+            chunk_out = torch.cat(frame_outs, dim=0)
+        results.append(chunk_out.cpu())
+        del chunk_out
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
     out_t = torch.cat(results, dim=0)  # [B, C, H*scale, W*scale] fp32
     return out_t.permute(0, 2, 3, 1).contiguous()  # [B, H, W, C]
 
@@ -1155,9 +1303,17 @@ def _flashvsr_upscale(frames, scale, seed=42):
     _load_plugin_package(flash_dir, "_bsai_flashvsr")
     nodes_mod = importlib.import_module("_bsai_flashvsr.nodes")
     dev = "cuda:0" if torch.cuda.is_available() else "cpu"
+    # VRAM cleanup before FlashVSR (H3 may still be resident; DiT+TCDecoder need ~16GB)
+    try:
+        import gc; gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache(); torch.cuda.ipc_collect(); torch.cuda.synchronize()
+    except Exception:
+        pass
     pipe = nodes_mod.init_pipeline("FlashVSR-v1.1", "tiny", dev, torch.bfloat16)
     s = max(2, min(4, int(round(float(scale)))))
-    out = nodes_mod.flashvsr(pipe, frames, s, True, True, True, 256, 24, False, 2.0, 3.0, 11, seed, True)
+    # VRAM-optimized: unload_dit=True, tile_size=128 (was 256), lower sparse/kv ratios
+    out = nodes_mod.flashvsr(pipe, frames, s, True, True, True, 128, 16, True, 1.5, 2.0, 11, seed, True)
     if out.is_cuda:
         out = out.cpu()
     return out.float().clamp(0, 1)
@@ -1243,6 +1399,203 @@ def _rtx_upscale(frames, scale, quality="超高"):
 
 
 # ---------------------------------------------------------------------------
+# DLSS 5 engine wrapper (NVIDIA DLSS Super Resolution + Neural Rendering)
+# ---------------------------------------------------------------------------
+# 底座 = video2dlssnr.exe —— 纯 C++17/D3D12 的 DLSS 视频超分 CLI（工具本体 MIT），
+# 通过 NVIDIA NGX 调用：
+#   * DLSS Super Resolution (nvngx_dlss.dll)  —— 真正把画面放大的超分引擎
+#   * DLSS Neural Rendering (nvngx_dlssnr.dll) —— NGX feature 18，超分后再加细节
+# 两个 DLL 均为 NVIDIA 专有、不可再分发：由用户自行获取（NVIDIA 驱动包 / DLSS SDK
+# / 社区整合包），放到 exe 同目录即可；本插件只做“本机调用”，与 Topaz 引擎同一
+# 设计哲学（v1.8.2）。这也是 OptiScaler DLSS5 背后的同一套引擎——OptiScaler 以
+# 游戏内注入（dxgi.dll + ReShade + RenoDX）方式驱动它，ComfyUI 视频处理无法复用
+# 其注入方式，故改为经 video2dlssnr 以“原始 RGBA 管道”驱动，帧不落盘、不转码。
+#
+# 要求: NVIDIA RTX 显卡；Neural Rendering 需要驱动 >= 616.56（低于此版本时
+#       driver NGX 会以 OutOfDate 拒绝 feature 18，纯 DLSS 超分仍可用）。
+import re as _re
+import subprocess as _sp
+
+_DLSSNR_STYLES = {"Default": 0, "Natural": 1, "Cinematic": 2}
+_DLSSNR_PRESETS = {"Default": 0, "Preset 1": 1, "Preset 2": 2, "Preset 3": 3}
+_DLSSNR_ENGINES = ["auto", "nvof", "lk"]
+_DLSSNR_DLL_NAMES = ("nvngx_dlss.dll", "nvngx_dlssnr.dll", "nvngx.dll_dlssnr.dll")
+
+
+def _dlssnr_exe_dir():
+    """Standard ComfyUI models/DLSS5 directory (create if needed)."""
+    d = os.path.join(folder_paths.models_dir, "DLSS5")
+    try:
+        os.makedirs(d, exist_ok=True)
+    except Exception:
+        pass
+    return d
+
+
+def _dlssnr_provision():
+    """Auto-provision video2dlssnr.exe + runtime DLLs from a known local pack
+    into <ComfyUI>/models/DLSS5/. Returns exe path or None.
+
+    Pack search order: VIDEO2DLSSNR_ZIP env var, then the user's DLSS5 collection.
+    Only the runnable artifacts (.exe + nvngx_* dlls) are copied; proprietary DLLs
+    stay user-supplied, this just unpacks what they already own.
+    """
+    dest = _dlssnr_exe_dir()
+    exe = os.path.join(dest, "video2dlssnr.exe")
+    if os.path.isfile(exe):
+        return exe
+    cands = []
+    env_zip = os.environ.get("VIDEO2DLSSNR_ZIP", "").strip().strip('"')
+    if env_zip:
+        cands.append(env_zip)
+    cands.append(r"C:\BSAI\DLSS5\DLSS5 的超分实现ideo2dlssnr整合包，有些人需要build.zip")
+    zsrc = next((z for z in cands if z and os.path.isfile(z)), None)
+    if not zsrc:
+        return None
+    try:
+        import zipfile
+        print(f"[BSAI-H3/DLSS5] 检测到本地整合包，自动部署 video2dlssnr -> {dest} ...", flush=True)
+        with zipfile.ZipFile(zsrc) as zf:
+            for m in zf.infolist():
+                if m.is_dir():
+                    continue
+                rel = m.filename
+                if not rel.startswith("video2dlssnr/out/"):
+                    continue
+                name = rel[len("video2dlssnr/out/"):]
+                if not name or "/" in name:
+                    continue
+                if not (name.endswith(".exe") or name in _DLSSNR_DLL_NAMES):
+                    continue
+                target = os.path.join(dest, name)
+                with zf.open(m) as s, open(target, "wb") as o:
+                    o.write(s.read())
+        if os.path.isfile(exe):
+            print(f"[BSAI-H3/DLSS5] 部署完成: {exe}", flush=True)
+            return exe
+    except Exception as e:
+        print(f"[BSAI-H3/DLSS5] 自动部署失败: {e}（可手动把 video2dlssnr/out/ 整个复制到 {dest}）", flush=True)
+    return None
+
+
+def _dlssnr_find_exe():
+    """Locate video2dlssnr.exe. Order: VIDEO2DLSSNR_EXE -> models/DLSS5 ->
+    plugin bin/ -> auto-provision from local pack. Raises a clear error."""
+    cands = []
+    env = os.environ.get("VIDEO2DLSSNR_EXE", "").strip().strip('"')
+    if env:
+        cands.append(env)
+    cands.append(os.path.join(_dlssnr_exe_dir(), "video2dlssnr.exe"))
+    cands.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "bin", "video2dlssnr.exe"))
+    for c in cands:
+        if c and os.path.isfile(c):
+            return c
+    prov = _dlssnr_provision()
+    if prov:
+        return prov
+    raise RuntimeError(
+        "[BSAI-H3/DLSS5] 未找到 video2dlssnr.exe。请任选一种：\n"
+        "  1) 设置环境变量 VIDEO2DLSSNR_EXE 指向其完整路径；\n"
+        "  2) 把 video2dlssnr/out/ 整个目录（exe + nvngx_dlss.dll + nvngx_dlssnr.dll）"
+        "复制到 " + _dlssnr_exe_dir() + " ；\n"
+        "  3) 把可执行文件放入本插件 bin/ 目录。\n"
+        "项目: https://github.com/DaniilSokolyuk/video2dlssnr"
+    )
+
+
+def _dlssnr_out_dims(in_w, in_h, width, scale):
+    """Output size (even dims): width pins the aspect, else scale."""
+    if width and width > 0:
+        out_w, out_h = int(width), round(in_h * width / in_w)
+    else:
+        out_w, out_h = round(in_w * scale), round(in_h * scale)
+    return out_w - out_w % 2, out_h - out_h % 2
+
+
+def _dlssnr_upscale(frames, scale, style="Cinematic", preset="Default", intensity=1.0,
+                    local_structure=1.0, local_tone=1.0, skin=-1.0, global_tone=-1.0,
+                    detail=1.0, color=1.0, auto_mask=False, hdr=False,
+                    motion=True, motion_engine="auto", width=0, adapter=0):
+    """frames [B,H,W,3] float 0..1 CPU -> DLSS SR + Neural Rendering [B,H',W',3] float 0..1 CPU.
+
+    Frames stream to video2dlssnr.exe as raw RGBA over a pipe and come back the
+    same way — no ffmpeg, no temp files (mirrors the upstream ComfyUI nodes).
+    """
+    exe = _dlssnr_find_exe()
+    src = frames.detach().cpu().clamp(0, 1).mul(255).round().to(torch.uint8).numpy()
+    src = np.ascontiguousarray(src[..., :3])
+    b, h, w, _ = src.shape
+    if motion_engine not in _DLSSNR_ENGINES:
+        motion_engine = "auto"
+    out_w, out_h = _dlssnr_out_dims(w, h, width, scale)
+    cmd = [exe, "--nr-video", "--nr-in", f"{w}x{h}", "--adapter", str(int(adapter)),
+           "--nr-style", str(_DLSSNR_STYLES.get(style, 2)),
+           "--nr-preset", str(_DLSSNR_PRESETS.get(preset, 0)),
+           "--nr-intensity", f"{float(intensity)}",
+           "--nr-local-structure", f"{float(local_structure)}",
+           "--nr-local-tone", f"{float(local_tone)}",
+           "--nr-skin", f"{float(skin)}",
+           "--nr-global-tone", f"{float(global_tone)}",
+           "--nr-detail", f"{float(detail)}",
+           "--nr-color", f"{float(color)}",
+           "--nr-ui-correction", "0",
+           "--nr-motion", "1" if motion else "0",
+           "--nr-motion-engine", motion_engine]
+    if auto_mask:
+        cmd.append("--nr-auto-mask")
+    if hdr:
+        cmd.append("--nr-hdr")
+    if (out_w, out_h) != (w, h):
+        cmd += ["--nr-width", str(out_w), "--nr-height", str(out_h)]
+
+    alpha = np.full((b, h, w, 1), 255, np.uint8)
+    rgba = np.concatenate([src, alpha], axis=3)
+    print(f"[BSAI-H3/DLSS5] {os.path.basename(exe)} | {w}x{h} x{b}帧 -> {out_w}x{out_h} "
+          f"(style={style}, detail={detail}, motion={motion_engine})", flush=True)
+    p = _sp.Popen(cmd, stdin=_sp.PIPE, stdout=_sp.PIPE, stderr=_sp.PIPE)
+    err = []
+
+    def feed():
+        try:
+            for i in range(b):
+                p.stdin.write(rgba[i].tobytes())
+            p.stdin.close()
+        except (BrokenPipeError, OSError):
+            pass
+
+    def drain():
+        prog = _re.compile(rb"^NRPROG (\d+) ")
+        for raw in iter(p.stderr.readline, b""):
+            if not prog.match(raw):
+                line = raw.decode("utf-8", "replace").rstrip()
+                if line:
+                    err.append(line)
+
+    tf = threading.Thread(target=feed, daemon=True)
+    td = threading.Thread(target=drain, daemon=True)
+    tf.start(); td.start()
+    need = b * out_w * out_h * 4
+    buf = bytearray(need)
+    view = memoryview(buf)
+    got = 0
+    while got < need:
+        n = p.stdout.readinto(view[got:])
+        if not n:
+            break
+        got += n
+    rc = p.wait()
+    tf.join(timeout=5); td.join(timeout=5)
+    if rc != 0 or got != need:
+        raise RuntimeError(
+            "[BSAI-H3/DLSS5] DLSS 5 超分失败 (exit %s, got %d/%d bytes)\n%s\n"
+            "提示: 需要 NVIDIA RTX 显卡；Neural Rendering 需驱动 >= 616.56（旧驱动下 "
+            "driver NGX 以 OutOfDate 拒绝 feature 18）。请确认 nvngx_dlss.dll / "
+            "nvngx_dlssnr.dll 与 exe 同目录。" % (rc, got, need, "\n".join(err)[-2000:]))
+    return (torch.from_numpy(
+        np.frombuffer(buf, np.uint8).reshape(b, out_h, out_w, 4)[..., :3]).float() / 255.0)
+
+
+# ---------------------------------------------------------------------------
 # Main node: video frames -> AI upscaled frames
 # ---------------------------------------------------------------------------
 class BSAI_H3_Upscale4K:
@@ -1254,6 +1607,7 @@ class BSAI_H3_Upscale4K:
         "FlashVSR-v1.1 (扩散视频超分)": "flashvsr",
         "SeedVR2 7B (扩散视频超分)": "seedvr2",
         "NVIDIA RTX Video Super Res": "rtx",
+        "DLSS 5 (NVIDIA 神经渲染超分)": "dlss5",
     }
 
     # Generative Topaz engine options (prepended to the Real-ESRGAN model list).
@@ -1321,6 +1675,13 @@ class BSAI_H3_Upscale4K:
                 # texture, gated to avoid halos) — reads closer to Topaz /
                 # FlashVSR's reconstructed texture.
                 "detail_mode / 细节模式": (["classic", "smart"], {"default": "smart"}),
+                # DLSS 5 专属参数（仅当 model_name 选择 DLSS 5 时生效）：
+                # style=NR 风格（Cinematic 默认最干净）；intensity/detail 控制
+                # 神经渲染叠加强度；motion=光流运动矢量（时序稳定，防闪烁）。
+                "dlss_style / DLSS风格": (["Cinematic", "Default", "Natural"], {"default": "Cinematic"}),
+                "dlss_intensity / DLSS强度": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05}),
+                "dlss_detail / DLSS细节": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05}),
+                "dlss_motion / DLSS光流": ("BOOLEAN", {"default": True}),
             },
         }
 
@@ -1333,6 +1694,8 @@ class BSAI_H3_Upscale4K:
         "  • Real-ESRGAN 极速档：general-x4v3 / x4plus，光流时序 + 多尺度细节 + 人脸修复\n"
         "  • FlashVSR-v1.1 / SeedVR2 7B：扩散式视频超分（各自权重路径不变）\n"
         "  • NVIDIA RTX Video Super Res：nvidia-vfx GPU 超分（无模型文件）\n"
+        "  • DLSS 5（NVIDIA 神经渲染超分）：DLSS SR + Neural Rendering，RTX 硬件超分，\n"
+        "    video2dlssnr 管道驱动（需 exe + nvngx_dlss.dll + nvngx_dlssnr.dll）\n"
         "  • Topaz 生成式完美档：星光 2.6 / Astra 神经引擎（本机 ComfyUI/models/Topaz_Engine），\n"
         "    单节点即可达 Topaz 官方级人脸细节与纹理，后续 detail/softness/face_restore 仍可叠加。\n"
         "Unified multi-engine video super-resolution node: Real-ESRGAN fast tier, "
@@ -1358,6 +1721,10 @@ class BSAI_H3_Upscale4K:
         face_blend = g("face_blend / 融合强度", 0.65)
         face_fidelity = g("face_fidelity / 保真度", 0.75)
         detail_mode = g("detail_mode / 细节模式", 'smart')
+        dlss_style = g("dlss_style / DLSS风格", 'Cinematic')
+        dlss_intensity = g("dlss_intensity / DLSS强度", 1.0)
+        dlss_detail = g("dlss_detail / DLSS细节", 1.0)
+        dlss_motion = g("dlss_motion / DLSS光流", True)
         t0 = time.time()
         # Free GPU VRAM before upscaling: H3 diffusion model (~20GB) may still
         # be resident from the previous generation node, which causes OOM when
@@ -1387,6 +1754,18 @@ class BSAI_H3_Upscale4K:
         elif _engine == "rtx":
             # --- NVIDIA RTX Video Super Resolution path ---------------------
             out = _rtx_upscale(images, scale)
+            eff_scale = float(out.shape[1] / float(images.shape[1]))
+            temporal_strength = 0.0
+            lr_np = None
+        elif _engine == "dlss5":
+            # --- DLSS 5 (Super Resolution + Neural Rendering) path ----------
+            # DLSS NR 自带时序（光流运动矢量），我们的光流时序 pass 跳过；
+            # 后续 detail / softness / face_restore 仍可叠加微调。
+            out = _dlssnr_upscale(
+                images, float(scale),
+                style=dlss_style, preset="Default", intensity=float(dlss_intensity),
+                detail=float(dlss_detail), motion=bool(dlss_motion),
+            )
             eff_scale = float(out.shape[1] / float(images.shape[1]))
             temporal_strength = 0.0
             lr_np = None
@@ -2045,8 +2424,8 @@ def _topaz_run(in_path, out_path, scale, frames, w, h, strength, max_gpu_mem, mo
         filters = '[{"model": "%s", "enhancement_strength": %s}]' % (model_id, strength)
     ow = int(round(w * scale)); ow += ow % 2
     oh = int(round(h * scale)); oh += oh % 2
-    NS_ENC = ('-c:v h264_nvenc -profile:v high -pix_fmt yuv420p -g 30 -preset p7 -tune hq '
-              '-rc constqp -qp 18 -rc-lookahead 20 -spatial_aq 1 -aq-strength 15 -b:v 0 -bf 0')
+    NS_ENC = ('-c:v h264_nvenc -profile:v high -pix_fmt yuv420p -g 30 -preset p4 -tune hq '
+              '-rc constqp -qp 23 -rc-lookahead 10 -spatial_aq 0 -b:v 0 -bf 0')
 
     max_attempts = 3
     last_err = None
@@ -2239,11 +2618,108 @@ class BSAI_TopazEngine_FaceRestore:
         return (out_t, bw, bh, used, info)
 
 
+# ---------------------------------------------------------------------------
+# Standalone DLSS 5 node: any video / image frames through DLSS SR + NR.
+# ---------------------------------------------------------------------------
+class BSAI_H3_DLSS5:
+    """DLSS 5 (NVIDIA Super Resolution + Neural Rendering) 视频超分独立节点。
+
+    通过 video2dlssnr.exe 以原始 RGBA 管道驱动 DLSS 超分 + 神经渲染（NGX
+    feature 18），任意视频/图片帧可直接放大，带光流运动矢量保证时序稳定。
+    独立于 Real-ESRGAN / Topaz / FlashVSR 等引擎，RTX 显卡专用。
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images / 图像": ("IMAGE",),
+                "scale / 放大倍数": ("FLOAT", {"default": 2.0, "min": 1.0, "max": 3.0, "step": 0.05,
+                                               "tooltip": "DLSS SR 放大倍数 1-3（1 = 原生分辨率仅神经渲染）"}),
+                "style / 风格": (["Cinematic", "Default", "Natural"], {"default": "Cinematic",
+                                                                        "tooltip": "Cinematic 最干净 / Natural 保留肤色 / Default 默认"}),
+                "preset / 预设": (["Default", "Preset 1", "Preset 2", "Preset 3"], {"default": "Default"}),
+                "intensity / 强度": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05}),
+                "local_structure / 局部结构": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05}),
+                "local_tone / 局部色调": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05}),
+                "skin / 皮肤": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 2.0, "step": 0.05,
+                                          "tooltip": "-1 = 模型默认"}),
+                "global_tone / 全局色调": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 2.0, "step": 0.05,
+                                                     "tooltip": "<0 = 模型默认"}),
+                "detail / 细节": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05,
+                                            "tooltip": "0 = 纯超分不加细节，1 = 全量神经渲染"}),
+                "color / 色彩": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05,
+                                           "tooltip": "0 = 保持原色相，1 = 采用 NR 色彩"}),
+                "motion / 光流运动矢量": ("BOOLEAN", {"default": True,
+                                                       "tooltip": "光流运动矢量 -> 时序稳定防闪烁"}),
+                "motion_engine / 光流引擎": (["auto", "nvof", "lk"], {"default": "auto",
+                                                                       "tooltip": "auto=NVOFA硬件光流，否则LK计算着色器"}),
+                "adapter / GPU适配器": ("INT", {"default": 0, "min": 0, "max": 15}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "INT", "INT", "FLOAT", "STRING")
+    RETURN_NAMES = ("IMAGE / 图像", "width / 宽", "height / 高", "scale_used / 实际倍率", "info / 信息")
+    FUNCTION = "run"
+    CATEGORY = "BSAI/H3"
+    DESCRIPTION = (
+        "DLSS 5 视频超分独立节点：DLSS Super Resolution + Neural Rendering（NGX feature 18），\n"
+        "经 video2dlssnr.exe 原始 RGBA 管道驱动，RTX 显卡硬件加速。\n"
+        "• 纯超分：detail=0（只放大不加神经渲染）\n"
+        "• 完美档：detail=1 + Cinematic + motion（光流时序）\n"
+        "需 exe + nvngx_dlss.dll + nvngx_dlssnr.dll 就位（详见 README）。\n"
+        "DLSS 5 standalone video upscaler: DLSS SR + Neural Rendering via video2dlssnr.exe."
+    )
+
+    def run(self, **kw):
+        g = kw.get
+        images = g("images / 图像")
+        scale = g("scale / 放大倍数", 2.0)
+        style = g("style / 风格", "Cinematic")
+        preset = g("preset / 预设", "Default")
+        intensity = g("intensity / 强度", 1.0)
+        local_structure = g("local_structure / 局部结构", 1.0)
+        local_tone = g("local_tone / 局部色调", 1.0)
+        skin = g("skin / 皮肤", -1.0)
+        global_tone = g("global_tone / 全局色调", -1.0)
+        detail = g("detail / 细节", 1.0)
+        color = g("color / 色彩", 1.0)
+        motion = g("motion / 光流运动矢量", True)
+        motion_engine = g("motion_engine / 光流引擎", "auto")
+        adapter = g("adapter / GPU适配器", 0)
+        t0 = time.time()
+        try:
+            model_management.unload_all_models()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
+        except Exception:
+            pass
+        out = _dlssnr_upscale(
+            images, float(scale), style=style, preset=preset, intensity=float(intensity),
+            local_structure=float(local_structure), local_tone=float(local_tone),
+            skin=float(skin), global_tone=float(global_tone), detail=float(detail),
+            color=float(color), motion=bool(motion), motion_engine=motion_engine,
+            adapter=int(adapter),
+        )
+        bh, bw = out.shape[1], out.shape[2]
+        eff = float(out.shape[2]) / float(images.shape[2])
+        elapsed = time.time() - t0
+        info = (
+            f"DLSS 5: {bw}x{bh} (eff={eff:.3f}x) | style={style} preset={preset} "
+            f"intensity={intensity} detail={detail} color={color} | motion={motion_engine} | "
+            f"frames={images.shape[0]} | time={elapsed:.2f}s | "
+            f"device: {'cuda' if torch.cuda.is_available() else 'cpu'}"
+        )
+        return (out, bw, bh, float(eff), info)
+
+
 NODE_CLASS_MAPPINGS = {
     "BSAI_H3_Upscale4K": BSAI_H3_Upscale4K,
     "BSAI_H3_Upscale4K_Latent": BSAI_H3_Upscale4K_Latent,
     "BSAI_H3_FaceRestore": BSAI_H3_FaceRestore,
     "BSAI Topaz Engine Face Restore": BSAI_TopazEngine_FaceRestore,
+    "BSAI_H3_DLSS5": BSAI_H3_DLSS5,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -2251,4 +2727,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "BSAI_H3_Upscale4K_Latent": "BSAI H3 upscale 4K Latent / H3潜空间放大",
     "BSAI_H3_FaceRestore": "BSAI H3 Face Restore / 人脸修复",
     "BSAI Topaz Engine Face Restore": "BSAI Topaz Engine Face Restore",
+    "BSAI_H3_DLSS5": "BSAI H3 DLSS 5 Upscale / DLSS5神经超分",
 }

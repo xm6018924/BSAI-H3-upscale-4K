@@ -1,0 +1,191 @@
+{
+  "last_node_id": 5,
+  "last_link_id": 2,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "LoadImage",
+      "pos": [
+        -980,
+        0
+      ],
+      "size": [
+        320,
+        314
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            1
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {},
+      "widgets_values": [
+        "example.png",
+        "image"
+      ]
+    },
+    {
+      "id": 2,
+      "type": "BSAI_H3_Upscale4K",
+      "pos": [
+        -520,
+        -40
+      ],
+      "size": [
+        400,
+        470
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 1
+        }
+      ],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            2
+          ],
+          "slot_index": 0
+        },
+        {
+          "name": "width",
+          "type": "INT",
+          "links": null,
+          "slot_index": 1
+        },
+        {
+          "name": "height",
+          "type": "INT",
+          "links": null,
+          "slot_index": 2
+        },
+        {
+          "name": "scale_used",
+          "type": "FLOAT",
+          "links": null,
+          "slot_index": 3
+        },
+        {
+          "name": "info",
+          "type": "STRING",
+          "links": null,
+          "slot_index": 4
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "BSAI_H3_Upscale4K"
+      },
+      "widgets_values": [
+        "DLSS 5 (NVIDIA 神经渲染超分)",
+        2.0,
+        0,
+        16,
+        4,
+        true,
+        false,
+        0.0,
+        0.0,
+        1.8,
+        0.0,
+        "Off",
+        0.15,
+        0.7,
+        0.6,
+        "smart",
+        "Cinematic",
+        1.0,
+        1.0,
+        true
+      ]
+    },
+    {
+      "id": 3,
+      "type": "PreviewImage",
+      "pos": [
+        -20,
+        0
+      ],
+      "size": [
+        400,
+        400
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 2
+        }
+      ],
+      "outputs": [],
+      "properties": {}
+    },
+    {
+      "id": 4,
+      "type": "MarkdownNote",
+      "pos": [
+        -980,
+        380
+      ],
+      "size": [
+        420,
+        340
+      ],
+      "flags": {},
+      "order": 99,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "properties": {},
+      "widgets_values": [
+        "## 🚀 BSAI H3 upscale 4K — DLSS 5 引擎版\n\n主节点下拉选择 **`DLSS 5 (NVIDIA 神经渲染超分)`**：\n- scale=2.0（DLSS 超分倍数）\n- DLSS风格=Cinematic ｜ DLSS强度=1.0 ｜ DLSS细节=1.0 ｜ DLSS光流=ON\n\n**注意**：DLSS NR 自带光流时序，`temporal_strength` 已置 0 避免重复处理；\n`detail_amount`/`softness` 置 0 保留 DLSS 原生画面，需要可自行上调。\n\n**视频用法**：`H3 生成 → VAE Decode → [本节点] → Save Video (4K)`\n引擎：`video2dlssnr.exe` + `nvngx_dlss.dll` + `nvngx_dlssnr.dll`（需 NVIDIA RTX，NR 需驱动 ≥616.56）"
+      ],
+      "widgets_values_named": {
+        "text": "## 🚀 BSAI H3 upscale 4K — DLSS 5 引擎版\n\n主节点下拉选择 **`DLSS 5 (NVIDIA 神经渲染超分)`**：\n- scale=2.0（DLSS 超分倍数）\n- DLSS风格=Cinematic ｜ DLSS强度=1.0 ｜ DLSS细节=1.0 ｜ DLSS光流=ON\n\n**注意**：DLSS NR 自带光流时序，`temporal_strength` 已置 0 避免重复处理；\n`detail_amount`/`softness` 置 0 保留 DLSS 原生画面，需要可自行上调。\n\n**视频用法**：`H3 生成 → VAE Decode → [本节点] → Save Video (4K)`\n引擎：`video2dlssnr.exe` + `nvngx_dlss.dll` + `nvngx_dlssnr.dll`（需 NVIDIA RTX，NR 需驱动 ≥616.56）"
+      },
+      "title": "主节点 DLSS5 引擎 — 使用说明",
+      "color": "#222",
+      "bgcolor": "#000"
+    }
+  ],
+  "links": [
+    [
+      1,
+      1,
+      0,
+      2,
+      0,
+      "IMAGE"
+    ],
+    [
+      2,
+      2,
+      0,
+      3,
+      0,
+      "IMAGE"
+    ]
+  ],
+  "groups": [],
+  "config": {},
+  "extra": {},
+  "version": 0.4
+}

@@ -4,7 +4,7 @@
 > A dedicated AI video super-resolution / upscaling plugin for **MiniMax H3** — extreme-speed HD/4K upscale.
 
 参考当前全球最先进的超分技术实现 / Built on the state-of-the-art in video super-resolution:
-**Real-ESRGAN**（写实 / 动漫 / 通用）+ **Tile 分块推理** + **FP16 半精度** + **帧批量并行** + **模型常驻缓存** + **H3 专属 latent 二次采样放大**。
+**Real-ESRGAN**（写实 / 动漫 / 通用）+ **Tile 分块推理** + **FP16 半精度** + **帧批量并行** + **模型常驻缓存** + **H3 专属 latent 二次采样放大** + **DLSS 5（NVIDIA 神经渲染超分）** + **Topaz 生成式完美档**。
 
 ---
 
@@ -16,6 +16,7 @@
 - 🧬 **双架构自适应** — 同时支持标准 RRDBNet 与 compact（`body.N.rdb1/2/3`）结构
 - 🎞️ **H3 latent 二次采样放大** — 32 像素对齐，供 H3 第二遍采样补细节（保持人物一致性）
 - 🧑 **人脸修复 / Face restore** — YOLOv8-Face 检测 + GFPGAN / CodeFormer（ONNX·GPU·零新依赖），一键解决 H3 中远景**小脸崩坏、五官模糊丢失**
+- 🎮 **DLSS 5（NVIDIA 神经渲染超分）** — DLSS Super Resolution + Neural Rendering（NGX feature 18），RTX 硬件加速、自带光流时序稳定，经 video2dlssnr.exe 原始 RGBA 管道驱动（exe + NVIDIA 专有 DLL 就位即用，可自动从本地整合包部署）
 - 🌐 **中英双语节点与文档 / Bilingual nodes & docs**
 - 📦 **零额外依赖** — 仅用 PyTorch + ComfyUI 自带环境，经典 API，最大兼容性
 
@@ -81,6 +82,7 @@
 | FlashVSR | 扩散一步流式 | ✅ | A100 17FPS | 高 | 时序+实时(云端) | 模型大、消费卡慢 |
 | SeedVR2 | 扩散一步 | ✅ | 数秒/帧 | **最高** | 保真+时序，文本/人脸最强 | 慢、显存大 |
 | Topaz Starlight | 扩散(6B) | ✅ | 慢 | 最高(专调AI视频) | AI 视频去塑料感 | 商业闭源、$799/年 |
+| **DLSS 5 (RTX硬件)** | 神经网络(NGX) | ✅(光流NVOF) | 极快(0.74ms/图SR) | 高 | 硬件加速、自带时序 | 需RTX卡、专有DLL、NR需新驱动 |
 
 **取舍结论**：纯 PyTorch 无法达到 NVIDIA RTX VSR 的硬件实时延迟；本插件以「**最快速度 + 光流时序一致性 + 细节增强**」在消费级 GPU 上实现逐帧 4K 导出，清晰度优于 RTX VSR 的 2x 实时增强，速度远快于 SeedVR2 / Starlight 等扩散方案。
 
@@ -155,9 +157,53 @@ H3 解码 / 任意视频帧 → [BSAI H3 Face Restore] → 修复后帧
 > （RTX 5090 实测 8 帧 608×352→1216×704 首跑约 7 分钟）——与 Topaz 官方一致，
 > 这是追求"完美画质"的代价；需要速度请用节点 1️⃣（极速档）。
 
+### 5️⃣ BSAI H3 DLSS 5 Upscale（DLSS5 神经渲染超分，任意工作流可用）
+
+以 **NVIDIA DLSS 5**（DLSS Super Resolution + Neural Rendering，NGX feature 18）为放大引擎，
+任意视频/图片帧直接放大，RTX 硬件加速、自带光流运动矢量保证时序稳定。
+
+> 与 OptiScaler 的关系：OptiScaler 对 DLSS5 的支持是“游戏进程内注入”（dxgi.dll + ReShade +
+> RenoDX addon），ComfyUI 视频处理无法复用其注入方式；但其背后同一套 DLSS5 引擎
+> （nvngx_dlss.dll + nvngx_dlssnr.dll）正是由 [video2dlssnr](https://github.com/DaniilSokolyuk/video2dlssnr)
+> 对视频帧生效。本插件即经 video2dlssnr 的原始 RGBA 管道驱动 DLSS5，帧不落盘、不转码。
+
+```
+任意视频帧 → [BSAI H3 DLSS 5 Upscale] → DLSS 超分 + 神经渲染 4K 帧
+```
+
+| 参数 / Parameter | 说明 / Description | 默认 |
+|---|---|---|
+| `scale / 放大倍数` | DLSS SR 放大倍数 1–3（1 = 原生分辨率仅神经渲染） | 2.0 |
+| `style / 风格` | **Cinematic**（最干净）/ Default / Natural（保留肤色） | Cinematic |
+| `preset / 预设` | 神经渲染渲染预设 0–3 | Default |
+| `intensity / 强度` | 神经渲染整体强度 0–2 | 1.0 |
+| `local_structure / 局部结构` | 局部结构强度 0–2 | 1.0 |
+| `local_tone / 局部色调` | 局部色调强度 0–2 | 1.0 |
+| `skin / 皮肤` / `global_tone / 全局色调` | <0 = 模型默认 | -1.0 |
+| `detail / 细节` | **0 = 纯超分不加细节**，1 = 全量神经渲染，>1 夸张 | 1.0 |
+| `color / 色彩` | 0 = 保持原色相，1 = 采用 NR 色彩 | 1.0 |
+| `motion / 光流运动矢量` | 光流运动矢量 → 时序稳定防闪烁 | True |
+| `motion_engine / 光流引擎` | auto（NVOFA 硬件光流）/ nvof / lk（计算着色器） | auto |
+| `adapter / GPU适配器` | DXGI 适配器索引（多卡选卡） | 0 |
+
+**引擎依赖**：需本机存在 `video2dlssnr.exe` + `nvngx_dlss.dll` + `nvngx_dlssnr.dll`
+（NVIDIA 专有，不可再分发，用户自备）。查找顺序：环境变量 `VIDEO2DLSSNR_EXE` →
+`ComfyUI/models/DLSS5/` → 本插件 `bin/` → **自动从本地整合包部署**
+（`C:\BSAI\DLSS5\...\video2dlssnr整合包*.zip`，仅解包 exe + DLL 到 `models/DLSS5/`）。
+缺失时节点给出明确指引，不会静默失败。
+
+> **驱动要求**：Neural Rendering（NGX feature 18）官方要求 **NVIDIA 驱动 ≥ 616.56**。
+> 已实测 **RTX 5090 + Studio 616.56**：视频管道（--nr-video）NR 全功能生效（
+> detail=1 与 detail=0 输出差异显著，神经渲染真实叠加，最大像素差 ≈0.21）。
+> 旧驱动（<616.56）下 driver NGX 以 OutOfDate 拒绝 feature 18，可经前向 shim
+> 路由兜底跑通，但建议升级驱动。纯 DLSS Super Resolution（detail=0）兼容性更宽松。
+
+**速度**：DLSS 是 Tensor Core 硬件超分，远快于任何 CNN/扩散方案——实测 427×240→640×360
+单帧 **0.74 ms**（SR），神经渲染逐帧流式，适合长视频。
+
 ---
 
-## 🎬 H3 工作流推荐用法 / Recommended H3 workflow
+## 🎬 H3 工作流推荐用法
 
 **路线 A — 像素级 4K 放大（最直接）**
 ```
@@ -187,6 +233,14 @@ H3 生成 → VAE Decode → [BSAI Topaz Engine Face Restore](model=星光 2.6, 
 > 生成式重绘带来最自然的人脸与细节，远处人脸崩坏由星光生成式修复 +
 > 本插件人脸保真重建双保险。可自由切换星光 2.6 / Astra 家族模型。
 
+**路线 E — DLSS 5 硬件超分档（RTX 显卡最快 4K 路线）**
+`
+H3 生成 → VAE Decode → [BSAI H3 DLSS 5 Upscale](scale=2, style=Cinematic, detail=1)
+   → Save Video (4K)
+`
+> 需 video2dlssnr.exe + nvngx_dlss.dll + nvngx_dlssnr.dll 就位（详见节点 5️⃣）。
+> RTX 硬件超分 + 神经渲染，单帧 SR 仅 ~0.74ms，自带光流时序，适合超长视频。
+
 ---
 
 ## 🧪 性能参考 / Performance (RTX 5090 Laptop, FP16 + compile)
@@ -206,6 +260,28 @@ H3 生成 → VAE Decode → [BSAI Topaz Engine Face Restore](model=星光 2.6, 
 ---
 
 ## 📝 更新日志 / Changelog
+
+### v2.4.0 — DLSS 5 神经渲染超分引擎 + 2026 最新超分技术全景 / DLSS 5 Neural Rendering tier
+- **新增 DLSS 5（NVIDIA 神经渲染超分）引擎**：
+  - 主节点 `BSAI H3 upscale 4K` 的模型下拉新增 `DLSS 5 (NVIDIA 神经渲染超分)`（ENGINE_OPTIONS），
+    新增 4 个 DLSS 专属参数：`dlss_style / DLSS风格`、`dlss_intensity / DLSS强度`、
+    `dlss_detail / DLSS细节`、`dlss_motion / DLSS光流`。
+  - 新增独立节点 `BSAI H3 DLSS 5 Upscale / DLSS5神经超分`：完整 NR 旋钮（style/preset/intensity/
+    local_structure/local_tone/skin/global_tone/detail/color + motion/motion_engine/adapter），
+    任意视频/图片帧可直接调用；`detail=0` 即纯 DLSS 超分不加神经渲染。
+  - 底座 = [video2dlssnr](https://github.com/DaniilSokolyuk/video2dlssnr)（纯 C++17/D3D12 CLI）：
+    DLSS Super Resolution（nvngx_dlss.dll）+ Neural Rendering（nvngx_dlssnr.dll, NGX feature 18），
+    帧以原始 RGBA 管道进出，不落盘、不转码；自带光流运动矢量（NVOFA/LK）保证时序稳定。
+  - **OptiScaler DLSS5 说明**：OptiScaler 的 DLSS5 支持是游戏内注入（dxgi.dll + ReShade + RenoDX），
+    无法用于 ComfyUI 视频处理；其背后同一套 DLSS5 引擎经 video2dlssnr 对视频帧生效，已接入。
+  - **引擎部署**：查找顺序 `VIDEO2DLSSNR_EXE` → `ComfyUI/models/DLSS5/` → 插件 `bin/` →
+    自动从本地 DLSS5 整合包解包部署（仅 exe + NVIDIA 专有 DLL，不随插件分发）。
+  - **驱动**：Neural Rendering 官方要求驱动 ≥ 616.56；已实测 RTX 5090 + Studio 616.56 视频管道 NR 全功能生效（610.88 下可经前向 shim 兜底跑通）。
+- **2026 最新超分技术全景调研**（详见对比表）：FlashVSR 一步扩散流式（≈17FPS A100）、
+  SeedVR2 7B 扩散、SparkVSR 稀疏关键帧传播（老电影修复）、OSDEnhancer 一步时空扩散、
+  WEVSR 小波增强 VAE、VSRM（Mamba）、DRCT/OmniSR 轻量 Transformer、ComfyUI 核心 vCube 8K 增强等；
+  本插件现集 Real-ESRGAN（极速）+ FlashVSR + SeedVR2 + NVIDIA RTX + Topaz（生成式）+ DLSS 5（硬件）
+  六类引擎于一节点。
 
 ### v2.1.0 — 通用超分集合节点：融合 FlashVSR / SeedVR2 / NVIDIA RTX / Unified multi-engine node
 - `BSAI_H3_Upscale4K` 的 `model_name / 模型` 下拉新增三个第三方引擎选项：

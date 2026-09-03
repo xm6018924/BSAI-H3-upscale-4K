@@ -1432,24 +1432,62 @@ def _dlssnr_exe_dir():
     return d
 
 
+def _dlssnr_pack_candidates():
+    """Locate video2dlssnr packs under known roots (walked, bounded depth).
+
+    Returns both already-extracted exe paths and the integration zip paths, so
+    the caller can either use the exe directly or auto-provision from a zip.
+    """
+    roots = []
+    env = os.environ.get("VIDEO2DLSSNR_PACK_DIR", "").strip().strip('"')
+    if env:
+        roots.append(env)
+    roots.append(r"C:\BSAI\DLSS5")
+    out = []
+    seen = set()
+    for root in roots:
+        if not os.path.isdir(root):
+            continue
+        try:
+            for dirpath, _dirs, files in os.walk(root):
+                depth = dirpath[len(root):].count(os.sep)
+                if depth > 4:
+                    continue
+                for fn in files:
+                    low = fn.lower()
+                    if low == "video2dlssnr.exe":
+                        p = os.path.normpath(os.path.join(dirpath, fn))
+                        if p not in seen:
+                            seen.add(p); out.append(p)
+                    elif low.endswith(".zip") and "video2dlssnr" in low:
+                        p = os.path.normpath(os.path.join(dirpath, fn))
+                        if p not in seen:
+                            seen.add(p); out.append(p)
+        except OSError:
+            continue
+    return out
+
+
 def _dlssnr_provision():
-    """Auto-provision video2dlssnr.exe + runtime DLLs from a known local pack
+    """Auto-provision video2dlssnr.exe + runtime DLLs from a local pack zip
     into <ComfyUI>/models/DLSS5/. Returns exe path or None.
 
-    Pack search order: VIDEO2DLSSNR_ZIP env var, then the user's DLSS5 collection.
-    Only the runnable artifacts (.exe + nvngx_* dlls) are copied; proprietary DLLs
-    stay user-supplied, this just unpacks what they already own.
+    Pack search order: VIDEO2DLSSNR_ZIP env var, then known local collections
+    (C:\\BSAI\\DLSS5 tree). Only the runnable artifacts (.exe + nvngx_* dlls)
+    are copied; proprietary DLLs stay user-supplied — this just unpacks what the
+    user already owns, same design philosophy as the Topaz engine (v1.8.2).
     """
     dest = _dlssnr_exe_dir()
     exe = os.path.join(dest, "video2dlssnr.exe")
     if os.path.isfile(exe):
         return exe
-    cands = []
+    zsrc = None
     env_zip = os.environ.get("VIDEO2DLSSNR_ZIP", "").strip().strip('"')
-    if env_zip:
-        cands.append(env_zip)
-    cands.append(r"C:\BSAI\DLSS5\DLSS5 的超分实现ideo2dlssnr整合包，有些人需要build.zip")
-    zsrc = next((z for z in cands if z and os.path.isfile(z)), None)
+    if env_zip and os.path.isfile(env_zip):
+        zsrc = env_zip
+    else:
+        zsrc = next((c for c in _dlssnr_pack_candidates()
+                     if c.lower().endswith(".zip")), None)
     if not zsrc:
         return None
     try:
@@ -1459,7 +1497,7 @@ def _dlssnr_provision():
             for m in zf.infolist():
                 if m.is_dir():
                     continue
-                rel = m.filename
+                rel = m.filename.replace("\\", "/")
                 if not rel.startswith("video2dlssnr/out/"):
                     continue
                 name = rel[len("video2dlssnr/out/"):]
@@ -1480,7 +1518,8 @@ def _dlssnr_provision():
 
 def _dlssnr_find_exe():
     """Locate video2dlssnr.exe. Order: VIDEO2DLSSNR_EXE -> models/DLSS5 ->
-    plugin bin/ -> auto-provision from local pack. Raises a clear error."""
+    plugin bin/ -> known local packs (extracted exe, then zip auto-provision).
+    Raises a clear error if missing."""
     cands = []
     env = os.environ.get("VIDEO2DLSSNR_EXE", "").strip().strip('"')
     if env:
@@ -1490,6 +1529,11 @@ def _dlssnr_find_exe():
     for c in cands:
         if c and os.path.isfile(c):
             return c
+    # known local packs: prefer an already-extracted exe before unzipping
+    for cand in _dlssnr_pack_candidates():
+        if cand.lower().endswith(".exe"):
+            print(f"[BSAI-H3/DLSS5] 使用本地引擎: {cand}", flush=True)
+            return cand
     prov = _dlssnr_provision()
     if prov:
         return prov

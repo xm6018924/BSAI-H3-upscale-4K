@@ -32,6 +32,37 @@
 
 ---
 
+## 🖥️ 空电脑一键安装（环境自检 + 自动补齐）/ One-click setup
+
+在**新装 / 空白电脑**上部署本插件时，无需手动配依赖：
+
+```bat
+cd ComfyUI\custom_nodes\BSAI-H3-upscale-4K
+python install.py
+```
+
+自动检测已有依赖并**静默补齐缺失项**（已有 → 跳过；缺失 → 自动安装/下载）：
+
+| # | 检测项 | 缺失时行为 |
+|---|---|---|
+| 1 | Python / ComfyUI 根目录 | 提示 |
+| 2 | PyTorch + CUDA + GPU（识别 NVIDIA RTX，判定 DLSS5 可用性） | 提示先装 ComfyUI |
+| 3 | numpy / opencv-python / spandrel / onnxruntime-gpu / ultralytics / pillow | `pip install` 静默安装 |
+| 4 | Real-ESRGAN 三模型（`upscale_models/`） | 官方 GitHub release 自动下载 |
+| 5 | YOLOv8-Face（`ultralytics/bbox/`） | adetailer 镜像自动下载 |
+| 6 | FlashVSR / SeedVR2 / NVIDIA RTX 引擎插件 | `git clone` 到 `custom_nodes/`（可选） |
+| 7 | DLSS5 运行时（`models/DLSS5/`） | 本地整合包自动复制/解包；无则自动下载官方 `video2dlssnr.exe` |
+| 8 | Topaz 商业引擎（可选） | 仅检测提示 |
+
+**DLSS5 的 NVIDIA 专有 DLL（`nvngx_dlssnr.dll` / `nvngx_dlss.dll`）不自动分发**（与 video2dlssnr 官方一致）：
+脚本会自动从本机 DLSS5 整合包复制；若本机没有，运行 `python install.py --dlss5-full` 可自动下载含
+NVIDIA DLL 的官方全量包（约 247MB），或按提示手动放入 `models/DLSS5/`。
+
+可选参数：`--no-pip`（跳过依赖安装）、`--no-models`（跳过模型下载）、`--no-git`（跳过引擎插件
+clone）、`--dlss-dir <路径>`（额外指定含 video2dlssnr.exe 的目录）、`--dlss5-full`（下载全量包）。
+
+---
+
 ## 🔧 节点 / Nodes
 
 ### 1️⃣ BSAI H3 upscale 4K（视频帧 → AI 超分高清帧）

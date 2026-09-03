@@ -32,7 +32,8 @@
       "widgets_values": [
         "example.png",
         "image"
-      ]
+      ],
+      "title": "BSAI Load Image"
     },
     {
       "id": 2,
@@ -107,7 +108,7 @@
         "auto",
         0
       ],
-      "title": "DLSS5 全量神经渲染 (detail=1)"
+      "title": "BSAI DLSS5 全量神经渲染 (detail=1)"
     },
     {
       "id": 3,
@@ -182,7 +183,7 @@
         "auto",
         0
       ],
-      "title": "DLSS5 纯超分 (detail=0)"
+      "title": "BSAI DLSS5 纯超分 (detail=0)"
     },
     {
       "id": 4,
@@ -206,7 +207,8 @@
         }
       ],
       "outputs": [],
-      "properties": {}
+      "properties": {},
+      "title": "BSAI Preview 神经渲染"
     },
     {
       "id": 5,
@@ -230,7 +232,8 @@
         }
       ],
       "outputs": [],
-      "properties": {}
+      "properties": {},
+      "title": "BSAI Preview 纯超分"
     },
     {
       "id": 6,
@@ -255,7 +258,7 @@
       "widgets_values_named": {
         "text": "## 🎮 BSAI H3 DLSS 5 Upscale — 独立节点示例\n\n**左图 = DLSS 5 全量神经渲染**（detail=1.0，DLSS 超分 + Neural Rendering 细节）\n**右图 = DLSS 5 纯超分**（detail=0.0，只放大不加神经渲染）\n\n**用法**：把任意图片 / 视频帧批（IMAGE batch）接到两个 DLSS5 节点，点 Run。\n引擎：`video2dlssnr.exe` + `nvngx_dlss.dll` + `nvngx_dlssnr.dll`（需 NVIDIA RTX）\n\n**关键参数**\n- style=Cinematic（最干净）/ Natural（保留肤色）\n- detail=1 全量神经渲染；0 纯超分；>1 夸张\n- motion=ON 光流运动矢量 → 时序稳定防闪烁\n- motion_engine=auto（NVOFA 硬件光流）\n\n视频用法：`H3 生成 → VAE Decode → [本节点] → Save Video (4K)`"
       },
-      "title": "DLSS5 独立节点 — 使用说明",
+      "title": "BSAI DLSS5 独立节点 — 使用说明",
       "color": "#222",
       "bgcolor": "#000"
     }

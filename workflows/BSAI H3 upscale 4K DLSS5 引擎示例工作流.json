@@ -31,7 +31,8 @@
       "widgets_values": [
         "example.png",
         "image"
-      ]
+      ],
+      "title": "BSAI Load Image"
     },
     {
       "id": 2,
@@ -112,7 +113,8 @@
         1.0,
         1.0,
         true
-      ]
+      ],
+      "title": "BSAI H3 upscale 4K (DLSS5 引擎)"
     },
     {
       "id": 3,
@@ -136,7 +138,8 @@
         }
       ],
       "outputs": [],
-      "properties": {}
+      "properties": {},
+      "title": "BSAI Preview DLSS5 4K"
     },
     {
       "id": 4,
@@ -161,7 +164,7 @@
       "widgets_values_named": {
         "text": "## 🚀 BSAI H3 upscale 4K — DLSS 5 引擎版\n\n主节点下拉选择 **`DLSS 5 (NVIDIA 神经渲染超分)`**：\n- scale=2.0（DLSS 超分倍数）\n- DLSS风格=Cinematic ｜ DLSS强度=1.0 ｜ DLSS细节=1.0 ｜ DLSS光流=ON\n\n**注意**：DLSS NR 自带光流时序，`temporal_strength` 已置 0 避免重复处理；\n`detail_amount`/`softness` 置 0 保留 DLSS 原生画面，需要可自行上调。\n\n**视频用法**：`H3 生成 → VAE Decode → [本节点] → Save Video (4K)`\n引擎：`video2dlssnr.exe` + `nvngx_dlss.dll` + `nvngx_dlssnr.dll`（需 NVIDIA RTX，NR 需驱动 ≥616.56）"
       },
-      "title": "主节点 DLSS5 引擎 — 使用说明",
+      "title": "BSAI 主节点 DLSS5 — 使用说明",
       "color": "#222",
       "bgcolor": "#000"
     }

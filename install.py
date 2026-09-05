@@ -16,9 +16,14 @@ BSAI-H3-upscale-4K — 一键环境自检 + 自动补齐安装器
   3. Python 依赖包：numpy / opencv-python / spandrel / onnxruntime-gpu / ultralytics / pillow
   4. 超分模型：Real-ESRGAN 三模型（官方 GitHub release，自动下载）
   5. 人脸修复模型：GFPGANv1.4 / CodeFormer / YOLOv8-Face
-  6. 外部引擎插件：FlashVSR / SeedVR2 / NVIDIA RTX（git clone 到 custom_nodes，可选）
+  6. 外部引擎插件：FlashVSR / SeedVR2 / NVIDIA RTX（git clone 到 custom_nodes，可选；
+     空电脑直连 GitHub 超时时自动回退 ghproxy / gitclone 等镜像，最多每镜像重试 3 次）
   7. DLSS5 运行时：本地已有整合包 -> 自动复制；缺失 -> 给出获取指引
   8. Topaz 引擎：商业软件，仅检测提示，不自动获取
+
+退出码说明
+  仅核心项（1~5、7）失败才返回 1；可选项（6 引擎插件、8 Topaz）未就绪返回 0 并标 ⚠️，
+  不影响 Real-ESRGAN 核心功能使用。网络恢复后重跑 install.py 可自动补齐可选项。
 
 可选参数
   --no-pip        跳过 Python 依赖包安装
@@ -119,6 +124,78 @@ def download(url, dest, label, timeout=120):
 
 def git_available():
     return shutil.which("git") is not None
+
+
+# GitHub 加速镜像（空电脑直连 GitHub 常超时 rc=128，按顺序回退）
+GITHUB_MIRRORS = [
+    "",  # 直连优先
+    "https://ghproxy.com/",
+    "https://mirror.ghproxy.com/",
+    "https://gh-proxy.com/",
+    "https://gitclone.com/github.com/",
+]
+
+
+def _to_mirror_url(url, mirror_prefix):
+    """把 https://github.com/xxx/yyy.git 套上镜像前缀。"""
+    if not mirror_prefix:
+        return url
+    if mirror_prefix.endswith("github.com/"):
+        # gitclone 风格: https://gitclone.com/github.com/USER/REPO.git
+        return url.replace("https://github.com/", mirror_prefix)
+    # 通用代理风格: https://ghproxy.com/https://github.com/USER/REPO.git
+    return mirror_prefix + url
+
+
+def git_clone_with_retry(url, dest, max_retry=3, timeout=300):
+    """
+    带重试 + 镜像回退 + 残留清理的 git clone。
+    空电脑直连 GitHub 常因超时/SSL 返回 rc=128，这里逐镜像尝试。
+    返回 (success: bool, last_error: str)
+    """
+    # 克隆前清理失败残留（空目录 / 不完整 .git）
+    if os.path.isdir(dest):
+        try:
+            if not os.listdir(dest) or not os.path.isdir(os.path.join(dest, ".git")):
+                shutil.rmtree(dest, ignore_errors=True)
+        except Exception:
+            pass
+
+    last_err = ""
+    for mirror in GITHUB_MIRRORS:
+        murl = _to_mirror_url(url, mirror)
+        label = "直连" if not mirror else f"镜像 {mirror}"
+        for attempt in range(1, max_retry + 1):
+            if os.path.isdir(dest) and os.path.isdir(os.path.join(dest, ".git")):
+                return True, ""
+            print(f"{TAG}   [{label} 尝试 {attempt}/{max_retry}] git clone --depth 1 {murl}")
+            try:
+                env = os.environ.copy()
+                env.setdefault("GIT_TERMINAL_PROMPT", "0")
+                env.setdefault("GIT_HTTP_LOW_SPEED_LIMIT", "1000")
+                env.setdefault("GIT_HTTP_LOW_SPEED_TIME", "30")
+                r = subprocess.run(
+                    ["git", "clone", "--depth", "1", murl, dest],
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    encoding="utf-8", errors="replace", timeout=timeout,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                    env=env,
+                )
+                if r.returncode == 0 and os.path.isdir(dest) and os.path.isdir(os.path.join(dest, ".git")):
+                    return True, ""
+                last_err = (r.stdout or "").strip()[-300:]
+                print(f"{TAG}     rc={r.returncode}，{last_err[:120]}")
+            except subprocess.TimeoutExpired:
+                last_err = f"超时（>{timeout}s）"
+                print(f"{TAG}     {last_err}")
+                # 超时后清理残留，避免下一次 clone 报 "already exists"
+                shutil.rmtree(dest, ignore_errors=True)
+            except Exception as e:
+                last_err = str(e)
+                print(f"{TAG}     异常: {last_err}")
+        # 当前镜像全部失败，清理后换下一个镜像
+        shutil.rmtree(dest, ignore_errors=True)
+    return False, last_err
 
 
 # ---------------------------------------------------------------------------
@@ -298,26 +375,31 @@ def check_engine_plugins(no_git):
     print(f"\n{TAG} == 6/8 外部引擎插件（可选，git clone 到 custom_nodes）==")
     if no_git:
         print(f"{TAG} [跳过] --no-git")
-        return True
+        return True, True  # (ok, is_optional)
     if not git_available():
         print(f"{TAG} [跳过] 未找到 git，跳过引擎插件 clone（不影响核心功能）")
-        return True
+        print(f"{TAG}         如需安装: 安装 Git for Windows 后重跑，或手动 clone 下方仓库")
+        return True, True
     d = custom_nodes_dir()
-    all_ok = True
+    failed = []
     for name, url in ENGINE_PLUGINS:
         dest = os.path.join(d, name)
-        if os.path.isdir(dest):
+        if os.path.isdir(dest) and os.path.isdir(os.path.join(dest, ".git")):
             print(f"{TAG} [跳过] 已有插件 {name}")
             continue
         print(f"{TAG} [clone] {name} ...")
-        r = run(["git", "clone", "--depth", "1", url, dest])
-        if r.returncode == 0 and os.path.isdir(dest):
+        ok, err = git_clone_with_retry(url, dest)
+        if ok:
             print(f"{TAG} [完成] {name} -> {dest}")
         else:
-            print(f"{TAG} [失败] clone {name}（rc={r.returncode}），可手动:\n"
+            print(f"{TAG} [失败] clone {name}（所有镜像均失败），可手动:\n"
                   f"         git clone --depth 1 {url} {dest}")
-            all_ok = False
-    return all_ok
+            failed.append(name)
+    if failed:
+        print(f"{TAG} [警告] 以下可选引擎插件未安装（不影响 Real-ESRGAN 核心功能）: {', '.join(failed)}")
+        print(f"{TAG}         网络恢复后可重跑 install.py 自动补齐，或手动 git clone")
+        return False, True  # 失败但属于可选
+    return True, True
 
 
 # ---------------------------------------------------------------------------
@@ -461,12 +543,12 @@ def check_topaz():
     legacy = os.path.join(comfyui_root(), "topaz_engine")
     if os.path.isdir(d) and os.listdir(d):
         print(f"{TAG} Topaz 引擎已就绪: {d}")
-        return True
+        return True, True
     if os.path.isdir(legacy) and os.listdir(legacy):
         print(f"{TAG} Topaz 引擎（旧路径）: {legacy}")
-        return True
+        return True, True
     print(f"{TAG} [提示] 未检测到 Topaz 商业引擎（可选）。如需 Topaz 生成式档，请自行部署到 {d}")
-    return False
+    return False, True  # 未就绪但属于可选
 
 
 # ---------------------------------------------------------------------------
@@ -492,26 +574,37 @@ def main():
     print(f"{TAG} 插件目录: {PLUGIN_DIR}")
 
     results = {}
-    results["1_Python/ComfyUI"] = check_python()
-    results["2_PyTorch/CUDA/GPU"] = check_torch()
-    results["3_Python包"] = check_pip(no_pip)
-    results["4_Real-ESRGAN模型"] = check_esrgan(no_models)
-    results["5_人脸修复模型"] = check_face(no_models)
+    results["1_Python/ComfyUI"] = (check_python(), False)
+    results["2_PyTorch/CUDA/GPU"] = (check_torch(), False)
+    results["3_Python包"] = (check_pip(no_pip), False)
+    results["4_Real-ESRGAN模型"] = (check_esrgan(no_models), False)
+    results["5_人脸修复模型"] = (check_face(no_models), False)
     results["6_引擎插件"] = check_engine_plugins(no_git)
-    results["7_DLSS5"] = check_dlss5(extra_dirs, dlss5_full)
+    results["7_DLSS5"] = (check_dlss5(extra_dirs, dlss5_full), False)
     results["8_Topaz(可选)"] = check_topaz()
 
     print(f"\n{TAG} ============ 汇总 ============")
-    for k, v in results.items():
-        mark = "✅" if v else "⚠️"
+    for k, (ok, optional) in results.items():
+        if ok:
+            mark = "✅"
+        elif optional:
+            mark = "⚠️"
+        else:
+            mark = "❌"
         print(f"{TAG} {mark} {k}")
     print(f"{TAG} ==============================")
-    bad = [k for k, v in results.items() if not v]
-    if bad:
-        print(f"{TAG} 待处理: {', '.join(bad)}（详见上方提示；核心功能=1~4 就绪即可使用 Real-ESRGAN）")
-    else:
+    core_failed = [k for k, (ok, optional) in results.items() if not ok and not optional]
+    opt_failed = [k for k, (ok, optional) in results.items() if not ok and optional]
+    if core_failed:
+        print(f"{TAG} [核心失败] {', '.join(core_failed)} —— 这些必须解决才能使用核心功能")
+    if opt_failed:
+        print(f"{TAG} [可选未就绪] {', '.join(opt_failed)} —— 不影响 Real-ESRGAN 核心功能，网络恢复后重跑可补齐")
+    if not core_failed and not opt_failed:
         print(f"{TAG} 全部就绪！重启 ComfyUI 即可使用。")
-    return 0 if not bad else 1
+    elif not core_failed:
+        print(f"{TAG} 核心功能已就绪（1~4 + 7），可使用 Real-ESRGAN 超分。可选项见上方 ⚠️ 提示。")
+    # 退出码：仅核心失败才返回 1，可选失败不视为安装失败
+    return 1 if core_failed else 0
 
 
 if __name__ == "__main__":

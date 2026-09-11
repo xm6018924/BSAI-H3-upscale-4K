@@ -1041,7 +1041,66 @@ def _face_models(mode: str):
     return det, sess
 
 
-def _restore_faces_frame(img, boxes, sess, mode, blend, fidelity=0.75):
+def _face_param_estimate(ratio, mode, blend, fidelity):
+    """v2.7.0: 抽取单张脸的修复参数计算（strength / blend_eff / fid_eff / is_small），
+    供 _restore_faces_frame 与 _face_restore_frames 的时域参数平滑共用。"""
+    is_small = ratio < 0.02
+    if ratio >= 0.05:
+        strength = 1.0
+    elif ratio >= 0.02:
+        strength = 0.85 + (ratio - 0.02) / 0.03 * 0.15  # 0.85 -> 1.0
+    else:
+        strength = min(0.85, 0.65 + ratio * 10)  # 0.65 -> 0.85 (v2.3.2: reduced)
+    blend_eff = blend * strength
+    fid_eff = fidelity
+    if mode == "CodeFormer":
+        if is_small:
+            # small faces: slight fidelity reduction for regeneration (v2.3.2 cap)
+            fid_eff = max(0.55, fidelity - (0.02 - ratio) * 7.5)
+        else:
+            fid_eff = min(1.0, fidelity + (1.0 - strength) * 0.15)
+    return is_small, strength, blend_eff, fid_eff
+
+
+def _face_box_match(cur_box, prev_boxes, iou_thr=0.30, dist_gate=0.60):
+    """v2.7.0: 跨帧人脸匹配。优先 IoU；快速移动/尺寸变化导致 IoU 断裂时，
+    用中心距离 + 尺寸比 gating 续链（对标 HitPaw portrait_restore 的时空对齐，
+    减少断链重检造成的修复强度跳变）。返回 (best_pi, kind) 或 (-1, None)。"""
+    cx1, cy1, cx2, cy2 = [float(v) for v in cur_box]
+    cw, ch = cx2 - cx1, cy2 - cy1
+    carea = max(cw * ch, 1.0)
+    best_iou, best_pi = 0.0, -1
+    for pi in range(len(prev_boxes)):
+        px1, py1, px2, py2 = [float(v) for v in prev_boxes[pi]]
+        ix1, iy1 = max(cx1, px1), max(cy1, py1)
+        ix2, iy2 = min(cx2, px2), min(cy2, py2)
+        if ix2 > ix1 and iy2 > iy1:
+            inter = (ix2 - ix1) * (iy2 - iy1)
+            parea = max((px2 - px1) * (py2 - py1), 1.0)
+            iou = inter / (carea + parea - inter)
+            if iou > best_iou:
+                best_iou, best_pi = iou, pi
+    if best_pi >= 0 and best_iou > iou_thr:
+        return best_pi, "iou"
+    # ---- center-distance gating（IoU 断裂时续链）----
+    cxc, cyc = (cx1 + cx2) / 2.0, (cy1 + cy2) / 2.0
+    best_d, best_pi2 = None, -1
+    for pi in range(len(prev_boxes)):
+        px1, py1, px2, py2 = [float(v) for v in prev_boxes[pi]]
+        pxc, pyc = (px1 + px2) / 2.0, (py1 + py2) / 2.0
+        diag = max((cw + ch + (px2 - px1) + (py2 - py1)) / 4.0, 1.0)
+        d = ((cxc - pxc) ** 2 + (cyc - pyc) ** 2) ** 0.5
+        sr = max(cw, ch) / max(max(px2 - px1, py2 - py1), 1.0)
+        if d < dist_gate * diag and 0.5 <= sr <= 2.0:
+            if best_d is None or d < best_d:
+                best_d, best_pi2 = d, pi
+    if best_pi2 >= 0:
+        return best_pi2, "dist"
+    return -1, None
+
+
+def _restore_faces_frame(img, boxes, sess, mode, blend, fidelity=0.75,
+                         blend_eff_override=None, fid_eff_override=None):
     """Restore every detected face in one BGR/RGB uint8 frame (numpy), blend back.
 
     v2.2.0 small-face overhaul (针对全身照中远景小脸模糊/变形):
@@ -1070,24 +1129,14 @@ def _restore_faces_frame(img, boxes, sess, mode, blend, fidelity=0.75):
         # and need generative rebuild; lowering strength here was the root
         # cause of "small faces stay blurry / misshapen".
         ratio = (w * h) / float(max(H * W, 1))
-        is_small = ratio < 0.02
-        if ratio >= 0.05:
-            strength = 1.0
-        elif ratio >= 0.02:
-            strength = 0.85 + (ratio - 0.02) / 0.03 * 0.15  # 0.85 -> 1.0
-        else:
-            strength = min(0.85, 0.65 + ratio * 10)  # 0.65 -> 0.85 (v2.3.2: reduced)
-        blend_eff = blend * strength
-        fid_eff = fidelity
-        if mode == "CodeFormer":
-            if is_small:
-                # (2) small faces: slight fidelity reduction for regeneration,
-                # but v2.3.2 reduces the drop from -0.45 to -0.15 to prevent
-                # frame-to-frame ghosting from aggressive generative restoration.
-                # map ratio 0.02->fidelity, 0.002->fidelity-0.15 (clamp 0.55)
-                fid_eff = max(0.55, fidelity - (0.02 - ratio) * 7.5)
-            else:
-                fid_eff = min(1.0, fidelity + (1.0 - strength) * 0.15)
+        # v2.7.0: 参数计算统一走 _face_param_estimate；时域平滑可 override
+        # blend_eff / fid_eff（消除“检测框抖动 → 修复强度逐帧跳变”的闪烁）。
+        is_small, strength, blend_eff, fid_eff = _face_param_estimate(
+            ratio, mode, blend, fidelity)
+        if blend_eff_override is not None:
+            blend_eff = float(blend_eff_override)
+        if fid_eff_override is not None:
+            fid_eff = float(fid_eff_override)
         # generous pad (more vertical) so the whole face stays inside the crop
         pad_w, pad_h = 0.45 * w, 0.50 * h
         cx1 = max(0, int(x1 - pad_w)); cy1 = max(0, int(y1 - pad_h))
@@ -1146,7 +1195,7 @@ def _restore_faces_frame(img, boxes, sess, mode, blend, fidelity=0.75):
     return out
 
 
-def _face_restore_frames(out_tensor, mode, det_conf, blend, fidelity=0.75):
+def _face_restore_frames(out_tensor, mode, det_conf, blend, fidelity=0.75, temporal=0.5):
     """Apply face restoration to an SR tensor [n,H,W,3] float 0-1 (CPU).
 
     v2.2.0: multi-scale detection (1280 then 1920 re-scan on frames with
@@ -1162,6 +1211,11 @@ def _face_restore_frames(out_tensor, mode, det_conf, blend, fidelity=0.75):
     v2.3.1: temporal stability — face boxes are EMA-smoothed across frames
     (IOU-tracked, alpha=0.70, 1-frame persistence). Frame-to-frame result
     blending removed (caused ghosting on moving faces).
+    v2.7.0 (对标 HitPaw portrait_restore 时空对齐):
+      - 跟踪增强: IoU 断裂时用中心距离+尺寸比 gating 续链(快速移动不断链);
+      - 参数时域平滑: 每条轨迹的 blend_eff/fid_eff 做跨帧 EMA (temporal=当前帧
+        权重, 0 关闭)。框抖动不再直接造成修复强度逐帧跳变, 消除强度闪烁,
+        同时保持逐帧像素级恢复(不混合结果像素, 规避鬼影)。
 
     Returns (out_tensor, total_faces_detected)."""
     if mode == "Off" or not _HAS_CV2 or not torch.cuda.is_available():
@@ -1211,10 +1265,15 @@ def _face_restore_frames(out_tensor, mode, det_conf, blend, fidelity=0.75):
                             boxes = np.vstack([boxes, np.array(keep)])
             all_boxes.append(boxes)
 
-    # ---- Phase 2: temporal EMA smoothing of face boxes (IOU-tracked) ----
+    # ---- Phase 2: temporal EMA smoothing of face boxes + per-track params ----
+    # v2.7.0: ① 匹配增强(IoU + 中心距离续链) ② 每条轨迹的修复参数
+    # (blend_eff/fid_eff) 跨帧 EMA —— 消除检测框抖动造成的修复强度逐帧跳变。
     EMA_ALPHA = 0.70  # 70% current + 30% prev: stable but responsive (less lag)
+    P_ALPHA = 0.0 if temporal <= 0 else float(temporal)  # 参数平滑的“当前帧权重”
     smoothed_boxes = []
+    track_params = []   # per frame: list of (blend_eff, fid_eff), 与 smoothed boxes 对齐
     prev_boxes = np.zeros((0, 4))
+    prev_params = []
     miss_count = 0
     for fi in range(n):
         cur = all_boxes[fi]
@@ -1222,38 +1281,56 @@ def _face_restore_frames(out_tensor, mode, det_conf, blend, fidelity=0.75):
             # Only persist for 1 frame on missed detection (avoid ghosting on fast motion)
             if len(prev_boxes) > 0 and miss_count < 1:
                 smoothed_boxes.append(prev_boxes.copy())
+                track_params.append([p[:] for p in prev_params])
                 miss_count += 1
             else:
                 smoothed_boxes.append(np.zeros((0, 4)))
+                track_params.append([])
                 prev_boxes = np.zeros((0, 4))
+                prev_params = []
                 miss_count = 0
             continue
         miss_count = 0
         if len(prev_boxes) == 0:
             smoothed_boxes.append(cur.copy())
+            frame_ps = []
+            for b in cur:
+                r = ((b[2]-b[0])*(b[3]-b[1])) / float(H * W)
+                _, _, c_be, c_fe = _face_param_estimate(r, mode, blend, fidelity)
+                frame_ps.append((c_be, c_fe))
+            track_params.append(frame_ps)
             prev_boxes = cur.copy()
+            prev_params = [p[:] for p in frame_ps]
             continue
         smoothed = cur.copy()
+        cur_params = []
         for ci in range(len(cur)):
-            best_iou = 0.0
-            best_pi = -1
-            cx1, cy1, cx2, cy2 = cur[ci]
-            carea = max((cx2-cx1)*(cy2-cy1), 1)
-            for pi in range(len(prev_boxes)):
-                px1, py1, px2, py2 = prev_boxes[pi]
-                ix1 = max(cx1, px1); iy1 = max(cy1, py1)
-                ix2 = min(cx2, px2); iy2 = min(cy2, py2)
-                if ix2 > ix1 and iy2 > iy1:
-                    inter = (ix2-ix1)*(iy2-iy1)
-                    parea = max((px2-px1)*(py2-py1), 1)
-                    iou = inter / (carea + parea - inter)
-                    if iou > best_iou:
-                        best_iou = iou
-                        best_pi = pi
-            if best_pi >= 0 and best_iou > 0.3:
-                smoothed[ci] = EMA_ALPHA * cur[ci] + (1.0 - EMA_ALPHA) * prev_boxes[best_pi]
+            b = cur[ci]
+            pi, kind = _face_box_match(b, prev_boxes)
+            r = ((b[2]-b[0])*(b[3]-b[1])) / float(H * W)
+            _, _, c_be, c_fe = _face_param_estimate(r, mode, blend, fidelity)
+            if pi >= 0 and kind == "iou":
+                smoothed[ci] = EMA_ALPHA * b + (1.0 - EMA_ALPHA) * prev_boxes[pi]
+                if P_ALPHA > 0:
+                    p_be, p_fe = prev_params[pi]
+                    cur_params.append((P_ALPHA * c_be + (1.0 - P_ALPHA) * p_be,
+                                       P_ALPHA * c_fe + (1.0 - P_ALPHA) * p_fe))
+                else:
+                    cur_params.append((c_be, c_fe))
+            elif pi >= 0:  # dist-gate 续链: 不 EMA 混合框(避免拖影), 仅平滑参数
+                smoothed[ci] = b
+                if P_ALPHA > 0:
+                    p_be, p_fe = prev_params[pi]
+                    cur_params.append((P_ALPHA * c_be + (1.0 - P_ALPHA) * p_be,
+                                       P_ALPHA * c_fe + (1.0 - P_ALPHA) * p_fe))
+                else:
+                    cur_params.append((c_be, c_fe))
+            else:  # 新轨迹
+                cur_params.append((c_be, c_fe))
         smoothed_boxes.append(smoothed)
+        track_params.append(cur_params)
         prev_boxes = smoothed.copy()
+        prev_params = [p[:] for p in cur_params]
 
     # ---- Phase 3: restore faces with EMA-smoothed boxes ----
     # NOTE: frame-to-frame result blending is intentionally NOT done here —
@@ -1270,7 +1347,13 @@ def _face_restore_frames(out_tensor, mode, det_conf, blend, fidelity=0.75):
             boxes = smoothed_boxes[fi]
             if len(boxes):
                 total += len(boxes)
-                frames[i] = _restore_faces_frame(frames[i], boxes, sess, mode, blend, fidelity)
+                params = track_params[fi]
+                for j, b in enumerate(boxes):
+                    p_be = params[j][0] if j < len(params) else None
+                    p_fe = params[j][1] if j < len(params) else None
+                    frames[i] = _restore_faces_frame(
+                        frames[i], [b], sess, mode, blend, fidelity,
+                        blend_eff_override=p_be, fid_eff_override=p_fe)
         chunks.append(torch.from_numpy(frames).float() / 255.0)
     return torch.cat(chunks, dim=0), total
 
@@ -1958,12 +2041,137 @@ def _vosr_rtx_chain(frames, vosr_scale=2, rtx_scale=2):
 # ---------------------------------------------------------------------------
 # Main node: video frames -> AI upscaled frames
 # ---------------------------------------------------------------------------
+def _apply_input_adaptive(input_adaptive, in_short, detail_amount, detail_mode, softness):
+    """v2.7.0: UHD 输入自适应（对标 HitPaw Ultra HD 模型：高清输入保守细节、
+    低清输入激进重建，避免过度锐化/伪影）。
+    返回 (detail_eff, mode_eff, soft_eff, used_label)。"""
+    detail_eff, mode_eff, soft_eff = detail_amount, detail_mode, softness
+    if input_adaptive == "自动":
+        uhd = in_short >= 720.0
+    elif input_adaptive == "UHD 保守档":
+        uhd = True
+    elif input_adaptive == "HD 增强档":
+        uhd = False
+    else:
+        uhd = None
+    if uhd is True:
+        # ≥720p: 细节打 6 折且上限 0.35 + 强制 classic(无重建光环) + 柔和度下限 0.15
+        detail_eff = min(float(detail_amount) * 0.6, 0.35)
+        mode_eff = "classic"
+        soft_eff = max(float(softness), 0.15)
+        return detail_eff, mode_eff, soft_eff, "UHD 保守档"
+    if uhd is False:
+        # <720p: 细节增强 1.2 倍(上限 1.0)，配合 smart 重建补细节
+        detail_eff = min(float(detail_amount) * 1.2, 1.0)
+        return detail_eff, mode_eff, soft_eff, "HD 增强档"
+    return detail_eff, mode_eff, soft_eff, "关"
+
+
+def _auto_route(images, prefer="质量优先", scale=4.0, user_face='Off',
+                user_detail=0.5, user_detail_mode='smart', user_adaptive='自动'):
+    """v2.7.0: 模型自动路由（对标 HitPaw VikPea 多模型选择器：General /
+    Animation / Portrait / UltraHD / Generative 按需选型）。零新依赖——
+    只探测插件已有权重文件 + 抽样人脸检测，返回 (显示名, 参数覆盖 dict, notes)。"""
+    notes = []
+    base = getattr(folder_paths, "models_dir", "models")
+    def has(*ps):
+        return os.path.exists(os.path.join(base, *ps))
+    H, W = images.shape[1], images.shape[2]
+    in_short = float(min(H, W))
+    cuda = torch.cuda.is_available()
+    # ---- 引擎可用性探测（只查文件，不加载）----
+    int8_name = None
+    ddir = os.path.join(base, "diffusion_models")
+    if os.path.isdir(ddir):
+        for f in sorted(os.listdir(ddir)):
+            if f.startswith("seedvr2") and f.endswith(".safetensors"):
+                int8_name = f
+                break
+    has_seed_fp8 = has("SEEDVR2", "seedvr2_ema_7b_fp8_e4m3fn_mixed_block35_fp16.safetensors")
+    has_flash = has("FlashVSR-v1.1", "diffusion_pytorch_model_streaming_dmd.safetensors")
+    has_vosr = False
+    vdir = os.path.join(base, "VOSR")
+    if os.path.isdir(vdir):
+        for root, _, files in os.walk(vdir):
+            if any(f.endswith((".safetensors", ".ckpt", ".pth")) for f in files):
+                has_vosr = True
+                break
+    anime = None
+    for f in ("RealESRGAN_x4plus_anime_6B.pth", "realesr-animevideov3.pth"):
+        if has("upscale_models", f):
+            anime = f
+            break
+    # ---- 内容探测：人脸（抽样最多 3 帧，任何异常静默降级为“非人脸”）----
+    face_found = False
+    try:
+        det, _ = _face_models("GFPGANv1.4")
+        probe = images[:: max(1, images.shape[0] // 3)][:3]
+        fr = (probe.clamp(0, 1).numpy() * 255.0).astype(np.uint8)
+        res = det.predict([fr[i] for i in range(len(fr))], conf=0.25, imgsz=1280, verbose=False)
+        face_found = any(r.boxes is not None and len(r.boxes) for r in res)
+    except Exception as e:
+        print(f"[BSAI-H3] auto-route face probe skipped ({e})")
+    notes.append("内容: " + ("人脸" if face_found else "非人脸") +
+                 f", 输入 {int(W)}x{int(H)} ({'HD/UHD' if in_short >= 720 else 'SD'})")
+    # ---- 偏好 → 引擎 ----
+    over = {}
+    if prefer == "质量优先":
+        if int8_name and cuda:
+            engine = "SeedVR2 7B INT8 (ComfyUI原生)"
+            notes.append("引擎: SeedVR2 INT8 (扩散, 质量最高)")
+        elif has_seed_fp8 and cuda:
+            engine = "SeedVR2 7B (扩散视频超分)"
+            notes.append("引擎: SeedVR2 fp8 (扩散)")
+        elif has_vosr and cuda:
+            engine = "VOSR 2.0 (CVPR2026生成式超分)"
+            notes.append("引擎: VOSR 2.0 (生成式)")
+        elif has_flash and cuda:
+            engine = "FlashVSR-v1.1 (扩散视频超分)"
+            notes.append("引擎: FlashVSR-v1.1 (扩散)")
+        else:
+            engine = "realesr-general-x4v3.pth"
+            notes.append("引擎: Real-ESRGAN general (无扩散权重, 速度回退)")
+    elif prefer == "速度优先":
+        engine = "realesr-general-x4v3.pth"
+        notes.append("引擎: Real-ESRGAN general (速度优先)")
+    elif prefer == "人像优先":
+        engine = "RealESRGAN_x4plus.pth" if has("upscale_models", "RealESRGAN_x4plus.pth") else "realesr-general-x4v3.pth"
+        notes.append("引擎: " + engine)
+        over["face_restore"] = "CodeFormer"
+        over["face_temporal"] = 0.5
+        notes.append("后处理: 强制 CodeFormer 人脸修复 + 时域稳定")
+    elif prefer == "动漫优先":
+        engine = anime if anime else "realesr-general-x4v3.pth"
+        notes.append("引擎: " + (anime or "general (无 anime 权重, 回退 general+smart)"))
+        if not anime:
+            over["detail_mode"] = "smart"
+    else:  # UHD 优先
+        engine = "realesr-general-x4v3.pth"
+        notes.append("引擎: Real-ESRGAN general")
+        over["input_adaptive"] = "UHD 保守档"
+        notes.append("后处理: UHD 保守细节 (防过度锐化)")
+    # ---- 通用智能补强 ----
+    if face_found and user_face == "Off" and prefer != "人像优先":
+        over["face_restore"] = "CodeFormer"
+        over["face_temporal"] = 0.5
+        notes.append("检测到人脸 → 自动开启 CodeFormer + 时域稳定")
+    if prefer == "质量优先" and "input_adaptive" not in over:
+        if in_short >= 720:
+            over["input_adaptive"] = "UHD 保守档"
+            notes.append("高清输入 → UHD 保守细节")
+        elif in_short < 540:
+            over["input_adaptive"] = "HD 增强档"
+            notes.append("低清输入 → HD 增强细节 (生成式重建)")
+    return engine, over, notes
+
+
 class BSAI_H3_Upscale4K:
     """Video frame AI super-resolution for MiniMax H3 (pixel domain, extremely fast)."""
 
     # Third-party diffusion / GPU engine options (prepended to the model list).
     # Each keeps its own weights path unchanged; loaded lazily via wrappers above.
     ENGINE_OPTIONS = {
+        "自动路由 (按内容/输入推荐)": "auto",
         "FlashVSR-v1.1 (扩散视频超分)": "flashvsr",
         "SeedVR2 7B (扩散视频超分)": "seedvr2",
         "SeedVR2 7B INT8 (ComfyUI原生)": "seedvr2_int8",
@@ -2039,6 +2247,15 @@ class BSAI_H3_Upscale4K:
                 # texture, gated to avoid halos) — reads closer to Topaz /
                 # FlashVSR's reconstructed texture.
                 "detail_mode / 细节模式": (["classic", "smart"], {"default": "smart"}),
+                # v2.7.0 输入自适应（对标 HitPaw Ultra HD：高清输入保守细节防过锐，
+                # 低清输入激进重建）。对全部像素路径生效。
+                "input_adaptive / 输入自适应": (["自动", "关", "UHD 保守档", "HD 增强档"], {"default": "自动"}),
+                # v2.7.0 人脸时域稳定（对标 HitPaw portrait_restore 时空对齐）：
+                # 跨帧跟踪 + 修复强度参数 EMA，消除“框抖动→强度跳变”闪烁。
+                # 0=关(等同 v2.6 行为)；0.5=推荐；1.0=完全跟随历史轨迹。
+                "face_temporal / 人脸时域稳定": ("FLOAT", {"default": 0.50, "min": 0.0, "max": 1.0, "step": 0.05}),
+                # v2.7.0 自动路由偏好（仅当 model_name = 自动路由 时生效）
+                "auto_prefer / 自动路由偏好": (["质量优先", "速度优先", "人像优先", "动漫优先", "UHD优先"], {"default": "质量优先"}),
                 # DLSS 5 专属参数（仅当 model_name 选择 DLSS 5 时生效）：
                 # style=NR 风格（Cinematic 默认最干净）；intensity/detail 控制
                 # 神经渲染叠加强度；motion=光流运动矢量（时序稳定，防闪烁）。
@@ -2104,7 +2321,10 @@ class BSAI_H3_Upscale4K:
         face_det_conf = g("face_det_conf / 检测置信度", 0.25)
         face_blend = g("face_blend / 融合强度", 0.65)
         face_fidelity = g("face_fidelity / 保真度", 0.75)
+        face_temporal = g("face_temporal / 人脸时域稳定", 0.50)
         detail_mode = g("detail_mode / 细节模式", 'smart')
+        input_adaptive = g("input_adaptive / 输入自适应", '自动')
+        auto_prefer = g("auto_prefer / 自动路由偏好", '质量优先')
         dlss_style = g("dlss_style / DLSS风格", 'Cinematic')
         dlss_intensity = g("dlss_intensity / DLSS强度", 1.0)
         dlss_detail = g("dlss_detail / DLSS细节", 1.0)
@@ -2120,6 +2340,24 @@ class BSAI_H3_Upscale4K:
                 torch.cuda.ipc_collect()
         except Exception:
             pass
+        auto_notes = []
+        if model_name in self.ENGINE_OPTIONS and self.ENGINE_OPTIONS[model_name] == "auto":
+            resolved, over, auto_notes = _auto_route(
+                images, prefer=auto_prefer, scale=float(scale),
+                user_face=face_restore, user_detail=detail_amount,
+                user_detail_mode=detail_mode, user_adaptive=input_adaptive)
+            model_name = resolved
+            if "detail_amount" in over:
+                detail_amount = over["detail_amount"]
+            if "detail_mode" in over:
+                detail_mode = over["detail_mode"]
+            if "input_adaptive" in over:
+                input_adaptive = over["input_adaptive"]
+            if "face_restore" in over:
+                face_restore = over["face_restore"]
+            if "face_temporal" in over:
+                face_temporal = over["face_temporal"]
+
         _engine = self.ENGINE_OPTIONS.get(model_name)
         _is_topaz = model_name in self.TOPAZ_OPTIONS
 
@@ -2252,22 +2490,26 @@ class BSAI_H3_Upscale4K:
                 out = out.permute(0, 2, 3, 1).contiguous()
             eff_scale = float(out.shape[1] / float(images.shape[1]))
 
+        # v2.7.0 UHD 输入自适应：按输入分辨率决定保守/激进细节（对标 Ultra HD）
+        in_short = float(min(images.shape[1], images.shape[2]))
+        detail_eff, mode_eff, soft_eff, adaptive_used = _apply_input_adaptive(
+            input_adaptive, in_short, detail_amount, detail_mode, softness)
         # Temporal consistency (motion-compensated neighbour blend) + detail USM
         t_td = time.time()
-        out = _video_temporal_detail(out, lr_np, temporal_strength, detail_amount,
-                                     detail_radius, eff_scale, detail_mode)
+        out = _video_temporal_detail(out, lr_np, temporal_strength, detail_eff,
+                                     detail_radius, eff_scale, mode_eff)
         td_elapsed = time.time() - t_td
 
         # Softness (Topaz-style) — GPU, then back to CPU.
         # OOM fallback: if GPU runs out (e.g. 4K 56-frame batch), process on CPU.
-        if softness > 0 and torch.cuda.is_available():
+        if soft_eff > 0 and torch.cuda.is_available():
             dev = torch.cuda.current_device()
             try:
-                out = _soften_gpu(out.to(dev), softness).cpu()
+                out = _soften_gpu(out.to(dev), soft_eff).cpu()
             except torch.cuda.OutOfMemoryError:
                 print(f"[BSAI-H3-Upscale] GPU OOM in softness pass, falling back to CPU (frames={out.shape[0]}, size={out.shape[2]}x{out.shape[3]})")
                 torch.cuda.empty_cache()
-                out = _soften_gpu(out, softness)
+                out = _soften_gpu(out, soft_eff)
 
         # Face restoration (small / distant broken faces) - optional, on the SR frames
         t_fr = time.time()
@@ -2285,7 +2527,8 @@ class BSAI_H3_Upscale4K:
                 fr_conf = min(0.12, float(face_det_conf))
                 fr_blend = min(0.45, float(face_blend))
                 fr_fid = max(0.75, float(face_fidelity))
-            out, _ = _face_restore_frames(out, fr_mode, fr_conf, fr_blend, fr_fid)
+            out, _ = _face_restore_frames(out, fr_mode, fr_conf, fr_blend, fr_fid,
+                                         temporal=float(face_temporal))
         fr_elapsed = time.time() - t_fr
 
         bh, bw = out.shape[1], out.shape[2]
@@ -2297,11 +2540,14 @@ class BSAI_H3_Upscale4K:
             f"temporal: {temporal_strength} | detail: {detail_amount}@{detail_radius} "
             f"({detail_mode}) | "
             f"softness: {softness} | "
-            f"face: {face_restore} (conf={face_det_conf}, blend={face_blend}, fid={face_fidelity}) | "
+            f"face: {face_restore} (conf={face_det_conf}, blend={face_blend}, fid={face_fidelity}, temporal={face_temporal}) | "
             f"frames: {images.shape[0]} | time: {elapsed:.2f}s "
             f"(temporal+detail: {td_elapsed:.2f}s, face: {fr_elapsed:.2f}s) | "
+            f"adaptive: {adaptive_used} (in_short={in_short:.0f}px) | "
             f"device: {'cuda' if torch.cuda.is_available() else 'cpu'}"
         )
+        if auto_notes:
+            info = info + " | auto路由: " + "; ".join(auto_notes)
         return (out, bw, bh, float(eff_scale), info)
 
 
@@ -2713,6 +2959,7 @@ class BSAI_H3_FaceRestore:
                 "face_det_conf / 检测置信度": ("FLOAT", {"default": 0.15, "min": 0.05, "max": 0.95, "step": 0.05}),
                 "face_blend / 融合强度": ("FLOAT", {"default": 0.70, "min": 0.1, "max": 1.0, "step": 0.05}),
                 "face_fidelity / 保真度": ("FLOAT", {"default": 0.60, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "face_temporal / 人脸时域稳定": ("FLOAT", {"default": 0.50, "min": 0.0, "max": 1.0, "step": 0.05}),
             },
         }
 
@@ -2737,6 +2984,7 @@ class BSAI_H3_FaceRestore:
         face_det_conf = g("face_det_conf / 检测置信度", 0.15)
         face_blend = g("face_blend / 融合强度", 0.70)
         face_fidelity = g("face_fidelity / 保真度", 0.60)
+        face_temporal = g("face_temporal / 人脸时域稳定", 0.50)
         t0 = time.time()
         fr_mode = face_restore
         fr_conf = face_det_conf
@@ -2747,9 +2995,10 @@ class BSAI_H3_FaceRestore:
             fr_conf = min(0.12, float(face_det_conf))
             fr_blend = max(0.80, float(face_blend))
             fr_fid = min(0.40, float(face_fidelity))
-        out, nf = _face_restore_frames(images, fr_mode, fr_conf, fr_blend, fr_fid)
+        out, nf = _face_restore_frames(images, fr_mode, fr_conf, fr_blend, fr_fid,
+                                     temporal=float(face_temporal))
         info = (
-            f"face restore: {face_restore} (conf={face_det_conf}, blend={face_blend}, fid={face_fidelity}) | "
+            f"face restore: {face_restore} (conf={face_det_conf}, blend={face_blend}, fid={face_fidelity}, temporal={face_temporal}) | "
             f"faces detected: {nf} | frames: {images.shape[0]} | "
             f"time: {time.time() - t0:.2f}s | "
             f"device: {'cuda' if torch.cuda.is_available() else 'cpu'}"
@@ -2972,6 +3221,7 @@ class BSAI_TopazEngine_FaceRestore:
                 "face_det_conf / 检测置信度": ("FLOAT", {"default": 0.15, "min": 0.05, "max": 0.95, "step": 0.05}),
                 "face_blend / 融合强度": ("FLOAT", {"default": 0.70, "min": 0.1, "max": 1.0, "step": 0.05}),
                 "face_fidelity / 保真度": ("FLOAT", {"default": 0.60, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "face_temporal / 人脸时域稳定": ("FLOAT", {"default": 0.50, "min": 0.0, "max": 1.0, "step": 0.05}),
                 "detail_amount / 细节强度": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.5, "step": 0.05}),
                 "detail_radius / 细节半径": ("FLOAT", {"default": 1.8, "min": 0.3, "max": 8.0, "step": 0.1}),
                 "softness / 柔和度": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05}),
@@ -3005,6 +3255,7 @@ class BSAI_TopazEngine_FaceRestore:
         face_det_conf = g("face_det_conf / 检测置信度", 0.15)
         face_blend = g("face_blend / 融合强度", 0.70)
         face_fidelity = g("face_fidelity / 保真度", 0.60)
+        face_temporal = g("face_temporal / 人脸时域稳定", 0.50)
         detail_amount = g("detail_amount / 细节强度", 0.0)
         detail_radius = g("detail_radius / 细节半径", 1.5)
         softness = g("softness / 柔和度", 0.0)
@@ -3028,7 +3279,8 @@ class BSAI_TopazEngine_FaceRestore:
                 fr_conf = min(0.12, float(face_det_conf))
                 fr_blend = max(0.80, float(face_blend))
                 fr_fid = min(0.40, float(face_fidelity))
-            out_t, nf = _face_restore_frames(out_t, fr_mode, fr_conf, fr_blend, fr_fid)
+            out_t, nf = _face_restore_frames(out_t, fr_mode, fr_conf, fr_blend, fr_fid,
+                                            temporal=float(face_temporal))
         if (detail_amount > 0 or softness > 0) and torch.cuda.is_available():
             dev = torch.cuda.current_device()
             x = out_t.to(dev).permute(0, 3, 1, 2)

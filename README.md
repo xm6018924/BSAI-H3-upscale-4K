@@ -93,6 +93,23 @@ ComfyUI/models/
 
 ## 📝 更新日志
 
+### v2.7.0 — HitPaw 技术路线本地落地：自动路由 + UHD 输入自适应 + 人脸时域稳定
+- **背景**：应要求全球调研 HitPaw VikPea 超分技术（官方模型文档 / developer.hitpaw.com API / 官方 OpenClaw skill）。结论：VikPea 为闭源商业软件 + 云端推理，**模型权重不可提取**；唯一合法接入路径是官方云端 REST API（付费积分、输入须公网 URL、分钟~小时级异步），与本插件"本地帧级批处理 + 离线 + 免费"定位根本冲突 → **采纳其技术理念本地落地（路径 B）**，对标映射：
+  - `ultrahd_restore_2x`（UHD 超分，高清输入保守细节）→ **输入自适应**
+  - `portrait_restore`（多帧融合 + 时空对齐防闪烁）→ **人脸时域稳定**
+  - VikPea 多模型选择器（General/Animation/Portrait/UHD/Generative）→ **自动路由**
+- **① 模型自动路由**：新增引擎「自动路由 (按内容/输入推荐)」，零新依赖（只探测已有权重 + 抽样人脸检测）：
+  - 5 档偏好 `auto_prefer / 自动路由偏好`：质量优先（SeedVR2 INT8→fp8→VOSR→FlashVSR→Real-ESRGAN 逐级回退）、速度优先、人像优先（强制 CodeFormer 人脸修复）、动漫优先（anime 权重）、UHD 优先
+  - 自动内容感知：YOLO 抽样检测到人脸 → 自动开启 CodeFormer 人脸修复 + 时域稳定（无需手动开关）
+  - 自动分辨率感知：≥720P 高清输入 → UHD 保守细节；<540P 低清输入 → HD 增强细节
+  - 路由决策完整写入 info 输出（引擎/内容/档位全透明）
+- **② UHD 输入自适应**：新参数 `input_adaptive / 输入自适应`（自动/关/UHD 保守档/HD 增强档）：≥720P 时细节强度打 6 折（上限 0.35）+ 强制 classic 模式（防过度锐化/伪影）+ 柔和度下限 0.15；<720P 时细节增强 1.2 倍配合 smart 重建。对标 Ultra HD 模型的"自然无数码感"定位
+- **③ 人脸时域稳定**：新参数 `face_temporal / 人脸时域稳定`（默认 0.50，主节点 / 独立 FaceRestore / Topaz FaceRestore 三节点同步）：
+  - 跟踪增强：IoU 断链时按中心距离 + 尺寸比 gating 续链（快速移动/缩放不再断链重检）
+  - **参数级 EMA**：每条人脸轨迹的融合强度/保真度做跨帧指数平滑（0=关闭，等同 v2.6 行为；0.5=推荐；1.0=完全跟随历史）——消除"检测框抖动 → 修复强度逐帧跳变"的闪烁，同时保持逐帧像素级恢复（不混合结果像素，规避 v2.3.1 曾出现的鬼影）
+- 实测：22 项单元测试全过（参数 EMA 跨断点抖动跳变 0.0105→0.0053 减半；dist-gate 续链；路由 5 偏好 + 人脸/分辨率感知）；端到端 4 帧真实人像（CodeFormer 修复正常、无伪影）；主节点完整链路 2 帧 1024×1365→2048×2730 30.3s，auto 路由正确选中引擎 + 自动开人脸修复 + UHD 保守档
+- 兼容性：`face_temporal=0` / `input_adaptive=关` / 不选自动路由时行为与 v2.6.0 完全一致
+
 ### v2.6.0 — SeedVR2 7B INT8 (ComfyUI 原生) 引擎 + 模型路径自动加载
 - **背景**：用户新下载 `models/diffusion_models/seedvr2_7b_int8_convrot.safetensors`（Comfy-Org INT8 量化，7.9GB）与 `models/vae/seedvr2_ema_vae_fp16.safetensors`
 - **兼容性核查结论**：VAE 与现有 `SEEDVR2/ema_vae_fp16.safetensors` **哈希完全一致**（同一文件）；INT8 权重含 `comfy_quant`/`weight_scale` + I8/U8 量化层（288 层），**numz 插件加载器无法读取**（strict=False 会静默丢权重），但 **ComfyUI 原生链（comfy.sd.load_diffusion_model + quant_ops）完整支持**（实测识别为 NaDiT 8.24B 全量加载）

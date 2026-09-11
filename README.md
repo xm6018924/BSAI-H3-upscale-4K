@@ -86,6 +86,21 @@ ComfyUI/models/
 
 ---
 
+## 🛠️ v2.7.1 修复（VOSR / DLSS5 大图健壮性）
+
+| 问题 | 根因 | 修复 |
+| --- | --- | --- |
+| VOSR 大图 OOM | 非方形帧被补成正方形（1536×2048→2048×2048，面积+33%）后全图 VAE 推理 | 短边 >1024 自动启用官方 latent 分块（tile 640）+ VAE 分块（1024），峰值显存降到单 tile 级；tile 路径只做最小 16 对齐不再补正方形 |
+| VOSR `Input height (131) should be divisible by patch size (2)` | VOSR DiT latent=像素/8、patch=2 → 输入必须为 16 的倍数（507×524 补成 524 → latent 131 非偶） | fast path 补成"正方形+16 对齐"，tile 路径最小 16 对齐，推理后按原比例裁回 |
+| DLSS5 `CreateFeature 18 failed` | DLSS NR 输出上限 7680（实测 8192 失败） | 目标超限自动分块（每块 ≤7680）+ 重叠线性融合，任意尺寸可用 |
+| VOSR 子进程偶发崩溃（WinError 10060） | torch.hub 每次启动联网探测 GitHub 默认分支，网络超时未捕获 | VOSR 仓库 `inference_vosr_onestep.py` / `inference_vosr.py` 打离线 DINOv2 补丁：本地权重 + 缓存 repo 加载，失败才回退在线 |
+
+> **VOSR 离线补丁部署**（换机/重装时需要）：把补丁应用到 `models/VOSR/inference_vosr_onestep.py` 与 `inference_vosr.py` 的 `load_dinov2()` —— 本地优先从 `preset/ckpts/torch_cache/checkpoints/dinov2_vitl14_pretrain.pth` + `preset/ckpts/torch_cache/facebookresearch_dinov2_main/` 加载，彻底免除 GitHub 联网依赖。
+
+实测（RTX 5090 Laptop 24GB）：507×524→1014×1048（42s）；1536×2048→4096×3072（tile，77s）；VOSR×2+DLSS5×2 全链→**8192×6144**（83.5s）；22 项单元测试全过。
+
+---
+
 ## 🚀 快速安装
 
 1. 把本仓库放入 `ComfyUI/custom_nodes/BSAI-H3-upscale-4K/`；

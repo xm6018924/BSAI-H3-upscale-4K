@@ -743,10 +743,7 @@ def _compute_flow_pairs(lr_np, max_size=512):
     (h,w,2) float32, in *original LR* pixel coordinates (rescaled back up).
     Downscales internally to speed up Farneback; flow is upsampled to LR size.
     """
-    if not _HAS_CV2:
-        return None
-    B = lr_np.shape[0]
-    if B < 2:
+    if not _HAS_CV2 or lr_np is None or lr_np.shape[0] < 2:
         return []
     h, w = lr_np.shape[1], lr_np.shape[2]
     ds = 1.0
@@ -925,6 +922,9 @@ def _video_temporal_detail(sr_cpu, lr_np, temporal_strength, detail_amount, deta
     B = sr_cpu.shape[0]
     if (temporal_strength <= 0 and detail_amount <= 0) or B < 1:
         return sr_cpu
+    # 单帧 / 无光流输入（如单图超分）时，时域一致性无意义，跳过 flow 计算
+    if lr_np is None or lr_np.shape[0] < 2:
+        temporal_strength = 0.0
     flows = _compute_flow_pairs(lr_np) if temporal_strength > 0 else None
     H, W = sr_cpu.shape[1], sr_cpu.shape[2]
     use_gpu = torch.cuda.is_available()
@@ -1467,7 +1467,12 @@ def _seedvr2_upscale(frames, scale, seed=42):
         color_correction="lab", input_noise_scale=0.0, latent_noise_scale=0.0,
         offload_device="cpu", enable_debug=False,
     )
-    out = result[0] if isinstance(result, (tuple, list)) else result
+    out = result
+    if hasattr(result, "result"):  # comfy_api NodeOutput: .result == args tuple
+        args = result.result
+        out = args[0] if isinstance(args, (tuple, list)) and len(args) > 0 else args
+    elif isinstance(result, (tuple, list)) and len(result) > 0:
+        out = result[0]
     if hasattr(out, "result"):
         out = out.result
     if torch.is_tensor(out):
@@ -2151,8 +2156,8 @@ def _apply_input_adaptive(input_adaptive, in_short, detail_amount, detail_mode, 
         soft_eff = max(float(softness), 0.15)
         return detail_eff, mode_eff, soft_eff, "UHD 保守档"
     if uhd is False:
-        # <720p: 细节增强 1.2 倍(上限 1.0)，配合 smart 重建补细节
-        detail_eff = min(float(detail_amount) * 1.2, 1.0)
+        # <720p: 细节增强 1.2 倍(上限 0.6，防生成式引擎叠加 USM 过度锐化/伪影)
+        detail_eff = min(float(detail_amount) * 1.2, 0.6)
         return detail_eff, mode_eff, soft_eff, "HD 增强档"
     return detail_eff, mode_eff, soft_eff, "关"
 
@@ -2206,12 +2211,12 @@ def _auto_route(images, prefer="质量优先", scale=4.0, user_face='Off',
     # ---- 偏好 → 引擎 ----
     over = {}
     if prefer == "质量优先":
-        if int8_name and cuda:
-            engine = "SeedVR2 7B INT8 (ComfyUI原生)"
-            notes.append("引擎: SeedVR2 INT8 (扩散, 质量最高)")
-        elif has_seed_fp8 and cuda:
+        if has_seed_fp8 and cuda:
             engine = "SeedVR2 7B (扩散视频超分)"
-            notes.append("引擎: SeedVR2 fp8 (扩散)")
+            notes.append("引擎: SeedVR2 fp8 (扩散, 精度最高)")
+        elif int8_name and cuda:
+            engine = "SeedVR2 7B INT8 (ComfyUI原生)"
+            notes.append("引擎: SeedVR2 INT8 (扩散, 量化加速)")
         elif has_vosr and cuda:
             engine = "VOSR 2.0 (CVPR2026生成式超分)"
             notes.append("引擎: VOSR 2.0 (生成式)")
@@ -2221,6 +2226,11 @@ def _auto_route(images, prefer="质量优先", scale=4.0, user_face='Off',
         else:
             engine = "realesr-general-x4v3.pth"
             notes.append("引擎: Real-ESRGAN general (无扩散权重, 速度回退)")
+        # 质量优先选中 INT8 量化扩散时：采样增强补偿量化损失（fp8 走官方默认采样，无需覆盖）
+        if engine == "SeedVR2 7B INT8 (ComfyUI原生)":
+            over["sv2_steps"] = 16
+            over["sv2_cfg"] = 1.5
+            notes.append("SeedVR2 INT8: 采样增强 16步/CFG1.5 (质量优先)")
     elif prefer == "速度优先":
         engine = "realesr-general-x4v3.pth"
         notes.append("引擎: Real-ESRGAN general (速度优先)")
@@ -2244,7 +2254,10 @@ def _auto_route(images, prefer="质量优先", scale=4.0, user_face='Off',
     if face_found and user_face == "Off" and prefer != "人像优先":
         over["face_restore"] = "CodeFormer"
         over["face_temporal"] = 0.5
-        notes.append("检测到人脸 → 自动开启 CodeFormer + 时域稳定")
+        # 轻修复：CodeFormer 保真 0.45 + 融合 0.55 —— 只补细节、不改脸型，避免“塑料感”
+        over["face_fidelity"] = 0.45
+        over["face_blend"] = 0.55
+        notes.append("检测到人脸 → 自动开启 CodeFormer(轻修复 保真0.45/融合0.55) + 时域稳定")
     if prefer == "质量优先" and "input_adaptive" not in over:
         if in_short >= 720:
             over["input_adaptive"] = "UHD 保守档"
@@ -2365,8 +2378,8 @@ class BSAI_H3_Upscale4K:
                 # 权重自动查找：diffusion_models/seedvr2_7b_int8_convrot.safetensors
                 # (INT8 优先) → 其它 seedvr2_*.safetensors → SEEDVR2/；VAE 自动查找
                 # SEEDVR2/ → vae/seedvr2_ema_vae_fp16.safetensors → vae/ema_vae_fp16。
-                "sv2_steps / SeedVR2步数": ("INT", {"default": 8, "min": 1, "max": 100, "step": 1}),
-                "sv2_cfg / SeedVR2保真度": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.1}),
+                "sv2_steps / SeedVR2步数": ("INT", {"default": 12, "min": 1, "max": 100, "step": 1}),
+                "sv2_cfg / SeedVR2保真度": ("FLOAT", {"default": 1.2, "min": 0.0, "max": 10.0, "step": 0.1}),
                 "sv2_sampler / SeedVR2采样器": (["euler", "dpmpp_2m", "dpmpp_2m_sde", "ddim", "uni_pc"], {"default": "euler"}),
                 "sv2_scheduler / SeedVR2调度器": (["normal", "karras", "simple", "sgm_uniform"], {"default": "normal"}),
                 "sv2_color / SeedVR2色彩校正": (["lab", "wavelet", "adain", "none"], {"default": "lab"}),
@@ -2431,6 +2444,7 @@ class BSAI_H3_Upscale4K:
         except Exception:
             pass
         auto_notes = []
+        over = {}
         if model_name in self.ENGINE_OPTIONS and self.ENGINE_OPTIONS[model_name] == "auto":
             resolved, over, auto_notes = _auto_route(
                 images, prefer=auto_prefer, scale=float(scale),
@@ -2447,6 +2461,12 @@ class BSAI_H3_Upscale4K:
                 face_restore = over["face_restore"]
             if "face_temporal" in over:
                 face_temporal = over["face_temporal"]
+            if "face_fidelity" in over:
+                face_fidelity = over["face_fidelity"]
+            if "face_blend" in over:
+                face_blend = over["face_blend"]
+            if "sv2_steps" in over:
+                pass  # 由 seedvr2_int8 分支消费（见下）
 
         _engine = self.ENGINE_OPTIONS.get(model_name)
         _is_topaz = model_name in self.TOPAZ_OPTIONS
@@ -2465,11 +2485,15 @@ class BSAI_H3_Upscale4K:
             lr_np = None
         elif _engine == "seedvr2_int8":
             # --- SeedVR2 7B INT8 (ComfyUI 原生链) path ----------------------
-            sv2_steps = g("sv2_steps / SeedVR2步数", 8)
-            sv2_cfg = g("sv2_cfg / SeedVR2保真度", 1.0)
+            sv2_steps = g("sv2_steps / SeedVR2步数", 12)
+            sv2_cfg = g("sv2_cfg / SeedVR2保真度", 1.2)
             sv2_sampler = g("sv2_sampler / SeedVR2采样器", "euler")
             sv2_scheduler = g("sv2_scheduler / SeedVR2调度器", "normal")
             sv2_color = g("sv2_color / SeedVR2色彩校正", "lab")
+            if "sv2_steps" in over:  # 质量优先档采样增强（补偿 INT8 量化损失）
+                sv2_steps = int(over["sv2_steps"])
+            if "sv2_cfg" in over:
+                sv2_cfg = float(over["sv2_cfg"])
             out = _seedvr2_native_upscale(
                 images, float(scale), seed=42,
                 steps=int(sv2_steps), cfg=float(sv2_cfg),
@@ -2558,6 +2582,8 @@ class BSAI_H3_Upscale4K:
             lr_np = None
             if temporal_strength > 0 and _HAS_CV2 and images.shape[0] > 1:
                 lr_np = np.ascontiguousarray(images.float().numpy(), dtype=np.float32)
+            else:
+                temporal_strength = 0.0  # 单帧（或无 cv2）无光流可用，时域一致性跳过
 
             # --- scale plan (Topaz-style arbitrary ratios) -------------------------
             # Super-resolve to the smallest model-integer power >= requested scale,

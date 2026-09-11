@@ -75,7 +75,7 @@ ComfyUI/models/
 | 节点 | 配置 | 说明 |
 |---|---|---|
 | LoadImage | `bsai_h3_v27_example.png`（已放入 `ComfyUI/input/`） | 400×532 低清人像示例，换成你自己的图/视频帧即可 |
-| **BSAI_H3_Upscale4K** | 模型 = **自动路由**，偏好 = **质量优先** | 自动探测 SeedVR2 INT8 → fp8 → VOSR → FlashVSR → Real-ESRGAN，逐级回退 |
+| **BSAI_H3_Upscale4K** | 模型 = **自动路由**，偏好 = **质量优先** | 自动探测 SeedVR2 fp8（精度最高）→ INT8 → VOSR → FlashVSR → Real-ESRGAN，逐级回退 |
 | ↑ 自动内容感知 | `face_restore = Off`（不用手动开） | 路由检测到人脸 → **自动开启 CodeFormer 修复 + 时域稳定** |
 | ↑ 自动分辨率感知 | `input_adaptive = 自动` | 低清输入自动 HD 增强重建；≥720P 输入自动 UHD 保守细节 |
 | ↑ 时域稳定 | `face_temporal = 0.50` | 跨帧跟踪 + 参数 EMA，防"框抖动→强度跳变"闪烁 |
@@ -126,6 +126,32 @@ ComfyUI/models/
 ---
 
 ## 📝 更新日志
+
+### v2.8.0 — 质量优先档画质重构 + 单帧崩溃修复 + SeedVR2 fp8 路径修复
+
+**背景**：用户反馈 v2.7.1 按"自动路由/质量优先"处理 507×524 单帧输出画质"不堪入目"（眼/唇细节劣化）；手动切 Real-ESRGAN 模型后节点崩溃 `AttributeError: 'NoneType' object has no attribute 'shape'`。
+
+**① 单帧崩溃修复（问题②）**：根因是 `upscale()` 仅 Real-ESRGAN 分支在多帧且 cv2 可用时才给 `lr_np` 赋值，其余引擎分支恒为 `None`；单帧输入时 `temporal_strength=0.2>0` 仍进入 `_video_temporal_detail` → `_compute_flow_pairs(None).shape` 崩溃。
+- `_compute_flow_pairs`：`lr_np is None` 或 `shape[0]<2` 直接返回 `[]`
+- `_video_temporal_detail`：单帧/无光流输入自动 `temporal_strength=0`（跳过 flow）
+- Real-ESRGAN 分支：单帧或无 cv2 时 `temporal_strength=0`——**任何引擎 + 任何输入尺寸都不再崩溃**
+
+**② 质量优先档画质重构（问题①）**：本地对照实验（同一张 507×524 原图）实测——
+| 路径 | 输出 | 耗时 | Laplacian |
+|---|---|---|---|
+| SeedVR2 INT8 8步 cfg1.0（旧默认） | 1048×1014 | 130s | 375 |
+| SeedVR2 fp8 官方默认（修复后） | 1048×1014 | **84s** | 290 |
+
+结论：**根因是路由选中 INT8 量化权重 + 8 步低采样**（w4a4 量化精度损失在眼唇等细节区最明显，高频被过度强调产生伪影/失真），而非后处理参数。
+- **路由换序**：质量优先 = SeedVR2 **fp8（精度最高）** → INT8 → VOSR → FlashVSR → Real-ESRGAN；fp8 已实测更快（84s vs 130s）且权重精度更高
+- **INT8 采样增强**：仅当回退到 INT8 时自动覆盖 `sv2_steps=16 / sv2_cfg=1.5`（补偿量化损失），信息写入 info 输出
+- **人脸自动轻修复**：自动检测到人脸时，CodeFormer 保真 0.6→**0.45**、融合 0.7→**0.55**（只补细节不改脸型，杜绝"塑料感"）
+- **HD 增强档防过度锐化**：低清输入细节强度上限 1.0→**0.6**
+- **节点默认值**：`sv2_steps` 8→**12**、`sv2_cfg` 1.0→**1.2**
+
+**③ SeedVR2 fp8 路径修复（潜伏 bug）**：`_seedvr2_upscale` 从未真正输出放大图——官方插件返回 `io.NodeOutput(sample)`（`.result` 为 args 元组），旧解包逻辑误判为非 tensor 直接回退原图。修复为正确解包 `NodeOutput.result[0]`，fp8 路径首次真实可用（此前若被手动选中会"输出尺寸不变"）。
+
+实测：24 项单元测试全过（单帧 temporal 防御 / fp8 优先路由 / INT8 采样覆盖 / 人脸轻修复 / HD 档上限 / 节点默认值 / fp8 返回解包）；节点级 E2E auto/质量优先 507×524→1048×1014 正常出图。
 
 ### v2.7.0 — HitPaw 技术路线本地落地：自动路由 + UHD 输入自适应 + 人脸时域稳定
 - **背景**：应要求全球调研 HitPaw VikPea 超分技术（官方模型文档 / developer.hitpaw.com API / 官方 OpenClaw skill）。结论：VikPea 为闭源商业软件 + 云端推理，**模型权重不可提取**；唯一合法接入路径是官方云端 REST API（付费积分、输入须公网 URL、分钟~小时级异步），与本插件"本地帧级批处理 + 离线 + 免费"定位根本冲突 → **采纳其技术理念本地落地（路径 B）**，对标映射：

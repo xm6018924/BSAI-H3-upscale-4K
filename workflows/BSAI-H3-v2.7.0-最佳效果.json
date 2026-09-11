@@ -1,0 +1,121 @@
+{
+  "last_node_id": 4,
+  "last_link_id": 3,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "LoadImage",
+      "pos": [60, 260],
+      "size": [320, 380],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        { "name": "IMAGE", "type": "IMAGE", "links": [1], "slot_index": 0 },
+        { "name": "MASK", "type": "MASK", "links": null }
+      ],
+      "properties": { "Node name for S&R": "LoadImage" },
+      "widgets_values": ["bsai_h3_v27_example.png", "image"]
+    },
+    {
+      "id": 2,
+      "type": "BSAI_H3_Upscale4K",
+      "pos": [460, 220],
+      "size": [430, 760],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [
+        { "name": "images / 图像", "type": "IMAGE", "link": 1 }
+      ],
+      "outputs": [
+        { "name": "IMAGE / 图像", "type": "IMAGE", "links": [2], "slot_index": 0 },
+        { "name": "width / 宽", "type": "INT", "links": null },
+        { "name": "height / 高", "type": "INT", "links": null },
+        { "name": "scale_used / 实际倍率", "type": "FLOAT", "links": null },
+        { "name": "info / 信息", "type": "STRING", "links": null }
+      ],
+      "properties": { "Node name for S&R": "BSAI_H3_Upscale4K" },
+      "widgets_values": [
+        "自动路由 (按内容/输入推荐)",
+        4.0,
+        0,
+        16,
+        4,
+        true,
+        true,
+        0.2,
+        0.5,
+        1.8,
+        0.1,
+        "Off",
+        0.15,
+        0.7,
+        0.6,
+        "smart",
+        "自动",
+        0.5,
+        "质量优先",
+        "Cinematic",
+        1.0,
+        1.0,
+        true,
+        0.5,
+        1,
+        2,
+        2,
+        2,
+        8,
+        1.0,
+        "euler",
+        "normal",
+        "lab"
+      ]
+    },
+    {
+      "id": 3,
+      "type": "SaveImage",
+      "pos": [960, 260],
+      "size": [400, 480],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [
+        { "name": "images", "type": "IMAGE", "link": 2 }
+      ],
+      "outputs": [],
+      "properties": { "Node name for S&R": "SaveImage" },
+      "widgets_values": ["BSAI-H3-v27-4K"]
+    },
+    {
+      "id": 4,
+      "type": "PreviewImage",
+      "pos": [60, 700],
+      "size": [320, 380],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [
+        { "name": "images", "type": "IMAGE", "link": 3 }
+      ],
+      "outputs": [],
+      "properties": { "Node name for S&R": "PreviewImage" },
+      "widgets_values": []
+    }
+  ],
+  "links": [
+    [1, 1, 0, 2, 0, "IMAGE"],
+    [2, 2, 0, 3, 0, "IMAGE"],
+    [3, 1, 0, 4, 0, "IMAGE"]
+  ],
+  "groups": [],
+  "config": {},
+  "extra": {
+    "ds": {
+      "scale": 1,
+      "offset": [0, 0]
+    }
+  },
+  "version": 0.4
+}

@@ -68,6 +68,24 @@ ComfyUI/models/
 
 ---
 
+## 🧪 示例工作流（v2.7.0 最佳效果）
+
+`workflows/BSAI-H3-v2.7.0-最佳效果.json` —— 一键体验本次升级的三项新能力，**按最佳效果配置**：
+
+| 节点 | 配置 | 说明 |
+|---|---|---|
+| LoadImage | `bsai_h3_v27_example.png`（已放入 `ComfyUI/input/`） | 400×532 低清人像示例，换成你自己的图/视频帧即可 |
+| **BSAI_H3_Upscale4K** | 模型 = **自动路由**，偏好 = **质量优先** | 自动探测 SeedVR2 INT8 → fp8 → VOSR → FlashVSR → Real-ESRGAN，逐级回退 |
+| ↑ 自动内容感知 | `face_restore = Off`（不用手动开） | 路由检测到人脸 → **自动开启 CodeFormer 修复 + 时域稳定** |
+| ↑ 自动分辨率感知 | `input_adaptive = 自动` | 低清输入自动 HD 增强重建；≥720P 输入自动 UHD 保守细节 |
+| ↑ 时域稳定 | `face_temporal = 0.50` | 跨帧跟踪 + 参数 EMA，防"框抖动→强度跳变"闪烁 |
+| ↑ 画质 | `temporal 0.2 / detail smart 0.5 / softness 0.1 / scale 4.0` | 光流时序 + 智能细节重建 + 柔和收敛，4K 输出 |
+| PreviewImage / SaveImage | — | 左下预览原图、右侧保存 4K 结果（`BSAI-H3-v27-4K` 前缀） |
+
+使用：拖入 ComfyUI → 点运行（LoadImage 可换图）。info 输出会完整显示自动路由决策（引擎 / 内容 / 档位），可直观看到 v2.7.0 的"自动"如何工作。
+
+---
+
 ## 🚀 快速安装
 
 1. 把本仓库放入 `ComfyUI/custom_nodes/BSAI-H3-upscale-4K/`；

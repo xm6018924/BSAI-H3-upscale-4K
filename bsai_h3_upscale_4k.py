@@ -1813,6 +1813,67 @@ def _dlssnr_out_dims(in_w, in_h, width, scale):
     return out_w - out_w % 2, out_h - out_h % 2
 
 
+_DLSSNR_MAX_DIM = 7680  # DLSS NR CreateFeature 输出上限（实测：8192 失败、7680 通过）
+
+
+def _dlssnr_tiled_upscale(frames, scale, style, preset, intensity,
+                          local_structure, local_tone, skin, global_tone,
+                          detail, color, auto_mask, hdr, motion,
+                          motion_engine, width, adapter):
+    """目标超 DLSS NR 8K 上限时自动分块 + 重叠线性融合，任意尺寸可用。
+
+    每块输出控制在 _DLSSNR_MAX_DIM 内（递归一次即收敛），块间 64px 重叠，
+    用边缘线性 ramp 权重融合消除接缝。DLSS NR 是局部增强（local structure/
+    tone/skin/detail），分块拼接质量损失极小。"""
+    b, h, w, _ = frames.shape
+    out_w, out_h = _dlssnr_out_dims(w, h, width, scale)
+    cols = max(1, math.ceil(out_w / _DLSSNR_MAX_DIM))
+    rows = max(1, math.ceil(out_h / _DLSSNR_MAX_DIM))
+    ow = math.ceil(out_w / cols / 2) * 2          # 输出块宽（偶数，<= MAX_DIM）
+    oh = math.ceil(out_h / rows / 2) * 2          # 输出块高
+    ov_out = 64                                   # 输出域重叠
+    iw = max(1, int(round(ow / scale)))           # 输入块基准宽
+    ih = max(1, int(round(oh / scale)))
+    out = torch.zeros(b, out_h, out_w, 3, dtype=torch.float32)
+    wsum = torch.zeros(b, out_h, out_w, 1, dtype=torch.float32)
+    for c in range(cols):
+        ox = round(c * (out_w - ow) / max(cols - 1, 1)) if cols > 1 else 0
+        for r in range(rows):
+            oy = round(r * (out_h - oh) / max(rows - 1, 1)) if rows > 1 else 0
+            x0 = min(max(0, int(round(ox / scale))), w - iw)
+            y0 = min(max(0, int(round(oy / scale))), h - ih)
+            blk = frames[:, y0:y0 + ih, x0:x0 + iw, :]
+            try:
+                sr = _dlssnr_upscale(
+                    blk, scale=1.0, style=style, preset=preset,
+                    intensity=intensity, local_structure=local_structure,
+                    local_tone=local_tone, skin=skin, global_tone=global_tone,
+                    detail=detail, color=color, auto_mask=auto_mask, hdr=hdr,
+                    motion=motion, motion_engine=motion_engine,
+                    width=ow, adapter=adapter)
+            except RuntimeError as e:
+                raise RuntimeError(
+                    "[BSAI-H3/DLSS5] 分块超分失败（块 %d/%d, %dx%d）：%s"
+                    % (r * cols + c + 1, rows * cols, ow, oh, str(e)[:300]))
+            # 输出块尺寸校正（scale 非整除时可能有 ±2px 偏差）
+            if sr.shape[1] != oh or sr.shape[2] != ow:
+                sr = torch.from_numpy(cv2.resize(
+                    sr.numpy(), (ow, oh), interpolation=cv2.INTER_LANCZOS4))
+            # 边缘线性 ramp 权重：中心 1，距块边 ov_out/2 内线性降到 0
+            wgt = torch.ones(oh, ow, dtype=torch.float32)
+            if oh > 2 * ov_out:
+                ramp = torch.arange(oh, dtype=torch.float32)
+                wgt = wgt * (torch.minimum(ramp, (oh - 1 - ramp))
+                             .clamp(0, ov_out) / ov_out).view(oh, 1)
+            if ow > 2 * ov_out:
+                ramp = torch.arange(ow, dtype=torch.float32)
+                wgt = wgt * (torch.minimum(ramp, (ow - 1 - ramp))
+                             .clamp(0, ov_out) / ov_out).view(1, ow)
+            out[:, oy:oy + oh, ox:ox + ow, :] += sr * wgt.unsqueeze(0).unsqueeze(-1)
+            wsum[:, oy:oy + oh, ox:ox + ow, 0] += wgt
+    return (out / wsum.clamp(min=1e-6)).clamp(0, 1)
+
+
 def _dlssnr_upscale(frames, scale, style="Cinematic", preset="Default", intensity=1.0,
                     local_structure=1.0, local_tone=1.0, skin=0.0, global_tone=-1.0,
                     detail=1.0, color=0.0, auto_mask=False, hdr=False,
@@ -1832,6 +1893,14 @@ def _dlssnr_upscale(frames, scale, style="Cinematic", preset="Default", intensit
     if motion_engine not in _DLSSNR_ENGINES:
         motion_engine = "auto"
     out_w, out_h = _dlssnr_out_dims(w, h, width, scale)
+    # 目标超 DLSS NR 上限（8K 宽边实测 7680 通过、8192 失败）时自动分块
+    if max(out_w, out_h) > _DLSSNR_MAX_DIM:
+        return _dlssnr_tiled_upscale(
+            frames, scale, style=style, preset=preset, intensity=intensity,
+            local_structure=local_structure, local_tone=local_tone, skin=skin,
+            global_tone=global_tone, detail=detail, color=color,
+            auto_mask=auto_mask, hdr=hdr, motion=motion,
+            motion_engine=motion_engine, width=width, adapter=adapter)
     cmd = [exe, "--nr-video", "--nr-in", f"{w}x{h}", "--adapter", str(int(adapter)),
            "--nr-style", str(_DLSSNR_STYLES.get(style, 2)),
            "--nr-preset", str(_DLSSNR_PRESETS.get(preset, 0)),
@@ -1958,29 +2027,49 @@ def _vosr_upscale(frames, scale=4.0, cfg_scale=0.5, infer_steps=1):
     home = _vosr_home()
     up = max(2, min(4, int(round(scale))))
     b, h, w, _ = frames.shape
-    # VOSR onestep 模型的 forward_flexible 只支持正方形输入（assert H == W），
-    # 非方形帧会静默失败（returncode=0 但 0 输出）。对非方形帧先 reflect
-    # 补边成正方形（内容与比例不变），推理后再按原比例裁回。
-    square = (h != w)
-    pad_side = max(h, w)
-    top = (pad_side - h) // 2 if square else 0
-    left = (pad_side - w) // 2 if square else 0
+    # VOSR 2.0 DiT 两条约束：forward_flexible 硬性 assert H==W（只支持方形 latent），
+    # 且 latent = 像素/8、patch_size=2 -> 像素须为 16 的倍数（507x524 补成 524 后
+    # latent 131 不整除 patch -> assert 失败）。
+    #   - 小图（fast path，无分块）：补成正方形并 16 对齐，推理后按原比例裁回；
+    #   - 大图（latent/VAE 分块）：DiT 每块 latent tile 天然是正方形，整体无需补
+    #     正方形，只需最小 16 对齐 —— 旧版补正方形会把 1536x2048 变成 2048x2048，
+    #     面积 +33%，是 4096x4096 全图 VAE OOM 的元凶。
+    MOD = 16
+    tile = 0
+    if max(h, w) > 1024:
+        tile = 640
+        pad_h = (MOD - h % MOD) % MOD
+        pad_w = (MOD - w % MOD) % MOD
+    else:
+        side = max(h, w)
+        side += (MOD - side % MOD) % MOD
+        pad_h, pad_w = side - h, side - w
+    top, left = pad_h // 2, pad_w // 2
+    bot, right = pad_h - top, pad_w - left
+    # 大图自动分块：VOSR 权重加载即占 ~18.7GB（RTX 5090 Laptop 24GB），全图 VAE
+    # encode 4096x4096 还需 ~6GB -> OOM。官方脚本支持 latent 分块（--tile_size，
+    # DiT 按 latent tile 前向）与 VAE 分块（--vae_tile_size，encode/decode 按像素
+    # tile 高斯混合），峰值显存降到单 tile 级别。短边 > 1024 时自动启用。
     in_dir = tempfile.mkdtemp(prefix="vosr_in_")
     out_dir = tempfile.mkdtemp(prefix="vosr_out_")
     try:
         import cv2
         for i in range(b):
             img = (frames[i].numpy() * 255.0).clip(0, 255).astype(np.uint8)
-            if square:
-                img = cv2.copyMakeBorder(img, top, pad_side - h - top,
-                                         left, pad_side - w - left,
+            if pad_h or pad_w:
+                img = cv2.copyMakeBorder(img, top, bot, left, right,
                                          cv2.BORDER_REFLECT_101)
             cv2.imwrite(os.path.join(in_dir, f"frame_{i:05d}.png"),
                         cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
-        print(f"[BSAI-H3/VOSR] {b}帧 {w}x{h} -> VOSR 2.0 (x{up}) ...", flush=True)
+        print(f"[BSAI-H3/VOSR] {b}帧 {w}x{h} -> VOSR 2.0 (x{up})"
+              + (f", tile={tile}/vae1024" if tile else "") + " ...", flush=True)
         t0 = time.time()
         cmd = [_vosr_python(), script, "-c", ckpt, "-i", in_dir, "-o", out_dir,
                "-u", str(up), "--infer_steps", str(infer_steps)]
+        if tile:
+            # latent 分块：像素 tile 640 -> latent 80（对齐 patch 2）；VAE 分块 1024
+            cmd += ["--tile_size", str(tile), "--tile_overlap", "32",
+                    "--vae_tile_size", "1024"]
         # onestep 脚本 (inference_vosr_onestep.py) 不支持 --cfg_scale（仅多步版
         # inference_vosr.py 支持）。动态检测脚本源码，避免 argparse 报错导致
         # VOSR 通道必然失败；多步版仍按用户 cfg 设置透传。
@@ -1991,7 +2080,8 @@ def _vosr_upscale(frames, scale=4.0, cfg_scale=0.5, infer_steps=1):
             _has_cfg = True
         if _has_cfg:
             cmd += ["--cfg_scale", str(cfg_scale)]
-        proc = subprocess.run(cmd, cwd=home, capture_output=True, text=True, timeout=600)
+        proc = subprocess.run(cmd, cwd=home, capture_output=True, text=True,
+                              timeout=1800)
         if proc.returncode != 0:
             raise RuntimeError("[BSAI-H3/VOSR] 推理失败 (exit %s)\n%s" %
                                (proc.returncode, (proc.stderr or "")[-2000:]))
@@ -2006,7 +2096,7 @@ def _vosr_upscale(frames, scale=4.0, cfg_scale=0.5, infer_steps=1):
         for i in range(b):
             img = cv2.imread(os.path.join(out_dir, out_files[i]), cv2.IMREAD_COLOR)
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            if square:
+            if pad_h or pad_w:
                 img = img[top * up: (top + h) * up, left * up: (left + w) * up]
                 # 保险：与目标尺寸不一致时校准（正常应恰好等于 h*up x w*up）
                 th, tw = h * up, w * up

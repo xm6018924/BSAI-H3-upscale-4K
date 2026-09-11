@@ -2300,6 +2300,9 @@ class BSAI_H3_Upscale4K:
         return {
             "required": {
                 "images / 图像": ("IMAGE",),
+                # v2.8.1 自动路由偏好（仅当 model_name = 自动路由 时生效）：置于模型选择之上，
+                # 先选偏好档位再看引擎，符合“按内容/输入推荐”的操作直觉。
+                "auto_prefer / 自动路由偏好": (["质量优先", "速度优先", "人像优先", "动漫优先", "UHD优先"], {"default": "质量优先"}),
                 # general-x4v3 default: ~8x faster than x4plus with nearly identical
                 # quality (PSNR ~39 dB on test frames). x4plus = max quality, slowest.
                 "model_name / 模型": (models, {"default": "realesr-general-x4v3.pth"}),
@@ -2357,8 +2360,6 @@ class BSAI_H3_Upscale4K:
                 # 跨帧跟踪 + 修复强度参数 EMA，消除“框抖动→强度跳变”闪烁。
                 # 0=关(等同 v2.6 行为)；0.5=推荐；1.0=完全跟随历史轨迹。
                 "face_temporal / 人脸时域稳定": ("FLOAT", {"default": 0.50, "min": 0.0, "max": 1.0, "step": 0.05}),
-                # v2.7.0 自动路由偏好（仅当 model_name = 自动路由 时生效）
-                "auto_prefer / 自动路由偏好": (["质量优先", "速度优先", "人像优先", "动漫优先", "UHD优先"], {"default": "质量优先"}),
                 # DLSS 5 专属参数（仅当 model_name 选择 DLSS 5 时生效）：
                 # style=NR 风格（Cinematic 默认最干净）；intensity/detail 控制
                 # 神经渲染叠加强度；motion=光流运动矢量（时序稳定，防闪烁）。

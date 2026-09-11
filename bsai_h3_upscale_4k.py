@@ -28,6 +28,7 @@ import math
 import time
 import threading
 import urllib.request
+import shutil
 
 import numpy as np
 import torch
@@ -1034,6 +1035,8 @@ def _face_models(mode: str):
         onnx_path,
         providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
     det = YOLO(det_path)
+    in_names = [i.name for i in sess.get_inputs()]
+    print(f"[BSAI-H3] face restore onnx inputs: {in_names} (expect [input, weight] for CodeFormer)")
     _FACE_CACHE[key] = (det, sess)
     return det, sess
 
@@ -1130,6 +1133,15 @@ def _restore_faces_frame(img, boxes, sess, mode, blend, fidelity=0.75):
         m = cv2.GaussianBlur(m, (0, 0), sigmaX=max(2.0, min(cw, ch) / 28.0))
         m = m[..., None].astype(np.float32)
         fused = blend_eff * restored.astype(np.float32) + (1.0 - blend_eff) * crop.astype(np.float32)
+        # v2.4.1: shrink back if small-face 2x pre-upscale was applied
+        orig_h = cy2 - cy1
+        orig_w = cx2 - cx1
+        if fused.shape[0] != orig_h or fused.shape[1] != orig_w:
+            fused = cv2.resize(fused, (orig_w, orig_h), interpolation=cv2.INTER_LANCZOS4)
+            m = cv2.resize(m, (orig_w, orig_h), interpolation=cv2.INTER_LANCZOS4)
+            if m.ndim == 2:
+                m = m[..., None]
+            crop = cv2.resize(crop, (orig_w, orig_h), interpolation=cv2.INTER_LANCZOS4)
         out[cy1:cy2, cx1:cx2] = (m * fused + (1.0 - m) * crop.astype(np.float32)).astype(np.uint8)
     return out
 
@@ -1557,9 +1569,12 @@ def _dlssnr_out_dims(in_w, in_h, width, scale):
 
 
 def _dlssnr_upscale(frames, scale, style="Cinematic", preset="Default", intensity=1.0,
-                    local_structure=1.0, local_tone=1.0, skin=-1.0, global_tone=-1.0,
-                    detail=1.0, color=1.0, auto_mask=False, hdr=False,
+                    local_structure=1.0, local_tone=1.0, skin=0.0, global_tone=-1.0,
+                    detail=1.0, color=0.0, auto_mask=False, hdr=False,
                     motion=True, motion_engine="auto", width=0, adapter=0):
+    # 默认参数对齐视频实测（NickAI《VOSR 遇上 DLSS5》）：skin=0 保留原图肌肤肌理感，
+    # color=0 避免神经渲染把皮肤处理得油腻（实测 color=1 皮肤发油没法看）；
+    # detail 保持 1.0（视频建议 1 或更高）。
     """frames [B,H,W,3] float 0..1 CPU -> DLSS SR + Neural Rendering [B,H',W',3] float 0..1 CPU.
 
     Frames stream to video2dlssnr.exe as raw RGBA over a pipe and come back the
@@ -1640,6 +1655,145 @@ def _dlssnr_upscale(frames, scale, style="Cinematic", preset="Default", intensit
 
 
 # ---------------------------------------------------------------------------
+# VOSR 2.0 (CVPR 2026) — Vision-Only Generative Image Super-Resolution
+# 通过子进程调用外部VOSR推理脚本，逐帧处理视频。
+# 仓库: https://github.com/cswry/VOSR
+# ---------------------------------------------------------------------------
+
+def _vosr_home():
+    env = os.environ.get("VOSR_HOME", "").strip().strip('"')
+    if env and os.path.isdir(env):
+        return env
+    base = getattr(folder_paths, "models_dir", "models")
+    cands = []
+    if base:
+        cands.append(os.path.join(base, "VOSR"))  # ComfyUI/models/VOSR (仓库副本)
+    cands += [r"C:\BSAI\VOSR",
+              os.path.join(os.path.dirname(os.path.abspath(__file__)), "bin", "VOSR")]
+    for c2 in cands:
+        if os.path.isdir(c2):
+            return c2
+    return None
+
+def _vosr_inference_script():
+    home = _vosr_home()
+    if not home:
+        return None
+    for name in ("inference_vosr_onestep.py", "inference_vosr.py"):
+        p = os.path.join(home, name)
+        if os.path.isfile(p):
+            return p
+    return None
+
+def _vosr_ckpt_dir():
+    home = _vosr_home()
+    if not home:
+        return None
+    for sub in ("preset/ckpts/VOSR2", "preset/ckpts/VOSR_1.4B_os",
+                "preset/ckpts/VOSR_1.4B_ms", "preset/ckpts/VOSR_0.5B_os"):
+        d = os.path.join(home, sub.replace("/", os.sep))
+        if os.path.isdir(d):
+            return d
+    return None
+
+def _vosr_python():
+    env = os.environ.get("VOSR_PYTHON", "").strip().strip('"')
+    if env and os.path.isfile(env):
+        return env
+    return sys.executable
+
+def _vosr_upscale(frames, scale=4.0, cfg_scale=0.5, infer_steps=1):
+    """VOSR 2.0 one-step generative SR. frames [B,H,W,3] float 0..1 CPU."""
+    script = _vosr_inference_script()
+    ckpt = _vosr_ckpt_dir()
+    if not script or not ckpt:
+        raise RuntimeError(
+            "[BSAI-H3/VOSR] VOSR未安装。将VOSR仓库放到 models/VOSR 或设置VOSR_HOME，权重放preset/ckpts/VOSR2/\n"
+            "下载: https://github.com/cswry/VOSR | ComfyUI: https://github.com/ylchen333/ComfyUI-VOSR2")
+    home = _vosr_home()
+    up = max(2, min(4, int(round(scale))))
+    b, h, w, _ = frames.shape
+    # VOSR onestep 模型的 forward_flexible 只支持正方形输入（assert H == W），
+    # 非方形帧会静默失败（returncode=0 但 0 输出）。对非方形帧先 reflect
+    # 补边成正方形（内容与比例不变），推理后再按原比例裁回。
+    square = (h != w)
+    pad_side = max(h, w)
+    top = (pad_side - h) // 2 if square else 0
+    left = (pad_side - w) // 2 if square else 0
+    in_dir = tempfile.mkdtemp(prefix="vosr_in_")
+    out_dir = tempfile.mkdtemp(prefix="vosr_out_")
+    try:
+        import cv2
+        for i in range(b):
+            img = (frames[i].numpy() * 255.0).clip(0, 255).astype(np.uint8)
+            if square:
+                img = cv2.copyMakeBorder(img, top, pad_side - h - top,
+                                         left, pad_side - w - left,
+                                         cv2.BORDER_REFLECT_101)
+            cv2.imwrite(os.path.join(in_dir, f"frame_{i:05d}.png"),
+                        cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+        print(f"[BSAI-H3/VOSR] {b}帧 {w}x{h} -> VOSR 2.0 (x{up}) ...", flush=True)
+        t0 = time.time()
+        cmd = [_vosr_python(), script, "-c", ckpt, "-i", in_dir, "-o", out_dir,
+               "-u", str(up), "--infer_steps", str(infer_steps)]
+        # onestep 脚本 (inference_vosr_onestep.py) 不支持 --cfg_scale（仅多步版
+        # inference_vosr.py 支持）。动态检测脚本源码，避免 argparse 报错导致
+        # VOSR 通道必然失败；多步版仍按用户 cfg 设置透传。
+        try:
+            with open(script, "r", encoding="utf-8", errors="replace") as _f:
+                _has_cfg = "--cfg_scale" in _f.read()
+        except OSError:
+            _has_cfg = True
+        if _has_cfg:
+            cmd += ["--cfg_scale", str(cfg_scale)]
+        proc = subprocess.run(cmd, cwd=home, capture_output=True, text=True, timeout=600)
+        if proc.returncode != 0:
+            raise RuntimeError("[BSAI-H3/VOSR] 推理失败 (exit %s)\n%s" %
+                               (proc.returncode, (proc.stderr or "")[-2000:]))
+        out_files = sorted(f2 for f2 in os.listdir(out_dir) if f2.endswith(".png"))
+        if len(out_files) < b:
+            raise RuntimeError(
+                "[BSAI-H3/VOSR] 输出帧数不足: %d/%d（returncode=%s）\n"
+                "--- VOSR stdout 尾部 ---\n%s\n--- VOSR stderr 尾部 ---\n%s"
+                % (len(out_files), b, proc.returncode,
+                   (proc.stdout or "")[-1500:], (proc.stderr or "")[-1500:]))
+        out_frames = []
+        for i in range(b):
+            img = cv2.imread(os.path.join(out_dir, out_files[i]), cv2.IMREAD_COLOR)
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            if square:
+                img = img[top * up: (top + h) * up, left * up: (left + w) * up]
+                # 保险：与目标尺寸不一致时校准（正常应恰好等于 h*up x w*up）
+                th, tw = h * up, w * up
+                if img.shape[0] != th or img.shape[1] != tw:
+                    img = cv2.resize(img, (tw, th), interpolation=cv2.INTER_LANCZOS4)
+            out_frames.append(torch.from_numpy(img.astype(np.float32) / 255.0))
+        dt = time.time() - t0
+        print(f"[BSAI-H3/VOSR] 完成 {b}帧 in {dt:.1f}s ({b/dt:.1f}fps)", flush=True)
+        return torch.stack(out_frames, dim=0)
+    finally:
+        shutil.rmtree(in_dir, ignore_errors=True)
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+def _vosr_dlss_chain(frames, vosr_scale=2, dlss_scale=2,
+                     dlss_style="Cinematic", dlss_intensity=1.0,
+                     dlss_detail=1.0, dlss_motion=True):
+    """VOSR -> DLSS 5 two-stage: VOSR adds details, DLSS amplifies + NR."""
+    sr = _vosr_upscale(frames, scale=float(vosr_scale))
+    return _dlssnr_upscale(sr, float(dlss_scale), style=dlss_style, preset="Default",
+                           intensity=float(dlss_intensity), detail=float(dlss_detail),
+                           motion=bool(dlss_motion))
+
+
+def _vosr_rtx_chain(frames, vosr_scale=2, rtx_scale=2):
+    """VOSR -> RTX two-stage（视频推荐流程：先 VOSR 2.0 去模糊生成细节，
+    再接 NVIDIA RTX 放大做二次清晰化）。"""
+    sr = _vosr_upscale(frames, scale=float(vosr_scale))
+    return _rtx_upscale(sr, float(rtx_scale))
+
+
+
+# ---------------------------------------------------------------------------
 # Main node: video frames -> AI upscaled frames
 # ---------------------------------------------------------------------------
 class BSAI_H3_Upscale4K:
@@ -1652,6 +1806,9 @@ class BSAI_H3_Upscale4K:
         "SeedVR2 7B (扩散视频超分)": "seedvr2",
         "NVIDIA RTX Video Super Res": "rtx",
         "DLSS 5 (NVIDIA 神经渲染超分)": "dlss5",
+        "VOSR 2.0 (CVPR2026生成式超分)": "vosr2",
+        "VOSR 2.0 + DLSS 5 (双引擎完美档)": "vosr_dlss",
+        "VOSR 2.0 + RTX (视频推荐两级放大)": "vosr_rtx",
     }
 
     # Generative Topaz engine options (prepended to the Real-ESRGAN model list).
@@ -1726,6 +1883,13 @@ class BSAI_H3_Upscale4K:
                 "dlss_intensity / DLSS强度": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05}),
                 "dlss_detail / DLSS细节": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05}),
                 "dlss_motion / DLSS光流": ("BOOLEAN", {"default": True}),
+                # VOSR 2.0 专属参数
+                "vosr_cfg / VOSR保真度": ("FLOAT", {"default": 0.5, "min": -2.0, "max": 2.0, "step": 0.1}),
+                "vosr_steps / VOSR步数": ("INT", {"default": 1, "min": 1, "max": 25, "step": 1}),
+                # VOSR+DLSS串联时的各自倍率
+                "vosr_scale / VOSR倍率": ("INT", {"default": 2, "min": 2, "max": 4, "step": 1}),
+                "dlss_chain_scale / DLSS串联倍率": ("INT", {"default": 2, "min": 1, "max": 3, "step": 1}),
+                "rtx_chain_scale / RTX串联倍率": ("INT", {"default": 2, "min": 1, "max": 3, "step": 1}),
             },
         }
 
@@ -1740,6 +1904,9 @@ class BSAI_H3_Upscale4K:
         "  • NVIDIA RTX Video Super Res：nvidia-vfx GPU 超分（无模型文件）\n"
         "  • DLSS 5（NVIDIA 神经渲染超分）：DLSS SR + Neural Rendering，RTX 硬件超分，\n"
         "    video2dlssnr 管道驱动（需 exe + nvngx_dlss.dll + nvngx_dlssnr.dll）\n"
+        "  • VOSR 2.0（CVPR 2026生成式超分）：DiT生成式图像超分，补全细节纹理\n"
+        "  • VOSR 2.0 + DLSS 5 双引擎：VOSR生成细节 -> DLSS硬件放大，质量+速度兼得\n"
+        "  • VOSR 2.0 + RTX 双引擎（视频推荐两级放大）：VOSR去模糊 -> RTX二次清晰化\n"
         "  • Topaz 生成式完美档：星光 2.6 / Astra 神经引擎（本机 ComfyUI/models/Topaz_Engine），\n"
         "    单节点即可达 Topaz 官方级人脸细节与纹理，后续 detail/softness/face_restore 仍可叠加。\n"
         "Unified multi-engine video super-resolution node: Real-ESRGAN fast tier, "
@@ -1809,6 +1976,38 @@ class BSAI_H3_Upscale4K:
                 images, float(scale),
                 style=dlss_style, preset="Default", intensity=float(dlss_intensity),
                 detail=float(dlss_detail), motion=bool(dlss_motion),
+                skin=0.0, color=0.0,  # 视频实测：保留肌理、避免皮肤油腻
+            )
+            eff_scale = float(out.shape[1] / float(images.shape[1]))
+            temporal_strength = 0.0
+            lr_np = None
+        elif _engine == "vosr2":
+            # --- VOSR 2.0 (CVPR 2026 generative SR) path -------------------
+            vosr_cfg = g("vosr_cfg / VOSR保真度", 0.5)
+            vosr_steps = g("vosr_steps / VOSR步数", 1)
+            out = _vosr_upscale(images, scale=float(scale),
+                                cfg_scale=float(vosr_cfg), infer_steps=int(vosr_steps))
+            eff_scale = float(out.shape[1] / float(images.shape[1]))
+            temporal_strength = 0.0
+            lr_np = None
+        elif _engine == "vosr_dlss":
+            # --- VOSR 2.0 -> DLSS 5 two-stage pipeline ---------------------
+            vosr_scale = g("vosr_scale / VOSR倍率", 2)
+            dlss_chain_scale = g("dlss_chain_scale / DLSS串联倍率", 2)
+            out = _vosr_dlss_chain(
+                images, vosr_scale=int(vosr_scale), dlss_scale=int(dlss_chain_scale),
+                dlss_style=dlss_style, dlss_intensity=float(dlss_intensity),
+                dlss_detail=float(dlss_detail), dlss_motion=bool(dlss_motion),
+            )
+            eff_scale = float(out.shape[1] / float(images.shape[1]))
+            temporal_strength = 0.0
+            lr_np = None
+        elif _engine == "vosr_rtx":
+            # --- VOSR 2.0 -> RTX 两级放大（视频推荐：先 VOSR 去模糊，再接 RTX 二次清晰化）--
+            vosr_scale = g("vosr_scale / VOSR倍率", 2)
+            rtx_chain_scale = g("rtx_chain_scale / RTX串联倍率", 2)
+            out = _vosr_rtx_chain(
+                images, vosr_scale=int(vosr_scale), rtx_scale=int(rtx_chain_scale),
             )
             eff_scale = float(out.shape[1] / float(images.shape[1]))
             temporal_strength = 0.0
@@ -2686,14 +2885,14 @@ class BSAI_H3_DLSS5:
                 "intensity / 强度": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05}),
                 "local_structure / 局部结构": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05}),
                 "local_tone / 局部色调": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05}),
-                "skin / 皮肤": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 2.0, "step": 0.05,
-                                          "tooltip": "-1 = 模型默认"}),
+                "skin / 皮肤": ("FLOAT", {"default": 0.0, "min": -1.0, "max": 2.0, "step": 0.05,
+                                          "tooltip": "0=保留原图肌肤肌理感（视频实测建议）；>0=加强皮肤处理；<0=模型默认"}),
                 "global_tone / 全局色调": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 2.0, "step": 0.05,
                                                      "tooltip": "<0 = 模型默认"}),
                 "detail / 细节": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05,
-                                            "tooltip": "0 = 纯超分不加细节，1 = 全量神经渲染"}),
-                "color / 色彩": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05,
-                                           "tooltip": "0 = 保持原色相，1 = 采用 NR 色彩"}),
+                                            "tooltip": "0 = 纯超分不加细节，1 = 全量神经渲染（视频实测建议 1 或更高）"}),
+                "color / 色彩": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05,
+                                           "tooltip": "0 = 保持原色相（视频实测：开 1 皮肤油腻，建议 0）；1 = 采用 NR 色彩"}),
                 "motion / 光流运动矢量": ("BOOLEAN", {"default": True,
                                                        "tooltip": "光流运动矢量 -> 时序稳定防闪烁"}),
                 "motion_engine / 光流引擎": (["auto", "nvof", "lk"], {"default": "auto",

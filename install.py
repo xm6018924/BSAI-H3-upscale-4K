@@ -20,6 +20,7 @@ BSAI-H3-upscale-4K — 一键环境自检 + 自动补齐安装器
      空电脑直连 GitHub 超时时自动回退 ghproxy / gitclone 等镜像，最多每镜像重试 3 次）
   7. DLSS5 运行时：本地已有整合包 -> 自动复制；缺失 -> 给出获取指引
   8. Topaz 引擎：商业软件，仅检测提示，不自动获取
+  9. VOSR 2.0 (CVPR 2026)：git clone仓库 + pip依赖 + modelscope/huggingface自动下载权重
 
 退出码说明
   仅核心项（1~5、7）失败才返回 1；可选项（6 引擎插件、8 Topaz）未就绪返回 0 并标 ⚠️，
@@ -551,6 +552,136 @@ def check_topaz():
     return False, True  # 未就绪但属于可选
 
 
+
+# ---------------------------------------------------------------------------
+# 9) VOSR 2.0 (CVPR 2026) 自动安装
+# ---------------------------------------------------------------------------
+VOSR_REPO_URL = "https://github.com/cswry/VOSR.git"
+VOSR_HOME_DEFAULT = r"C:\BSAI\VOSR"
+
+# ModelScope 模型仓库ID（优先，国内直连）
+VOSR_MODELSCOPE_ID = "cswry/VOSR"
+# HuggingFace 模型仓库ID（备选）
+VOSR_HF_ID = "cswry/VOSR"
+
+
+def check_vosr(no_git):
+    """自动安装 VOSR 2.0: clone仓库 + pip依赖 + 下载模型权重。"""
+    print(f"\n{TAG} == 9/9 VOSR 2.0 (CVPR 2026 生成式超分) ==")
+
+    # 确定VOSR目录（优先 env，其次 ComfyUI/models/VOSR，最后默认 C:\BSAI\VOSR）
+    vosr_home = os.environ.get("VOSR_HOME", "").strip().strip('"')
+    if vosr_home:
+        vosr_home = os.path.abspath(vosr_home)
+    else:
+        cands = [os.path.join(models_dir(), "VOSR"), VOSR_HOME_DEFAULT]
+        vosr_home = next((os.path.abspath(c) for c in cands if os.path.isdir(c)),
+                         os.path.abspath(cands[0]))
+
+    # 1) 检查是否已安装
+    infer_script = os.path.join(vosr_home, "inference_vosr_onestep.py")
+    ckpt_dir = os.path.join(vosr_home, "preset", "ckpts", "VOSR2")
+    if os.path.isfile(infer_script) and os.path.isdir(ckpt_dir) and os.listdir(ckpt_dir):
+        print(f"{TAG} VOSR 2.0 已就绪: {vosr_home}")
+        print(f"{TAG}   推理脚本: {infer_script}")
+        print(f"{TAG}   模型权重: {ckpt_dir}")
+        return True, True  # (ok, optional)
+
+    # 2) Clone VOSR仓库
+    if not os.path.isfile(infer_script):
+        if no_git:
+            print(f"{TAG} [跳过] --no-git，VOSR仓库未克隆")
+            print(f"{TAG}         手动: git clone --depth 1 {VOSR_REPO_URL} {vosr_home}")
+            return False, True
+        if not git_available():
+            print(f"{TAG} [跳过] 未找到 git，无法自动克隆VOSR仓库")
+            print(f"{TAG}         手动: git clone --depth 1 {VOSR_REPO_URL} {vosr_home}")
+            return False, True
+        print(f"{TAG} [clone] VOSR仓库 -> {vosr_home} ...")
+        ok, err = git_clone_with_retry(VOSR_REPO_URL, vosr_home)
+        if not ok:
+            print(f"{TAG} [失败] VOSR仓库克隆失败: {err}")
+            print(f"{TAG}         手动: git clone --depth 1 {VOSR_REPO_URL} {vosr_home}")
+            return False, True
+        print(f"{TAG} [完成] VOSR仓库已克隆")
+
+    # 3) 安装Python依赖
+    req_file = os.path.join(vosr_home, "requirements.txt")
+    if os.path.isfile(req_file):
+        print(f"{TAG} [pip] 安装VOSR依赖 ...")
+        r = run([sys.executable, "-m", "pip", "install", "--quiet",
+                 "--disable-pip-version-check",
+                 "-r", req_file], timeout=600)
+        if r.returncode == 0:
+            print(f"{TAG} VOSR依赖安装完成")
+        else:
+            print(f"{TAG} [警告] VOSR依赖安装失败（rc={r.returncode}），可手动:")
+            print(f"{TAG}         {sys.executable} -m pip install -r {req_file}")
+
+    # 4) 下载模型权重
+    if not os.path.isdir(ckpt_dir) or not os.listdir(ckpt_dir):
+        print(f"{TAG} [下载] VOSR 2.0 模型权重 -> {ckpt_dir} ...")
+        os.makedirs(ckpt_dir, exist_ok=True)
+
+        # 优先使用 modelscope（国内直连）
+        ms_ok = False
+        try:
+            # 检查modelscope是否可用
+            r = run([sys.executable, "-c", "import modelscope; print('ok')"], timeout=30)
+            if r.returncode == 0:
+                print(f"{TAG} [modelscope] 下载VOSR权重 ...")
+                r = run([
+                    sys.executable, "-m", "modelscope", "download",
+                    "--model", VOSR_MODELSCOPE_ID,
+                    "--local_dir", os.path.join(vosr_home, "preset", "ckpts"),
+                ], timeout=1800)
+                if r.returncode == 0:
+                    ms_ok = True
+                    print(f"{TAG} modelscope下载完成")
+                else:
+                    print(f"{TAG} [警告] modelscope下载失败: {(r.stdout or '')[-300:]}")
+        except Exception as e:
+            print(f"{TAG} [警告] modelscope不可用: {e}")
+
+        # 备选: huggingface_hub
+        if not ms_ok:
+            try:
+                r = run([sys.executable, "-c", "import huggingface_hub; print('ok')"], timeout=30)
+                if r.returncode == 0:
+                    print(f"{TAG} [huggingface] 下载VOSR权重 ...")
+                    r = run([
+                        sys.executable, "-c",
+                        f"from huggingface_hub import snapshot_download; "
+                        f"snapshot_download('{VOSR_HF_ID}', local_dir=r'{os.path.join(vosr_home, 'preset', 'ckpts')}')",
+                    ], timeout=1800)
+                    if r.returncode == 0:
+                        ms_ok = True
+                        print(f"{TAG} huggingface下载完成")
+                    else:
+                        print(f"{TAG} [警告] huggingface下载失败: {(r.stdout or '')[-300:]}")
+            except Exception as e:
+                print(f"{TAG} [警告] huggingface_hub不可用: {e}")
+
+        if not ms_ok:
+            print(f"{TAG} [待办] 模型权重自动下载失败（网络问题）")
+            print(f"{TAG}         请手动下载以下内容到 {os.path.join(vosr_home, 'preset', 'ckpts')}:")
+            print(f"{TAG}         - VOSR2/ (VOSR 2.0 one-step 1.4B模型)")
+            print(f"{TAG}         - Qwen-Image-vae-2d/ (Qwen VAE 2D)")
+            print(f"{TAG}         - torch_cache/ (DINOv2权重)")
+            print(f"{TAG}         下载: https://modelscope.cn/models/{VOSR_MODELSCOPE_ID}")
+            print(f"{TAG}         或: https://huggingface.co/{VOSR_HF_ID}")
+            return False, True
+
+    # 5) 复查
+    if os.path.isfile(infer_script) and os.path.isdir(ckpt_dir) and os.listdir(ckpt_dir):
+        print(f"{TAG} VOSR 2.0 安装完成!")
+        print(f"{TAG}   目录: {vosr_home}")
+        print(f"{TAG}   权重: {ckpt_dir}")
+        return True, True
+
+    print(f"{TAG} [待办] VOSR权重未就位，请手动下载到 {ckpt_dir}")
+    return False, True
+
 # ---------------------------------------------------------------------------
 # 主流程
 # ---------------------------------------------------------------------------
@@ -582,6 +713,7 @@ def main():
     results["6_引擎插件"] = check_engine_plugins(no_git)
     results["7_DLSS5"] = (check_dlss5(extra_dirs, dlss5_full), False)
     results["8_Topaz(可选)"] = check_topaz()
+    results["9_VOSR2.0(可选)"] = check_vosr(no_git)
 
     print(f"\n{TAG} ============ 汇总 ============")
     for k, (ok, optional) in results.items():

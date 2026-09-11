@@ -79,6 +79,7 @@ ComfyUI/models/
 
 ## 🎛️ 功能与引擎
 
+- **自动路由**：按内容/输入一键选引擎（质量/速度/人像/动漫/UHD 五档偏好 + 人脸/分辨率自动感知），对标 HitPaw VikPea 模型选择器
 - **像素域超分**：Real-ESRGAN 系（x4plus / anime / general）+ 光流时域增强 + 批量帧
 - **扩散视频超分**：FlashVSR-v1.1 / SeedVR2 7B（fp8 numz 路径 + **INT8 ComfyUI 原生路径**双引擎）
 - **硬件超分**：NVIDIA RTX Video Super Res / DLSS 5 神经渲染（RTX 显卡最快 4K 路线）

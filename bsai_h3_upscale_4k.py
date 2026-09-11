@@ -1508,8 +1508,11 @@ def _seedvr2_native_upscale(frames, scale, seed=42, steps=8, cfg=1.0,
     # ---- 预处理（pad 16 + 补帧 4n+1，官方 SeedVR2Preprocess） ----
     padded = _ns._seedvr2_pad(ref[0], min(th, tw), "BSAI_SeedVR2Int8")[0]  # (1,T',H',W',C)
 
-    # ---- VAE encode -> (1,16,T,H,W) ----
-    latent = vae.encode(padded)
+    # ---- VAE encode（显式 256 tile，seedvr 专用 tiled_vae，显存可控） ----
+    # no_grad：seedvr tiled_vae 内含 inplace 混合（tile_out.mul_），
+    # autograd 追踪下会报 AliasBackward0 视图错误，推理阶段无需梯度。
+    with torch.no_grad():
+        latent = vae.encode_tiled(padded, tile_x=256, tile_y=256, overlap=32)
 
     # ---- conditioning（官方 SeedVR2Conditioning 逻辑） ----
     cond_latent = latent.movedim(1, -1).contiguous()                  # (1,T,H,W,16)
@@ -1526,8 +1529,18 @@ def _seedvr2_native_upscale(frames, scale, seed=42, steps=8, cfg=1.0,
         positive, negative, latent, denoise=1.0, seed=seed,
     )
 
-    # ---- VAE decode ----
-    decoded = vae.decode(out_latent)
+    # ---- 采样完成：卸载 7B DiT，给 VAE decode 腾出显存 ----
+    # （否则 decode 整张 OOM 后 ComfyUI 会回退到 32x32 微型 tile，慢到分钟级）
+    try:
+        model_management.unload_all_models()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+    # ---- VAE decode（显式 256 tile，seedvr 专用 tiled_vae，显存可控） ----
+    with torch.no_grad():
+        decoded = vae.decode_tiled(out_latent, tile_x=256, tile_y=256, overlap=32)
 
     # ---- 后处理（官方 SeedVR2PostProcessing：颜色校正 + 对齐裁回） ----
     out = _ns.SeedVR2PostProcessing.execute(decoded, ref, color_correction)[0]

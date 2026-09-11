@@ -29,8 +29,9 @@ MiniMax H3 视频/图片 **AI 超分 4K 插件**（ComfyUI 像素域 + 潜空间
 |---|---|---|---|
 | **FlashVSR-v1.1** | `FlashVSR-v1.1/` 整个文件夹：`LQ_proj_in.ckpt` + `TCDecoder.ckpt` + `diffusion_pytorch_model_streaming_dmd.safetensors` + `Wan2.1_VAE.pth` | 6.5 GB | https://huggingface.co/JunhaoZhuang/FlashVSR （下载整个 FlashVSR 文件夹） |
 | FlashVSR 提示词嵌入 | 插件仓库内 `posi_prompt.pth`（随 git clone 自带，无需单独下载） | 4.2 MB | ✅ git clone 自带 |
-| **SeedVR2 7B** | `SEEDVR2/seedvr2_ema_7b_fp8_e4m3fn_mixed_block35_fp16.safetensors` | 7.9 GB | https://huggingface.co/numz/SeedVR2_comfyUI |
-| SeedVR2 VAE | `SEEDVR2/ema_vae_fp16.safetensors` | 478 MB | https://huggingface.co/numz/SeedVR2_comfyUI |
+| **SeedVR2 7B (fp8, numz)** | `SEEDVR2/seedvr2_ema_7b_fp8_e4m3fn_mixed_block35_fp16.safetensors` | 7.9 GB | https://huggingface.co/numz/SeedVR2_comfyUI |
+| SeedVR2 7B (INT8, ComfyUI 原生) | `diffusion_models/seedvr2_7b_int8_convrot.safetensors`（新引擎「SeedVR2 7B INT8」自动查找，优先于此文件，其次 `diffusion_models/` 其它 seedvr2、最后 `SEEDVR2/`） | 7.9 GB | Comfy-Org 转换包：https://huggingface.co/Comfy-Org/SeedVR2_comfyui_repackaged （ComfyUI 原生量化格式，插件走原生 NaDiT 链加载） |
+| SeedVR2 VAE | `SEEDVR2/ema_vae_fp16.safetensors`（原生引擎自动查找：`SEEDVR2/` → `vae/seedvr2_ema_vae_fp16.safetensors` → `vae/ema_vae_fp16.safetensors`；三者哈希相同） | 478 MB | https://huggingface.co/numz/SeedVR2_comfyUI |
 | SeedVR2 文本嵌入 | 插件仓库内 `pos_emb.pt` + `neg_emb.pt`（随 git clone 自带） | 1.3 MB | ✅ git clone 自带 |
 | **DLSS 5 运行时** | `DLSS5/video2dlssnr.exe` | 429 KB | https://github.com/DaniilSokolyuk/video2dlssnr/releases/download/v1.2/video2dlssnr_release_light.zip （仅 exe） |
 | DLSS 5 NVIDIA DLL | `DLSS5/nvngx_dlss.dll` + `nvngx_dlssnr.dll` + `nvngx.dll_dlssnr.dll` | 227 MB | NVIDIA 专有运行时，来自本地 DLSS5 整合包 / NVIDIA 官方；或用全量包：https://github.com/DaniilSokolyuk/video2dlssnr/releases/download/v1.2/video2dlssnr_release.zip （含 DLL，约 247 MB） |
@@ -58,6 +59,8 @@ ComfyUI/models/
 ├── latent_upscale_models/     minimax_h3_latent_upscaler_3d_fp16.safetensors
 ├── FlashVSR-v1.1/             LQ_proj_in.ckpt / TCDecoder.ckpt / DMD safetensors / Wan2.1_VAE.pth
 ├── SEEDVR2/                   seedvr2_ema_7b_fp8_...safetensors / ema_vae_fp16.safetensors
+├── diffusion_models/          seedvr2_7b_int8_convrot.safetensors（INT8 原生引擎用）
+├── vae/                       seedvr2_ema_vae_fp16.safetensors（与 SEEDVR2 内同文件）
 ├── DLSS5/                     video2dlssnr.exe / nvngx_dlss.dll / nvngx_dlssnr.dll / nvngx.dll_dlssnr.dll
 ├── VOSR/                      inference_vosr_onestep.py + preset/ckpts/（VOSR2 / Qwen VAE / SD2.1 VAE / torch_cache）
 └── Topaz_Engine/              neuroserver171/neuroserver.exe + models/
@@ -77,7 +80,7 @@ ComfyUI/models/
 ## 🎛️ 功能与引擎
 
 - **像素域超分**：Real-ESRGAN 系（x4plus / anime / general）+ 光流时域增强 + 批量帧
-- **扩散视频超分**：FlashVSR-v1.1 / SeedVR2 7B
+- **扩散视频超分**：FlashVSR-v1.1 / SeedVR2 7B（fp8 numz 路径 + **INT8 ComfyUI 原生路径**双引擎）
 - **硬件超分**：NVIDIA RTX Video Super Res / DLSS 5 神经渲染（RTX 显卡最快 4K 路线）
 - **生成式超分**：VOSR 2.0（CVPR 2026，模糊图→清晰，海报文字还原最强）+ 双引擎组合
   - `VOSR 2.0 + DLSS 5（双引擎完美档）`：VOSR 生成细节 → DLSS 硬件放大
@@ -89,6 +92,15 @@ ComfyUI/models/
 ---
 
 ## 📝 更新日志
+
+### v2.6.0 — SeedVR2 7B INT8 (ComfyUI 原生) 引擎 + 模型路径自动加载
+- **背景**：用户新下载 `models/diffusion_models/seedvr2_7b_int8_convrot.safetensors`（Comfy-Org INT8 量化，7.9GB）与 `models/vae/seedvr2_ema_vae_fp16.safetensors`
+- **兼容性核查结论**：VAE 与现有 `SEEDVR2/ema_vae_fp16.safetensors` **哈希完全一致**（同一文件）；INT8 权重含 `comfy_quant`/`weight_scale` + I8/U8 量化层（288 层），**numz 插件加载器无法读取**（strict=False 会静默丢权重），但 **ComfyUI 原生链（comfy.sd.load_diffusion_model + quant_ops）完整支持**（实测识别为 NaDiT 8.24B 全量加载）
+- **新增引擎**「SeedVR2 7B INT8 (ComfyUI原生)」：走 ComfyUI 官方 NaDiT + KSampler 采样链，推理流程 1:1 对齐 `comfy_extras/nodes_seedvr.py`（pad16 + 补帧 4n+1 → VAE tiled encode → conditioning → sample → tiled decode → lab/wavelet/adain 颜色校正）
+- **模型路径自动加载**：DIT 自动查找 `diffusion_models/seedvr2_7b_int8_convrot.safetensors`（INT8 优先）→ `diffusion_models/` 其它 seedvr2 → `SEEDVR2/` fp8；VAE 自动查找 `SEEDVR2/` → `vae/seedvr2_ema_vae_fp16.safetensors` → `vae/ema_vae_fp16.safetensors`
+- 新参数：`sv2_steps / SeedVR2步数`（默认 8）、`sv2_cfg / SeedVR2保真度`（默认 1.0）、`sv2_sampler / SeedVR2采样器`、`sv2_scheduler / SeedVR2调度器`、`sv2_color / SeedVR2色彩校正`（默认 lab）
+- 工程细节：采样后主动卸载 7B DiT 释放显存，VAE encode/decode 显式 256 tile（避免整张 OOM 回退 32x32 超慢 tile），tiled 阶段包 `torch.no_grad()`（规避 seedvr tiled_vae 的 inplace 视图冲突）
+- 实测：320×448 2 帧 → 640×896（8 步）32.7s，PSNR 31.0dB vs 双三次（结构完整保留）
 
 ### v2.5.0 — 结合视频实测优化：VOSR 通道修复 + DLSS5 参数对齐 + VOSR+RTX 组合
 - **依据**：B 站《低配必看！VOSR 遇上 DLSS5：如何用超分放大技术白嫖极致画质？》（BV1WBYV6hEXa）实测结论落地

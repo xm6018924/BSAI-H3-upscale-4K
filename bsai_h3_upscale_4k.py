@@ -1396,6 +1396,155 @@ def _seedvr2_upscale(frames, scale, seed=42):
     return frames
 
 
+def _seedvr2_native_upscale(frames, scale, seed=42, steps=8, cfg=1.0,
+                            sampler_name="euler", scheduler="normal",
+                            color_correction="lab"):
+    """SeedVR2 7B INT8 —— ComfyUI 原生链（NaDiT + 官方量化加载）。
+
+    针对 ComfyUI 官方转换的 INT8 量化权重（models/diffusion_models/ 下，
+    如 seedvr2_7b_int8_convrot.safetensors）：numz 插件（自定义 NaDiT
+    加载器）无法读取其 comfy_quant / weight_scale 量化层（strict=False
+    会静默丢弃 288 层权重、输出垃圾），故本路径改用 ComfyUI 原生加载链：
+      comfy.sd.load_diffusion_model -> 自动识别 seedvr2 + 反量化 INT8
+      comfy.sd.VAE                  -> 自动识别 SeedVR2 VAE
+      采样走 comfy.sample.sample（官方 KSampler 流程）
+    推理流程 1:1 对齐 ComfyUI 官方节点 comfy_extras/nodes_seedvr.py：
+      pad(16) + 补帧(4n+1) -> VAE encode -> conditioning -> sample -> decode
+      -> 颜色校正 + 对齐裁回目标分辨率。
+
+    权重自动查找（多路径，任一命中即用）：
+      DIT: models/diffusion_models/seedvr2_7b_int8_convrot.safetensors (INT8, 优先)
+           -> diffusion_models/ 下其它 seedvr2_*.safetensors
+           -> models/SEEDVR2/seedvr2_ema_7b_*.safetensors (官方 fp8/fp16, 原生亦可载)
+      VAE: models/SEEDVR2/ema_vae_fp16.safetensors
+           -> models/vae/seedvr2_ema_vae_fp16.safetensors
+           -> models/vae/ema_vae_fp16.safetensors
+    """
+    import comfy.sd, comfy.sample, comfy.utils
+    try:
+        import comfy_extras.nodes_seedvr as _ns
+    except Exception as _e:
+        _ns = None
+    if _ns is None:
+        raise RuntimeError(
+            "SeedVR2 原生节点不可用：请确认 ComfyUI 已内置 comfy_extras/nodes_seedvr.py\n"
+            f"（错误: {_e}）")
+
+    models_dir = folder_paths.models_dir
+    diffusion_dir = os.path.join(models_dir, "diffusion_models")
+    seedvr_dir = os.path.join(models_dir, "SEEDVR2")
+    vae_dir = os.path.join(models_dir, "vae")
+
+    def _scan(d):
+        try:
+            return sorted(f for f in os.listdir(d)
+                          if f.startswith("seedvr2") and f.endswith(".safetensors"))
+        except OSError:
+            return []
+
+    # ---- DIT 权重自动查找（INT8 convrot 优先） ----
+    cand_dit = [os.path.join(diffusion_dir, "seedvr2_7b_int8_convrot.safetensors")]
+    for d in (diffusion_dir, seedvr_dir):
+        for fn in _scan(d):
+            p = os.path.join(d, fn)
+            if p not in cand_dit:
+                cand_dit.append(p)
+    dit_path = next((p for p in cand_dit if os.path.isfile(p)), None)
+    if dit_path is None:
+        raise RuntimeError(
+            "SeedVR2 INT8 权重缺失 / SeedVR2 INT8 weights missing:\n"
+            "  已查找:\n    " + "\n    ".join(cand_dit) + "\n"
+            "  下载 / Download: https://huggingface.co/Comfy-Org/SeedVR2_comfyui_repackaged\n"
+            "  （或使用现有 fp8/fp16 权重: seedvr2_ema_7b_fp8_e4m3fn_mixed_block35_fp16.safetensors）")
+
+    # ---- VAE 权重自动查找（SEEDVR2 -> vae） ----
+    cand_vae = [
+        os.path.join(seedvr_dir, "ema_vae_fp16.safetensors"),
+        os.path.join(vae_dir, "seedvr2_ema_vae_fp16.safetensors"),
+        os.path.join(vae_dir, "ema_vae_fp16.safetensors"),
+    ]
+    vae_path = next((p for p in cand_vae if os.path.isfile(p)), None)
+    if vae_path is None:
+        raise RuntimeError(
+            "SeedVR2 VAE 缺失 / SeedVR2 VAE missing:\n"
+            "  已查找:\n    " + "\n    ".join(cand_vae) + "\n"
+            "  下载 / Download: https://huggingface.co/numz/SeedVR2_comfyUI (ema_vae_fp16.safetensors)")
+
+    # Aggressive VRAM cleanup before 7B DiT + VAE (~18GB)
+    try:
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+            torch.cuda.synchronize()
+    except Exception:
+        pass
+
+    # ---- 加载（原生链自动识别 + INT8 反量化） ----
+    model = comfy.sd.load_diffusion_model(dit_path)
+    vae = comfy.sd.VAE(sd=comfy.utils.load_torch_file(vae_path))
+    vae.patcher.cached_patcher_init = (comfy.sd.load_vae_patcher, (vae_path, None, None))
+
+    # ---- 目标分辨率（偶数对齐） ----
+    h0, w0 = frames.shape[1], frames.shape[2]
+    th = max(16, int(round(h0 * float(scale))) - int(round(h0 * float(scale))) % 2)
+    tw = max(16, int(round(w0 * float(scale))) - int(round(w0 * float(scale))) % 2)
+
+    # ---- 双三次放大到目标分辨率（模型输入 + 颜色参考） ----
+    if isinstance(frames, np.ndarray):
+        frames_t = torch.from_numpy(frames).to(torch.float32)
+    else:
+        frames_t = frames.float()
+    was_4d = frames_t.ndim == 4
+    if was_4d:
+        frames_t = frames_t.unsqueeze(0)                  # (1,T,H,W,C)
+    bt, t, h, w, c = frames_t.shape
+    ref = F.interpolate(
+        frames_t.permute(0, 1, 4, 2, 3).reshape(-1, c, h, w),
+        size=(th, tw), mode="bicubic", align_corners=False,
+    ).reshape(bt, t, c, th, tw).permute(0, 1, 3, 4, 2).contiguous()   # (1,T,th,tw,C)
+
+    # ---- 预处理（pad 16 + 补帧 4n+1，官方 SeedVR2Preprocess） ----
+    padded = _ns._seedvr2_pad(ref[0], min(th, tw), "BSAI_SeedVR2Int8")[0]  # (1,T',H',W',C)
+
+    # ---- VAE encode -> (1,16,T,H,W) ----
+    latent = vae.encode(padded)
+
+    # ---- conditioning（官方 SeedVR2Conditioning 逻辑） ----
+    cond_latent = latent.movedim(1, -1).contiguous()                  # (1,T,H,W,16)
+    mask = cond_latent.new_ones(cond_latent.shape[:-1] + (1,))
+    condition = torch.cat((cond_latent, mask), dim=-1).movedim(-1, 1)  # (1,17,T,H,W)
+    dm = model.model.diffusion_model
+    positive = [[dm.positive_conditioning.unsqueeze(0), {"condition": condition}]]
+    negative = [[dm.negative_conditioning.unsqueeze(0), {"condition": condition}]]
+
+    # ---- 采样（官方 KSampler 流程） ----
+    noise = comfy.sample.prepare_noise(latent, seed)
+    out_latent = comfy.sample.sample(
+        model, noise, steps, cfg, sampler_name, scheduler,
+        positive, negative, latent, denoise=1.0, seed=seed,
+    )
+
+    # ---- VAE decode ----
+    decoded = vae.decode(out_latent)
+
+    # ---- 后处理（官方 SeedVR2PostProcessing：颜色校正 + 对齐裁回） ----
+    out = _ns.SeedVR2PostProcessing.execute(decoded, ref, color_correction)[0]
+    if out.ndim == 5:
+        out = out[0]
+    out = out.float().clamp(0, 1)
+
+    # ---- 释放 ~18GB 显存给后续节点 ----
+    try:
+        model_management.unload_all_models()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+    return out
+
+
 def _rtx_upscale(frames, scale, quality="超高"):
     """NVIDIA RTX Video Super Resolution (nvidia-vfx, no model files)."""
     import importlib
@@ -1804,6 +1953,7 @@ class BSAI_H3_Upscale4K:
     ENGINE_OPTIONS = {
         "FlashVSR-v1.1 (扩散视频超分)": "flashvsr",
         "SeedVR2 7B (扩散视频超分)": "seedvr2",
+        "SeedVR2 7B INT8 (ComfyUI原生)": "seedvr2_int8",
         "NVIDIA RTX Video Super Res": "rtx",
         "DLSS 5 (NVIDIA 神经渲染超分)": "dlss5",
         "VOSR 2.0 (CVPR2026生成式超分)": "vosr2",
@@ -1890,6 +2040,16 @@ class BSAI_H3_Upscale4K:
                 "vosr_scale / VOSR倍率": ("INT", {"default": 2, "min": 2, "max": 4, "step": 1}),
                 "dlss_chain_scale / DLSS串联倍率": ("INT", {"default": 2, "min": 1, "max": 3, "step": 1}),
                 "rtx_chain_scale / RTX串联倍率": ("INT", {"default": 2, "min": 1, "max": 3, "step": 1}),
+                # SeedVR2 7B INT8 (ComfyUI 原生) 专属参数：走 ComfyUI 官方 NaDiT
+                # 采样链（comfy.sample.sample），对齐官方 KSampler 配置。
+                # 权重自动查找：diffusion_models/seedvr2_7b_int8_convrot.safetensors
+                # (INT8 优先) → 其它 seedvr2_*.safetensors → SEEDVR2/；VAE 自动查找
+                # SEEDVR2/ → vae/seedvr2_ema_vae_fp16.safetensors → vae/ema_vae_fp16。
+                "sv2_steps / SeedVR2步数": ("INT", {"default": 8, "min": 1, "max": 100, "step": 1}),
+                "sv2_cfg / SeedVR2保真度": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.1}),
+                "sv2_sampler / SeedVR2采样器": (["euler", "dpmpp_2m", "dpmpp_2m_sde", "ddim", "uni_pc"], {"default": "euler"}),
+                "sv2_scheduler / SeedVR2调度器": (["normal", "karras", "simple", "sgm_uniform"], {"default": "normal"}),
+                "sv2_color / SeedVR2色彩校正": (["lab", "wavelet", "adain", "none"], {"default": "lab"}),
             },
         }
 
@@ -1959,6 +2119,22 @@ class BSAI_H3_Upscale4K:
         elif _engine == "seedvr2":
             # --- SeedVR2 7B diffusion path ----------------------------------
             out = _seedvr2_upscale(images, scale)
+            eff_scale = float(out.shape[1] / float(images.shape[1]))
+            temporal_strength = 0.0
+            lr_np = None
+        elif _engine == "seedvr2_int8":
+            # --- SeedVR2 7B INT8 (ComfyUI 原生链) path ----------------------
+            sv2_steps = g("sv2_steps / SeedVR2步数", 8)
+            sv2_cfg = g("sv2_cfg / SeedVR2保真度", 1.0)
+            sv2_sampler = g("sv2_sampler / SeedVR2采样器", "euler")
+            sv2_scheduler = g("sv2_scheduler / SeedVR2调度器", "normal")
+            sv2_color = g("sv2_color / SeedVR2色彩校正", "lab")
+            out = _seedvr2_native_upscale(
+                images, float(scale), seed=42,
+                steps=int(sv2_steps), cfg=float(sv2_cfg),
+                sampler_name=sv2_sampler, scheduler=sv2_scheduler,
+                color_correction=sv2_color,
+            )
             eff_scale = float(out.shape[1] / float(images.shape[1]))
             temporal_strength = 0.0
             lr_np = None

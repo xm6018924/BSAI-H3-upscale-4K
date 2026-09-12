@@ -1,5 +1,59 @@
 # BSAI-H3-upscale-4K
 
+> **English overview — full details in Chinese sections below. / 英文概览，详细中文说明见下文。**
+
+**AI 4K Upscale plugin for MiniMax H3 video/images** (ComfyUI pixel-domain + latent-space dual channel, very fast).
+
+One-click upscale of H3 720P videos / low-res images to 4K, with **Real-ESRGAN / FlashVSR / SeedVR2 / NVIDIA RTX / DLSS 5 / VOSR 2.0 / Topaz** engines, optical-flow temporal enhancement, face restore, detail enhancement and batch frame processing.
+
+## Nodes
+
+| Node | Function |
+|---|---|
+| **BSAI_H3_Upscale4K** | Main upscale node: **Auto-Routing** (5 preference presets: Quality / Speed / Portrait / Anime / UHD) with automatic face & resolution detection; pixel-domain engines + optical-flow temporal detail + face restore |
+| **BSAI_H3_Upscale4K_Latent** | Latent-space upsampling (H3 Latent 3D Upscaler) during generation stage |
+| **BSAI_H3_FaceRestore** | Face restore: GFPGAN / CodeFormer with YOLOv8-Face detection, small-face adaptive enhancement, temporal stabilization |
+| **BSAI_H3_DLSS5** | DLSS 5 neural-render upscale (NVIDIA, fastest 4K path on RTX) |
+| **BSAI Topaz Engine Face Restore** | Topaz commercial engine face restore |
+
+## Engines
+
+- **Auto-Routing**: one-click engine selection by content/input (Quality→SeedVR2 fp8 / Speed / Portrait / Anime / UHD presets + face/resolution auto-detect), inspired by HitPaw VikPea's model selector
+- **Pixel-domain**: Real-ESRGAN family (x4plus / anime / general) + optical-flow temporal enhancement + batch frames
+- **Diffusion video**: FlashVSR-v1.1 / SeedVR2 7B (fp8 numz path + **INT8 ComfyUI-native path** dual engines)
+- **Hardware**: NVIDIA RTX Video Super Res / DLSS 5 neural rendering
+- **Generative**: VOSR 2.0 (CVPR 2026, blur→clear, best for poster text restoration) + engine combos (VOSR+DLSS5 perfect, VOSR+RTX for video)
+- **Face restore**: GFPGAN / CodeFormer (YOLOv8-Face detection)
+- **Latent**: H3 Latent 3D Upscaler
+- **Topaz**: commercial engine integration
+
+## Key Parameters (main node)
+
+`model_name` (incl. **auto routing**), `scale` (1-8), `tile_size`, `tile_pad`, `batch_frames`, `use_fp16`, `use_compile`, `temporal_strength`, `detail_amount`, `detail_radius`, `softness`, `detail_mode`, `face_restore`, `face_det_conf`, `face_blend`, `face_fidelity`, `face_temporal` (0.50 default), `input_adaptive` (auto), `auto_prefer` (quality/speed/portrait/anime/UHD), SeedVR2: `sv2_steps` (12), `sv2_cfg` (1.2), `sv2_sampler`, `sv2_scheduler`, `sv2_color` (lab), DLSS5: `dlss_style`/`dlss_intensity`/`dlss_detail`/`dlss_motion`.
+
+## Quick Start
+
+1. Copy repo into `ComfyUI/custom_nodes/BSAI-H3-upscale-4K/`
+2. Install deps: `pip install numpy opencv-python spandrel onnxruntime-gpu ultralytics pillow`
+3. Download models per the Chinese table below (or run `python install.py` for auto-check & core model download)
+4. Restart ComfyUI, hard-refresh (Ctrl+F5)
+
+## Example Workflow
+
+`workflows/BSAI-H3-v2.7.0-最佳效果.json` — open in ComfyUI and run (includes sample image). Auto-routing shows its decisions in the `info` output: engine / content / preset.
+
+## Model Weights
+
+Full model list with download URLs (core + optional engines), legacy-download tips and directory quick-check — see the Chinese tables below. Mirror tip: replace `huggingface.co` with `hf-mirror.com` in China.
+
+## License
+
+Apache-2.0.
+
+---
+
+# BSAI-H3-upscale-4K
+
 MiniMax H3 视频/图片 **AI 超分 4K 插件**（ComfyUI 像素域 + 潜空间双通道，速度极快）。
 
 把 H3 生成的 720P 视频 / 低清图片一键放大到 4K，内置 **Real-ESRGAN / FlashVSR / SeedVR2 / NVIDIA RTX / DLSS 5 / VOSR 2.0 / Topaz** 多引擎，支持光流时域增强、人脸修复、细节增强、批量帧处理。

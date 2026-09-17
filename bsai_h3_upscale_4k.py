@@ -2292,6 +2292,7 @@ class BSAI_H3_Upscale4K:
     TOPAZ_OPTIONS = {
         "Topaz 星光 2.6 (生成式完美档)": "slp-26",
         "Topaz Astra (生成式)": "astra",
+        "Topaz Wonder 3.5 (生成式)": "wonder-3.5",
     }
 
     @classmethod
@@ -2401,11 +2402,13 @@ class BSAI_H3_Upscale4K:
         "  • VOSR 2.0（CVPR 2026生成式超分）：DiT生成式图像超分，补全细节纹理\n"
         "  • VOSR 2.0 + DLSS 5 双引擎：VOSR生成细节 -> DLSS硬件放大，质量+速度兼得\n"
         "  • VOSR 2.0 + RTX 双引擎（视频推荐两级放大）：VOSR去模糊 -> RTX二次清晰化\n"
-        "  • Topaz 生成式完美档：星光 2.6 / Astra 神经引擎（本机 ComfyUI/models/Topaz_Engine），\n"
+        "  • Topaz 生成式完美档：星光 2.6 / Astra / Wonder 3.5 神经引擎（本机 ComfyUI/models/Topaz_Engine），\n"
         "    单节点即可达 Topaz 官方级人脸细节与纹理，后续 detail/softness/face_restore 仍可叠加。\n"
+        "    Wonder 3.5 = Topaz Photo 图像模型（走 neuroserver/ 引擎，权重在 Topaz Labs LLC/.../models/neuroserver/wonder-all），\n"
+        "    视频输入按逐帧处理（每帧独立调用引擎，速度较慢，约1分钟/帧@512px）。\n"
         "Unified multi-engine video super-resolution node: Real-ESRGAN fast tier, "
         "FlashVSR / SeedVR2 diffusion tiers (own weight paths), NVIDIA RTX VSR, "
-        "and Topaz generative tier (Starlight 2.6 / Astra), all with our post-processing on top."
+        "and Topaz generative tier (Starlight 2.6 / Astra / Wonder 3.5), all with our post-processing on top."
     )
     def upscale(self, **kw):
         g = kw.get
@@ -3286,8 +3289,181 @@ def _topaz_run(in_path, out_path, scale, frames, w, h, strength, max_gpu_mem, mo
     raise last_err or RuntimeError('neuroserver failed after all retries')
 
 
+# ---------------------------------------------------------------------------
+# Wonder 3.5 (图像模型) —— Topaz Photo 自带神经引擎 (neuroserver/, v20260728)
+# ---------------------------------------------------------------------------
+# 验证结论 (2026-09-16):
+#   * neuroserver171 (v20260809, 星光/Astra 用) 的 wonder3-win 只在内部注册表存在,
+#     CLI 无别名, 穷举全部候选 ID 均 "Model X not found", 无法调用。
+#   * Topaz Photo 自带的 neuroserver (v20260728) 注册了 "Wonder 3.5" (应用层 ID),
+#     权重包 wonder-all (48 blob, ~7.02GB) 在本机
+#     <Topaz_Engine>/Topaz Labs LLC/Topaz Photo/models/neuroserver/wonder-all。
+#   * 该引擎中 Wonder 3.5 是"图像模型"：只接受单张图片输入（官方 ComfyUI 集成
+#     TopazImageEnhanceV2 同样只支持单张图片），视频/帧序列输入会失败。因此
+#     本插件对视频按"逐帧独立处理"接入，失去引擎内时域一致性（模型本身即如此设计）。
+
+
+def _topaz_engine_wonder():
+    """解析 Wonder 3.5 专用运行环境: (neuroserver.exe 绝对路径, 应用模型库路径)。
+
+    返回:
+        ns:    Topaz Photo 自带 neuroserver\neuroserver.exe (v20260728)
+        store: 含 wonder-all 权重包的应用模型库目录
+    """
+    eng = _topaz_engine_dir()
+    ns = os.path.join(eng, "neuroserver", "neuroserver.exe")
+    if not os.path.exists(ns):
+        raise RuntimeError(
+            f"Wonder 3.5 需要 Topaz Photo 自带引擎: {ns} 未找到。\n"
+            f"请把 Topaz Photo 安装目录下的 neuroserver 引擎包整体放到 "
+            f"ComfyUI/models/Topaz_Engine/neuroserver（含 Lib/dml/DLLs）。")
+    store_candidates = (
+        os.path.join(eng, "Topaz Labs LLC", "Topaz Photo", "models", "neuroserver"),
+        os.path.join(eng, "Topaz Labs LLC", "Topaz Photo", "models"),
+    )
+    store = None
+    for cand in store_candidates:
+        if os.path.isdir(os.path.join(cand, "wonder-all")):
+            store = cand
+            break
+    if store is None:
+        raise RuntimeError(
+            f"未找到 Wonder 3.5 权重包 wonder-all（查找于 {store_candidates}）。\n"
+            f"请确认权重位于 <Topaz_Engine>/Topaz Labs LLC/Topaz Photo/models/neuroserver/wonder-all。")
+    return ns, store
+
+
+def _topaz_run_image(in_path, out_path, scale, w, h, strength, max_gpu_mem):
+    """Wonder 3.5 单张图片模式: in_path(PNG) -> out_path(PNG)。
+
+    与视频路径的区别: 用 Photo 引擎 (neuroserver/), 模型 ID 固定 "Wonder 3.5",
+    不传 --ffmpeg-encoding（输出为 PNG，由扩展名决定容器）。
+    """
+    ns, store = _topaz_engine_wonder()
+    env = os.environ.copy()
+    ffmpeg, _ = _topaz_ffmpeg()
+    env['PATH'] = os.path.dirname(ffmpeg) + os.pathsep + env.get('PATH', '')
+    env['TOPAZ_MODEL_STORE'] = store
+    # Photo 引擎自管授权；显式清除 Video 引擎的授权/模型目录变量避免串扰
+    env.pop('TVAI_MODEL_DIR', None)
+    env.pop('TOPAZLABS_LICENSE', None)
+    env.pop('PYTHONHOME', None)
+    env.pop('PYTHONPATH', None)
+    filters = '[{"model": "Wonder 3.5", "enhancement_strength": %s}]' % strength
+    ow = int(round(w * scale)); ow += ow % 2
+    oh = int(round(h * scale)); oh += oh % 2
+
+    max_attempts = 3
+    last_err = None
+    for attempt in range(max_attempts):
+        gpu_mem = max_gpu_mem if attempt == 0 else max(8.0, max_gpu_mem - 2.0 * attempt)
+        cmd = [ns, '--once', '--input-path', in_path, '--output-path', out_path,
+               '--start-frame-idx', '0', '--end-frame-idx', '1',
+               '--max-gpu-mem', str(gpu_mem), '--filters', filters,
+               '--output-width', str(ow), '--output-height', str(oh),
+               '--upscale-factor', str(scale)]
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+        try:
+            proc = subprocess.Popen(cmd, env=env, cwd=os.path.dirname(ns),
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                    encoding='utf-8', errors='replace')
+            for line in proc.stdout:
+                line = line.rstrip()
+                if line:
+                    print("  [Topaz] " + line)
+            proc.wait()
+            if proc.returncode != 0:
+                last_err = RuntimeError(f'neuroserver failed (exit {proc.returncode})')
+                if attempt < max_attempts - 1:
+                    print(f"[BSAI-H3/Topaz] neuroserver 崩溃 (exit {proc.returncode}), 5秒后重试...")
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    time.sleep(5)
+                    continue
+                else:
+                    raise last_err
+            if not os.path.isfile(out_path):
+                last_err = RuntimeError('neuroserver produced no output file')
+                if attempt < max_attempts - 1:
+                    time.sleep(3)
+                    continue
+                else:
+                    raise last_err
+            return
+        except RuntimeError:
+            raise
+        except Exception as e:
+            last_err = e
+            if attempt < max_attempts - 1:
+                print(f"[BSAI-H3/Topaz] 异常: {e}, 重试...")
+                time.sleep(5)
+                continue
+            else:
+                raise
+    raise last_err or RuntimeError('neuroserver failed after all retries')
+
+
+def _topaz_upscale_images(frames, scale, strength, max_gpu_mem):
+    """Wonder 3.5 逐帧图像处理: (B,H,W,3) uint8 RGB -> (B,H',W',3) uint8。
+
+    Wonder 3.5 在 Photo 引擎中是图像模型，只能逐帧单张处理；每帧独立调用引擎
+    （模型权重首次推理时加载进显存）。多帧视频请预估耗时：约 1 分钟/帧(512x512
+    放大2x 实测)。
+    """
+    b, h, w, c = frames.shape
+    if c != 3:
+        raise ValueError(f"Topaz Wonder 需要 RGB 3 通道, got {c}")
+    if b < 1:
+        raise ValueError("空帧输入")
+    if b > 1:
+        print(f"[BSAI-H3/Topaz] Wonder 3.5 为图像模型，视频按逐帧处理: {b} 帧，"
+              f"约需 {b} 次引擎调用（每帧独立加载模型，较慢）...")
+    tag = uuid.uuid4().hex[:10]
+    work = os.path.join(tempfile.gettempdir(), f'topaz_wonder_{tag}')
+    os.makedirs(work, exist_ok=True)
+    ffmpeg, _ = _topaz_ffmpeg()
+    ow = int(round(w * scale)); ow += ow % 2
+    oh = int(round(h * scale)); oh += oh % 2
+    try:
+        outs = []
+        for i in range(b):
+            fin = os.path.join(work, f'f{i:06d}.png')
+            fout = os.path.join(work, f'o{i:06d}.png')
+            p = subprocess.run(
+                [ffmpeg, '-y', '-loglevel', 'error',
+                 '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-s', f'{w}x{h}', '-i', '-',
+                 '-frames:v', '1', '-pix_fmt', 'rgb24', fin],
+                input=frames[i].tobytes(), stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            if p.returncode != 0:
+                raise RuntimeError(f'ffmpeg 单帧写图失败: {p.stderr.decode(errors="replace")[:300]}')
+            t0 = time.time()
+            print(f"[BSAI-H3/Topaz] Wonder 3.5 帧 {i + 1}/{b} ({w}x{h} -> {ow}x{oh}, x{scale}) ...")
+            _topaz_run_image(fin, fout, scale, w, h, strength, max_gpu_mem)
+            pr = subprocess.run(
+                [ffmpeg, '-loglevel', 'error', '-i', fout,
+                 '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-'],
+                capture_output=True)
+            if pr.returncode != 0:
+                raise RuntimeError(f'ffmpeg 读回输出失败: {pr.stderr.decode(errors="replace")[:300]}')
+            raw = np.frombuffer(pr.stdout, dtype=np.uint8)
+            need = ow * oh * 3
+            if raw.size != need:
+                raise RuntimeError(
+                    f'Wonder 输出尺寸不符: 期望 {ow}x{oh}, 实际 {raw.size // 3} 像素'
+                    f'({raw.size // (oh * 3)}x{raw.size // (ow * 3)})')
+            outs.append(raw.reshape(oh, ow, 3))
+            print(f"[BSAI-H3/Topaz] 帧 {i + 1}/{b} 完成 ({time.time() - t0:.1f}s)")
+        return np.stack(outs)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 def _topaz_upscale(frames, fps, scale, strength, max_gpu_mem, qp=14, model_id="slp-26"):
     """frames (B,H,W,3) uint8 RGB -> Topaz engine upscaled (B,H',W',3) uint8."""
+    if model_id == 'wonder-3.5':
+        return _topaz_upscale_images(frames, scale, strength, max_gpu_mem)
     tag = uuid.uuid4().hex[:10]
     tmp = tempfile.gettempdir()
     in_v = os.path.join(tmp, f'topaz_in_{tag}.mp4')
@@ -3315,9 +3491,10 @@ class BSAI_TopazEngine_FaceRestore:
     与修复脸部细节」。
     """
 
-    TOPAZ_MODELS = ["星光 2.6", "Astra", "Astra HQ", "Astra Sharp", "Astra Fast"]
+    TOPAZ_MODELS = ["星光 2.6", "Astra", "Astra HQ", "Astra Sharp", "Astra Fast", "Wonder 3.5"]
     TOPAZ_MODEL_IDS = {"星光 2.6": "slp-26", "Astra": "astra", "Astra HQ": "astrahq",
-                       "Astra Sharp": "astrasharp", "Astra Fast": "astrafast"}
+                       "Astra Sharp": "astrasharp", "Astra Fast": "astrafast",
+                       "Wonder 3.5": "wonder-3.5"}
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -3325,7 +3502,7 @@ class BSAI_TopazEngine_FaceRestore:
             "required": {
                 "images / 图像": ("IMAGE",),
                 "model / 模型": (cls.TOPAZ_MODELS, {"default": "星光 2.6",
-                                    "tooltip": "星光2.6=默认最佳；Astra系列需≥9帧 / Starlight2.6 default, Astra needs >=9 frames"}),
+                                    "tooltip": "星光2.6=默认最佳；Astra系列需≥9帧；Wonder 3.5=图像模型逐帧处理(慢) / Starlight2.6 default, Astra needs >=9 frames, Wonder 3.5 = image model, per-frame (slow)"}),
                 "scale / 放大倍数": ("FLOAT", {"default": 2.0, "min": 1.0, "max": 4.0, "step": 0.01,
                                               "tooltip": "输出放大倍数 1-4（支持小数）/ Upscale factor 1-4 (fraction ok)"}),
                 "enhancement_strength / 增强强度": ("FLOAT", {"default": 1.0, "min": 0.5, "max": 1.5, "step": 0.1,
@@ -3351,10 +3528,12 @@ class BSAI_TopazEngine_FaceRestore:
     FUNCTION = "run"
     CATEGORY = "BSAI/H3"
     DESCRIPTION = (
-        "BSAI Topaz Engine Face Restore：调用本机 Topaz 神经引擎（星光 2.6 / Astra，\n"
-        "默认 ComfyUI/models/Topaz_Engine）生成式放大，再叠加本插件的人脸修复\n"
+        "BSAI Topaz Engine Face Restore：调用本机 Topaz 神经引擎（星光 2.6 / Astra / "
+        "Wonder 3.5，默认 ComfyUI/models/Topaz_Engine）生成式放大，再叠加本插件的人脸修复\n"
         "（保真模式）+ 细节增强。底座效果对标 Topaz 官方，在其基础上继续优化\n"
-        "脸部细节。Topaz engine tier: generative upscale (Starlight/Astra) +\n"
+        "脸部细节。Wonder 3.5 为 Topaz Photo 图像模型（引擎 neuroserver/，权重 "
+        "Topaz Labs LLC/Topaz Photo/models/neuroserver/wonder-all），视频按逐帧处理。\n"
+        "Topaz engine tier: generative upscale (Starlight/Astra/Wonder 3.5) +\n"
         "our fidelity-first face restore + optional detail/softness on top.\n"
         "参数名中英双语 / Parameters bilingual (EN / 中文)."
     )

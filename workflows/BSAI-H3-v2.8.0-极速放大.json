@@ -1,8 +1,8 @@
 {
   "id": "b2092d04-1776-42b6-b704-633a566a8f06",
   "revision": 0,
-  "last_node_id": 25,
-  "last_link_id": 31,
+  "last_node_id": 27,
+  "last_link_id": 33,
   "nodes": [
     {
       "id": 1,
@@ -61,7 +61,7 @@
         274
       ],
       "flags": {},
-      "order": 6,
+      "order": 7,
       "mode": 0,
       "inputs": [
         {
@@ -126,7 +126,7 @@
         82
       ],
       "flags": {},
-      "order": 8,
+      "order": 10,
       "mode": 0,
       "inputs": [
         {
@@ -340,7 +340,7 @@
         220
       ],
       "flags": {},
-      "order": 7,
+      "order": 8,
       "mode": 0,
       "inputs": [
         {
@@ -364,6 +364,14 @@
           "shape": 7,
           "type": "IMAGE",
           "link": null
+        },
+        {
+          "name": "prompt",
+          "type": "STRING",
+          "widget": {
+            "name": "prompt"
+          },
+          "link": 32
         }
       ],
       "outputs": [
@@ -435,11 +443,11 @@
         "Node name for S&R": "RandomNoise"
       },
       "widgets_values": [
-        573534230973248,
+        876697741036695,
         "randomize"
       ],
       "widgets_values_named": {
-        "noise_seed": 573534230973248,
+        "noise_seed": 876697741036695,
         "control_after_generate": "randomize"
       },
       "bgcolor": "rgba(0,0,0,0)"
@@ -456,7 +464,7 @@
         70
       ],
       "flags": {},
-      "order": 10,
+      "order": 12,
       "mode": 0,
       "inputs": [
         {
@@ -500,7 +508,7 @@
         326
       ],
       "flags": {},
-      "order": 11,
+      "order": 13,
       "mode": 0,
       "inputs": [
         {
@@ -551,6 +559,8 @@
         "ver": "0.36.0",
         "Node name for S&R": "SamplerCustomAdvanced"
       },
+      "widgets_values": [],
+      "widgets_values_named": {},
       "bgcolor": "rgba(0,0,0,0)"
     },
     {
@@ -565,7 +575,7 @@
         70
       ],
       "flags": {},
-      "order": 12,
+      "order": 14,
       "mode": 0,
       "inputs": [
         {
@@ -611,7 +621,7 @@
         70
       ],
       "flags": {},
-      "order": 13,
+      "order": 15,
       "mode": 0,
       "inputs": [
         {
@@ -658,7 +668,7 @@
         150
       ],
       "flags": {},
-      "order": 16,
+      "order": 18,
       "mode": 0,
       "inputs": [
         {
@@ -715,7 +725,7 @@
         288.66666666666663
       ],
       "flags": {},
-      "order": 20,
+      "order": 22,
       "mode": 0,
       "inputs": [
         {
@@ -764,7 +774,7 @@
         112
       ],
       "flags": {},
-      "order": 17,
+      "order": 19,
       "mode": 0,
       "inputs": [
         {
@@ -806,7 +816,7 @@
         26
       ],
       "flags": {},
-      "order": 9,
+      "order": 11,
       "mode": 0,
       "inputs": [
         {
@@ -835,15 +845,15 @@
       "id": 18,
       "type": "BSAI Topaz Engine Face Restore",
       "pos": [
-        1603.5372771563796,
-        -417.19469760287905
+        -553.8087881246771,
+        630.9472298965469
       ],
       "size": [
         354.749609375,
         498
       ],
       "flags": {},
-      "order": 14,
+      "order": 16,
       "mode": 0,
       "inputs": [
         {
@@ -930,15 +940,15 @@
       "id": 19,
       "type": "CreateVideo",
       "pos": [
-        2030.4278745554202,
-        -414.78935905595296
+        -174.33400085015177,
+        638.4328682667114
       ],
       "size": [
         290.909090909091,
         150
       ],
       "flags": {},
-      "order": 18,
+      "order": 20,
       "mode": 0,
       "inputs": [
         {
@@ -986,15 +996,15 @@
       "id": 20,
       "type": "SaveVideo",
       "pos": [
-        2368.580438333317,
-        -420.29322151183743
+        150.84971793736682,
+        634.862633252864
       ],
       "size": [
-        730.6836130931542,
-        601.1696074190438
+        1362.3036130931544,
+        909.7196074190438
       ],
       "flags": {},
-      "order": 21,
+      "order": 23,
       "mode": 0,
       "inputs": [
         {
@@ -1036,15 +1046,15 @@
       "id": 24,
       "type": "BSAI_H3_Upscale4K",
       "pos": [
-        3296.654982874736,
-        -402.44760195266485
+        1626.6044281747377,
+        -451.1654699825385
       ],
       "size": [
         348.41796875,
         906
       ],
       "flags": {},
-      "order": 15,
+      "order": 17,
       "mode": 0,
       "inputs": [
         {
@@ -1163,15 +1173,15 @@
       "id": 25,
       "type": "VHS_VideoCombine",
       "pos": [
-        3687.4998876708405,
-        -407.21363281460594
+        2036.54024206175,
+        -465.0224376786416
       ],
       "size": [
         555.0871725937648,
         334
       ],
       "flags": {},
-      "order": 19,
+      "order": 21,
       "mode": 0,
       "inputs": [
         {
@@ -1243,6 +1253,178 @@
           "paused": false,
           "params": {}
         }
+      },
+      "bgcolor": "rgba(0,0,0,0)"
+    },
+    {
+      "id": 26,
+      "type": "BSAI_H3_PromptTemplate",
+      "pos": [
+        -1772.1643335307629,
+        631.6227450871125
+      ],
+      "size": [
+        490,
+        578
+      ],
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "scene_image",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": null
+        },
+        {
+          "name": "ref_image_1",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": null
+        },
+        {
+          "name": "ref_image_2",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": null
+        },
+        {
+          "name": "ref_image_3",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": null
+        },
+        {
+          "name": "ref_image_4",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": null
+        },
+        {
+          "name": "ref_image_5",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": null
+        },
+        {
+          "name": "ref_image_6",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": null
+        },
+        {
+          "name": "ref_image_7",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": null
+        },
+        {
+          "name": "ref_image_8",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": null
+        },
+        {
+          "name": "ref_image_9",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "name": "prompt_output (提示词输出)",
+          "type": "STRING",
+          "links": [
+            32,
+            33
+          ]
+        },
+        {
+          "name": "template_name (模板名称)",
+          "type": "STRING",
+          "links": null
+        },
+        {
+          "name": "generation_mode (生成模式)",
+          "type": "STRING",
+          "links": null
+        },
+        {
+          "name": "description (描述)",
+          "type": "STRING",
+          "links": null
+        },
+        {
+          "name": "video_duration (视频时长)",
+          "type": "INT",
+          "links": null
+        },
+        {
+          "name": "preview_file (预览文件)",
+          "type": "STRING",
+          "links": null
+        }
+      ],
+      "properties": {
+        "aux_id": "xm6018924/BSAI-MiniMAX-H3-Prompt",
+        "ver": "294ed2b8bd6d48a9a5d66e7295ca86b40dcef273",
+        "Node name for S&R": "BSAI_H3_PromptTemplate"
+      },
+      "widgets_values": [
+        "邵氏电影风格 > 邵氏切镜类 > 邵氏暴雨剪辑·刀光快切",
+        "",
+        "",
+        ""
+      ],
+      "widgets_values_named": {
+        "template_select": "邵氏电影风格 > 邵氏切镜类 > 邵氏暴雨剪辑·刀光快切",
+        "user_customization": "",
+        "narration": "",
+        "bsai_tpl_ui": ""
+      },
+      "bgcolor": "rgba(0,0,0,0)"
+    },
+    {
+      "id": 27,
+      "type": "ShowText|pysssss",
+      "pos": [
+        -1225.6936477455063,
+        632.7295477909424
+      ],
+      "size": [
+        585,
+        874.0000000000001
+      ],
+      "flags": {},
+      "order": 9,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "text",
+          "type": "STRING",
+          "link": 33
+        }
+      ],
+      "outputs": [
+        {
+          "name": "STRING",
+          "shape": 6,
+          "type": "STRING",
+          "links": null
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfyui-custom-scripts",
+        "ver": "609f3afaa74b2f88ef9ce8d939626065e3247469",
+        "Node name for S&R": "ShowText|pysssss"
+      },
+      "widgets_values": [
+        "integrated_multimodal_description: [Shot 1] [0-4s] 1960s Shaw Brothers wuxia film style, saturated Technicolor, heavy film grain, studio bamboo forest set with painted backdrop and artificial mist. Two sword fighters clash in a tight bamboo grove — the cutting is a violent storm: a rapid montage of shots lasting half a second or less, the blade flashing faster than the eye can follow. A flurry of ultra-short shots: a hand gripping the sword hilt, eyes locking, feet pivoting on dirt, a blade slicing through bamboo leaves, sparks of metal-on-metal, a face jerking back. Each cut lands like a physical blow. The bamboo stalks whip through the foreground between cuts. The rhythm is percussive and relentless. [Shot 2] At 00:04.000 [4-8s] The montage climaxes — a rapid series of 6-frame shots of the final exchange, then one clean cut: one fighter's sword stops a millimeter from the other's throat. Sudden stillness after the storm, bamboo leaves slowly falling in the silence, mist drifting. The held breath of the fight.\n\noverall_soundscape: Metallic blade clashes in rapid succession, bamboo stalks snapping, cloth whipping, sharp exhales, the whistle of each swing, then a sudden dead silence broken by a single falling leaf.\n\nnon_diegetic_music: Machine-gun Peking opera drum and gong percussion matching every cut, accelerating to a peak, then cutting to total silence with one lingering gong resonance."
+      ],
+      "widgets_values_named": {
+        "text_0": "integrated_multimodal_description: [Shot 1] [0-4s] 1960s Shaw Brothers wuxia film style, saturated Technicolor, heavy film grain, studio bamboo forest set with painted backdrop and artificial mist. Two sword fighters clash in a tight bamboo grove — the cutting is a violent storm: a rapid montage of shots lasting half a second or less, the blade flashing faster than the eye can follow. A flurry of ultra-short shots: a hand gripping the sword hilt, eyes locking, feet pivoting on dirt, a blade slicing through bamboo leaves, sparks of metal-on-metal, a face jerking back. Each cut lands like a physical blow. The bamboo stalks whip through the foreground between cuts. The rhythm is percussive and relentless. [Shot 2] At 00:04.000 [4-8s] The montage climaxes — a rapid series of 6-frame shots of the final exchange, then one clean cut: one fighter's sword stops a millimeter from the other's throat. Sudden stillness after the storm, bamboo leaves slowly falling in the silence, mist drifting. The held breath of the fight.\n\noverall_soundscape: Metallic blade clashes in rapid succession, bamboo stalks snapping, cloth whipping, sharp exhales, the whistle of each swing, then a sudden dead silence broken by a single falling leaf.\n\nnon_diegetic_music: Machine-gun Peking opera drum and gong percussion matching every cut, accelerating to a peak, then cutting to total silence with one lingering gong resonance."
       },
       "bgcolor": "rgba(0,0,0,0)"
     }
@@ -1449,6 +1631,22 @@
       "AUDIO"
     ],
     [
+      32,
+      26,
+      0,
+      8,
+      4,
+      "STRING"
+    ],
+    [
+      33,
+      26,
+      0,
+      27,
+      0,
+      "STRING"
+    ],
+    [
       19,
       14,
       0,
@@ -1472,8 +1670,8 @@
       "bounding": [
         1576.9378360551384,
         -554.3013060958082,
-        2734.5316100000014,
-        1113.9473708511355
+        1141.3246100000026,
+        1092.651452088929
       ],
       "color": "#3f789e",
       "flags": {}
@@ -1489,15 +1687,39 @@
       ],
       "color": "#3f789e",
       "flags": {}
+    },
+    {
+      "id": 3,
+      "title": "BSAI H3 Prompt Template (提示词模板)",
+      "bounding": [
+        -1798.4686754854583,
+        551.4098651554084,
+        1200.1799865722649,
+        1020.5002081298824
+      ],
+      "color": "#3f789e",
+      "flags": {}
+    },
+    {
+      "id": 4,
+      "title": "Topaz 星光2.6 · 最新参数 (mem22 / compile Off)",
+      "bounding": [
+        -577.4050828615153,
+        554.5505860908888,
+        2127.740997843144,
+        1020.1064996802249
+      ],
+      "color": "#3f789e",
+      "flags": {}
     }
   ],
   "config": {},
   "extra": {
     "ds": {
-      "scale": 1.4641000000000006,
+      "scale": 0.8264462809917354,
       "offset": [
-        2051.0435983114508,
-        784.4297484536007
+        1013.5074006839654,
+        -260.47237086738403
       ]
     },
     "qgn_navigation_groups": [],

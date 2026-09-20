@@ -3191,7 +3191,8 @@ def _topaz_read_video(path):
     return raw[: n * w * h * 3].reshape(n, h, w, 3)
 
 
-def _topaz_run(in_path, out_path, scale, frames, w, h, strength, max_gpu_mem, model_id="slp-26"):
+def _topaz_run(in_path, out_path, scale, frames, w, h, strength, max_gpu_mem, model_id="slp-26",
+               torch_compile="Off"):
     """Run Topaz neuroserver (Starlight / Astra) on a video file.
 
     v2.2.1: retry on neuroserver crash (exit 3221225478 = STATUS_IN_PAGE_ERROR,
@@ -3220,9 +3221,18 @@ def _topaz_run(in_path, out_path, scale, frames, w, h, strength, max_gpu_mem, mo
     env['TOPAZLABS_LICENSE'] = lic
     # 星光带 softness=1（官方默认），Astra 家族不带
     if model_id == 'slp-26':
-        filters = '[{"model": "%s", "enhancement_strength": %s, "softness": 1}]' % (model_id, strength)
+        filters = '[{"model": "%s", "enhancement_strength": %s, "softness": 1' % (model_id, strength)
     else:
-        filters = '[{"model": "%s", "enhancement_strength": %s}]' % (model_id, strength)
+        filters = '[{"model": "%s", "enhancement_strength": %s' % (model_id, strength)
+    # 引擎内置 torch.compile 透传（正确键: torch_compile + torch_compile_args_dit/vae，
+    # 由 pyd schema 实证；slp-26 实测无加速，默认 Off）
+    if torch_compile in ("inductor", "cudagraphs"):
+        cfg = '{"backend": "%s", "mode": "default", "fullgraph": false, "dynamic": false}' % torch_compile
+        filters += (', "torch_compile": %s, "torch_compile_args_dit": %s, "torch_compile_args_vae": %s'
+                    % (cfg, cfg, cfg))
+    filters += '}]'
+    if torch_compile in ("inductor", "cudagraphs"):
+        print(f"[BSAI-H3/Topaz] torch_compile={torch_compile} 已透传 (首次运行含编译开销, 缓存热后生效)")
     ow = int(round(w * scale)); ow += ow % 2
     oh = int(round(h * scale)); oh += oh % 2
     NS_ENC = ('-c:v h264_nvenc -profile:v high -pix_fmt yuv420p -g 30 -preset p4 -tune hq '
@@ -3460,7 +3470,8 @@ def _topaz_upscale_images(frames, scale, strength, max_gpu_mem):
         shutil.rmtree(work, ignore_errors=True)
 
 
-def _topaz_upscale(frames, fps, scale, strength, max_gpu_mem, qp=14, model_id="slp-26"):
+def _topaz_upscale(frames, fps, scale, strength, max_gpu_mem, qp=14, model_id="slp-26",
+                   torch_compile="Off"):
     """frames (B,H,W,3) uint8 RGB -> Topaz engine upscaled (B,H',W',3) uint8."""
     if model_id == 'wonder-3.5':
         return _topaz_upscale_images(frames, scale, strength, max_gpu_mem)
@@ -3471,7 +3482,8 @@ def _topaz_upscale(frames, fps, scale, strength, max_gpu_mem, qp=14, model_id="s
     b, h, w, c = frames.shape
     try:
         _topaz_write_video(frames, fps, in_v, qp)
-        _topaz_run(in_v, out_v, scale, b, w, h, strength, max_gpu_mem, model_id)
+        _topaz_run(in_v, out_v, scale, b, w, h, strength, max_gpu_mem, model_id,
+                   torch_compile)
         return _topaz_read_video(out_v)
     finally:
         for f in (in_v, out_v):
@@ -3507,7 +3519,10 @@ class BSAI_TopazEngine_FaceRestore:
                                               "tooltip": "输出放大倍数 1-4（支持小数）/ Upscale factor 1-4 (fraction ok)"}),
                 "enhancement_strength / 增强强度": ("FLOAT", {"default": 1.0, "min": 0.5, "max": 1.5, "step": 0.1,
                                                               "tooltip": "0.7柔和 / 1.0默认 / 1.3细节最猛"}),
-                "max_gpu_mem / 显存上限": ("FLOAT", {"default": 14.0, "min": 8.0, "max": 16.0, "step": 0.1}),
+                "max_gpu_mem / 显存上限": ("FLOAT", {"default": 22.0, "min": 8.0, "max": 32.0, "step": 0.1,
+                                                    "tooltip": "引擎显存上限(GB)。24GB 卡实测 22 最稳(峰值~9.6GB)，14 为旧默认 / Max VRAM cap (GB), 22 stable on 24GB cards"}),
+                "torch_compile / 编译优化": (["Off", "inductor", "cudagraphs"], {"default": "Off",
+                    "tooltip": "引擎内置 torch.compile 开关（透传 torch_compile + args_dit/vae）。slp-26 实测无加速甚至略慢，默认 Off / torch.compile switch, benchmarked no speedup on slp-26"}),
                 "fps / 帧率": ("INT", {"default": 24, "min": 1, "max": 120}),
                 "qp / 输入质量": ("INT", {"default": 14, "min": 0, "max": 40,
                                          "tooltip": "输入编码质量，越小越无损 / lower = more lossless"}),
@@ -3544,7 +3559,8 @@ class BSAI_TopazEngine_FaceRestore:
         model = g("model / 模型", "星光 2.6")
         scale = g("scale / 放大倍数", 2.0)
         enhancement_strength = g("enhancement_strength / 增强强度", 1.0)
-        max_gpu_mem = g("max_gpu_mem / 显存上限", 14.0)
+        max_gpu_mem = g("max_gpu_mem / 显存上限", 22.0)
+        torch_compile = g("torch_compile / 编译优化", "Off")
         fps = g("fps / 帧率", 24)
         qp = g("qp / 输入质量", 14)
         face_restore = g("face_restore / 人脸修复", "Off")
@@ -3562,7 +3578,8 @@ class BSAI_TopazEngine_FaceRestore:
             raise ValueError(f"Topaz 档需要 RGB 3 通道, got {c}")
         model_id = self.TOPAZ_MODEL_IDS.get(model, "slp-26")
         frames = (images * 255.0).clamp(0, 255).cpu().numpy().astype(np.uint8)
-        out = _topaz_upscale(frames, fps, scale, enhancement_strength, max_gpu_mem, qp, model_id)
+        out = _topaz_upscale(frames, fps, scale, enhancement_strength, max_gpu_mem, qp, model_id,
+                            torch_compile)
         out_t = torch.from_numpy(out.astype(np.float32) / 255.0)
         nf = 0
         if face_restore != "Off":
@@ -3593,7 +3610,7 @@ class BSAI_TopazEngine_FaceRestore:
             f"output: {bw}x{bh} | scale_used: {used:.3f}x | "
             f"face: {face_restore} (blend={face_blend}, fid={face_fidelity}, faces={nf}) | "
             f"detail: {detail_amount}@{detail_radius} ({detail_mode}) | softness: {softness} | "
-            f"frames: {b} | time: {elapsed:.1f}s | device: cuda"
+            f"torch_compile: {torch_compile} | frames: {b} | time: {elapsed:.1f}s | device: cuda"
         )
         return (out_t, bw, bh, used, info)
 

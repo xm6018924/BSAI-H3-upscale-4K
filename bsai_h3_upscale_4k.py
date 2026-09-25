@@ -3573,7 +3573,24 @@ class BSAI_TopazEngine_FaceRestore:
         softness = g("softness / 柔和度", 0.0)
         detail_mode = g("detail_mode / 细节模式", "classic")
         t0 = time.time()
-        b, h, w, c = images.shape
+        # ── RGBA / 通道序自适应：Topaz 引擎只收 RGB，4 通道自动 alpha 合成转 RGB ──
+        if images.dim() == 4:
+            b, h, w, c = images.shape
+            if c not in (3, 4) and b in (3, 4):
+                # channels-first [B,C,H,W] 罕见布局 → 转 BHWC
+                images = images.permute(0, 2, 3, 1)
+                b, h, w, c = images.shape
+            if c == 4:
+                rgb = images[..., :3].clamp(0, 1)
+                alpha = images[..., 3:4].clamp(0, 1)
+                if bool((alpha < 1.0).any()):
+                    # 存在半透明像素 → 合成到纯黑背景，保留透明边缘信息
+                    images = rgb * alpha + 0.0 * (1 - alpha)
+                else:
+                    images = rgb
+                b, h, w, c = images.shape
+        else:
+            b, h, w, c = images.shape
         if c != 3:
             raise ValueError(f"Topaz 档需要 RGB 3 通道, got {c}")
         model_id = self.TOPAZ_MODEL_IDS.get(model, "slp-26")

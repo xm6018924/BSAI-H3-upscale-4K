@@ -1351,8 +1351,11 @@ def _face_restore_frames(out_tensor, mode, det_conf, blend, fidelity=0.75, tempo
     all_boxes = []
     if use_npu:
         # NPU 人脸检测：逐帧调用（SCRFD 速度快，逐帧完全够用）
+        H = W = 0
         for s in range(n):
             frame = (out_tensor[s].clamp(0, 1).numpy() * 255.0).astype(np.uint8)
+            if s == 0:
+                H, W = frame.shape[:2]  # 记录帧尺寸（供 Phase 2 使用，同视频帧尺寸一致）
             # NPU 客户端期望 BGR 格式
             frame_bgr = frame[:, :, ::-1].copy() if frame.shape[2] == 3 else frame
             faces = _npu_detect_faces_batch([frame_bgr], det_conf=det_conf)
@@ -1363,6 +1366,7 @@ def _face_restore_frames(out_tensor, mode, det_conf, blend, fidelity=0.75, tempo
                 if det_backend == "auto":
                     print("[BSAI-H3] NPU 检测失败，回退到 GPU1 YOLOv8")
                     use_npu = False
+                    all_boxes = []  # 清空部分结果，GPU1 路径从头重新检测
                     try:
                         det, _ = _face_models(mode)
                     except Exception:

@@ -1935,6 +1935,8 @@ def _rtx_upscale(frames, scale, quality="超高"):
     out_pixels = output_width * output_height
     batch_size = max(1, MAX_PIXELS // out_pixels)
 
+    print(f"[BSAI-H3-upscale-4K] RTX VSR: {w}x{h} -> {output_width}x{output_height}, quality={quality}, batch={batch_size}", flush=True)
+
     out_tensor = torch.empty(
         (frames.shape[0], output_height, output_width, c),
         device=frames.device,
@@ -1948,12 +1950,13 @@ def _rtx_upscale(frames, scale, quality="超高"):
             batch = frames[i:i + batch_size]
             batch_cuda = batch.cuda().permute(0, 3, 1, 2).float().contiguous()
             for j in range(batch_cuda.shape[0]):
-                input_frame = batch_cuda[j]
+                input_frame = batch_cuda[j]  # (3, H, W) CUDA float32
                 dlpack_out = sr.run(input_frame).image
-                out_tensor[i + j: i + j + 1] = torch.from_dlpack(dlpack_out).movedim(0, -1).unsqueeze(0)
+                # 官方要求 from_dlpack 后立即 .clone()，否则 capsule 二次释放导致原生崩溃
+                up = torch.from_dlpack(dlpack_out).clone()  # (3, out_H, out_W)
+                out_tensor[i + j: i + j + 1] = up.movedim(0, -1).unsqueeze(0).cpu()
 
-    if out_tensor.is_cuda:
-        out_tensor = out_tensor.cpu()
+    out_tensor = out_tensor.cpu()
     return out_tensor.float().clamp(0, 1)
 
 

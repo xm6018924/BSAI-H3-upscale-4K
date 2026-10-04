@@ -51,6 +51,26 @@ try:
 except Exception:
     pass
 
+# ==== BSAI 插件协同 SDK：加载即自动注册（失败不拖垮插件） ====
+# 说明：本文件为多引擎分发（flashvsr/topaz/dlss/rrdb + 子进程 + 多条 return），
+# 安全插入 allocate 需重构分发方法，按最小安全原则仅 register（HUD 可见 h3_upscale 能力）。
+try:
+    import sys as _bsai_sys, os as _bsai_os
+    _BSAI_ORCH_DIR = _bsai_os.path.join(
+        _bsai_os.path.dirname(_bsai_os.path.abspath(__file__)),
+        "..", "BSAI-ComfyUI-Orchestrator")
+    if _bsai_os.path.isdir(_BSAI_ORCH_DIR) and _BSAI_ORCH_DIR not in _bsai_sys.path:
+        _bsai_sys.path.insert(0, _BSAI_ORCH_DIR)
+    from bsai_orch_client import BSAIOrch  # noqa: E402
+    BSAIOrch.register(
+        name="BSAI-H3-upscale-4K",
+        kind="h3_upscale",
+        hardware=["cuda"],
+    )
+except Exception as _bsai_e:  # 注册失败不得拖垮插件
+    print(f"[BSAI SDK] BSAI-H3-upscale-4K 注册失败(忽略): {_bsai_e}")
+# ==== BSAI SDK 块结束 ====
+
 # ---------------------------------------------------------------------------
 # Model registry & auto-download
 # ---------------------------------------------------------------------------

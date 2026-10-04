@@ -1386,8 +1386,11 @@ def _face_restore_frames(out_tensor, mode, det_conf, blend, fidelity=0.75, tempo
                     boxes = boxes[keep_mask]
             all_boxes.append(boxes)
 
+    # det_bs = batch size for both detection (GPU1) and restoration phases.
+    # Must be defined regardless of backend — Phase 3 restoration loop uses it.
+    det_bs = min(8, n)
+
     if not use_npu:
-        det_bs = min(8, n)
         for s in range(0, n, det_bs):
             seg = out_tensor[s:s + det_bs]
             frames = (seg.clamp(0, 1).numpy() * 255.0).astype(np.uint8)
@@ -1555,7 +1558,7 @@ def _load_plugin_package(plugin_dir, pkg_name):
     return sys.modules[pkg_name]
 
 
-def _flashvsr_upscale(frames, scale, seed=42, anti_ghost=0.3, local_range=7):
+def _flashvsr_upscale(frames, scale, seed=42, anti_ghost=0.4, local_range=5):
     """FlashVSR-v1.1 diffusion video SR. Weights: ComfyUI/models/FlashVSR-v1.1/ (unchanged).
 
     anti_ghost (0.0~1.0): blend FlashVSR output with a high-quality bicubic
@@ -1594,35 +1597,83 @@ def _flashvsr_upscale(frames, scale, seed=42, anti_ghost=0.3, local_range=7):
     pipe = nodes_mod.init_pipeline("FlashVSR-v1.1", "tiny", dev, torch.bfloat16)
     s = max(2, min(4, int(round(float(scale)))))
     # VRAM-optimized: unload_dit=True, tile_size=128 (was 256), lower sparse/kv ratios
-    # v2.x fix: local_range reduced 11->7 to reduce temporal-attention ghosting
-    # (overlapping faces / structures from neighbouring frames on motion).
+    # v2.x fix: local_range reduced 11->7->5 to reduce temporal-attention ghosting
+    # (overlapping faces / body silhouettes from neighbouring frames on motion).
     out = nodes_mod.flashvsr(pipe, frames, s, True, True, True, 128, 16, True, 1.5, 2.0,
                              int(local_range), seed, True)
     if out.is_cuda:
         out = out.cpu()
     out = out.float().clamp(0, 1)
 
-    # --- anti-ghost blend ---
-    # FlashVSR's temporal attention can leak content from neighbouring
-    # frames when there is significant motion (e.g. head turns cause
-    # "multi-face ghost" overlaps).  We optionally blend the output with
-    # a high-quality bicubic upscale of the original LR input.  The LR
-    # upscale has perfect structural fidelity (no ghosting), so blending
-    # at 20-40% substantially suppresses ghost artifacts while retaining
-    # most of FlashVSR's detail and texture enhancement.
+    # --- anti-ghost blend (structure / texture decomposition) ---
+    # FlashVSR's temporal attention leaks structural content from neighbouring
+    # frames when there is motion (body silhouettes, head turns → multi-face
+    # ghost).  A uniform alpha blend suppresses ghosts but also washes out
+    # fine texture detail.
+    #
+    # Instead we decompose both images into two frequency bands:
+    #   structure = large shapes / contours (where ghosts live)
+    #   detail    = fine texture / micro-detail (where FlashVSR adds value)
+    #
+    # We blend the structure band STRONGLY with the LR upscale (perfect
+    # structural fidelity, no ghosts) and the detail band only lightly
+    # (preserve most of FlashVSR's texture enhancement).  This gives far
+    # better ghost suppression per unit of detail loss than a uniform blend.
     if anti_ghost > 1e-4 and out.shape[0] > 0:
-        # out: (T, H, W, C) float32 [0,1]
-        # frames: (T, H_lr, W_lr, C) float32 [0,1]
         t_h, t_w = out.shape[1], out.shape[2]
         lr_up = F.interpolate(
-            frames.permute(0, 3, 1, 2),  # (T, C, H, W)
+            frames.permute(0, 3, 1, 2),
             size=(t_h, t_w),
             mode="bicubic",
             align_corners=False,
             antialias=True,
         ).permute(0, 2, 3, 1).clamp(0, 1)
-        # Simple alpha blend: out = lr_up * anti_ghost + out * (1 - anti_ghost)
-        out = torch.lerp(out, lr_up, float(anti_ghost))
+
+        strength = float(anti_ghost)
+        # Structure blend weight: full strength on large shapes
+        struct_w = strength
+        # Detail blend weight: much lighter — keep FlashVSR texture
+        detail_w = strength * 0.25
+
+        # Structure kernel size ~ 3% of image height (captures body-scale
+        # shapes while leaving fine texture in the detail band).
+        k = max(5, int(round(t_h * 0.03)))
+        if k % 2 == 0:
+            k += 1
+        sigma = k / 3.0
+
+        # Compute structure via Gaussian blur — manual kernel + conv2d
+        # (F.gaussian_blur not available on all PyTorch builds).
+        out_chw = out.permute(0, 3, 1, 2)         # (T, C, H, W)
+        lr_chw = lr_up.permute(0, 3, 1, 2)
+
+        # Build 2D Gaussian kernel (separable would be faster but this is
+        # only a small post-pass after FlashVSR; correctness > speed here).
+        coords = torch.arange(k, dtype=torch.float32) - (k - 1.0) / 2.0
+        gauss_1d = torch.exp(-(coords ** 2) / (2.0 * sigma ** 2))
+        gauss_2d = gauss_1d[:, None] * gauss_1d[None, :]
+        gauss_2d = gauss_2d / gauss_2d.sum()
+        # Per-channel kernel: (C, 1, k, k) for depthwise conv
+        C = out_chw.shape[1]
+        kernel = gauss_2d.view(1, 1, k, k).repeat(C, 1, 1, 1).to(out_chw.device).to(out_chw.dtype)
+        pad = k // 2
+
+        def _gauss_blur(x):
+            return F.conv2d(x, kernel, padding=pad, groups=C)
+
+        out_struct = _gauss_blur(out_chw)
+        lr_struct = _gauss_blur(lr_chw)
+
+        # Detail = original - structure
+        out_detail = out_chw - out_struct
+        lr_detail = lr_chw - lr_struct
+
+        # Blend structure strongly, detail lightly
+        mixed_struct = torch.lerp(out_struct, lr_struct, struct_w)
+        mixed_detail = torch.lerp(out_detail, lr_detail, detail_w)
+
+        out_chw = (mixed_struct + mixed_detail).clamp(0, 1)
+        out = out_chw.permute(0, 2, 3, 1).contiguous()
 
     return out
 
@@ -1860,9 +1911,16 @@ def _seedvr2_native_upscale(frames, scale, seed=42, steps=8, cfg=1.0,
 
 
 def _rtx_upscale(frames, scale, quality="超高"):
-    """NVIDIA RTX Video Super Resolution (nvidia-vfx, no model files)."""
+    """NVIDIA RTX Video Super Resolution (nvidia-vfx, no model files).
+    如果 ComfyUI-Yuan-Tool 插件未安装，抛 FileNotFoundError 让上层降级到 SeedVR2。"""
     import importlib
     yuan_dir = os.path.join(folder_paths.base_path, "custom_nodes", "ComfyUI-Yuan-Tool")
+    yuan_nodes = os.path.join(yuan_dir, "nodes.py")
+    if not os.path.isfile(yuan_nodes):
+        raise FileNotFoundError(
+            "ComfyUI-Yuan-Tool 插件未安装（缺少 %s）。"
+            "请改用 FlashVSR/SeedVR2 引擎，或安装 ComfyUI-Yuan-Tool。" % yuan_nodes
+        )
     _load_plugin_package(yuan_dir, "_bsai_yuan")
     rtx_mod = importlib.import_module("_bsai_yuan.Yuan_RTX_Upscale")
     YuanRTXVideoUpscaleH3 = rtx_mod.YuanRTXVideoUpscaleH3
@@ -2683,10 +2741,11 @@ class BSAI_H3_Upscale4K:
                 "sv2_scheduler / SeedVR2调度器": (["normal", "karras", "simple", "sgm_uniform"], {"default": "normal"}),
                 "sv2_color / SeedVR2色彩校正": (["lab", "wavelet", "adain", "none"], {"default": "lab"}),
                 # FlashVSR 抗鬼影：扩散视频超分的时序注意力会在运动物体上
-                # 产生帧间内容泄漏（如转头时多脸重叠虚影）。此参数将
-                # FlashVSR 输出与原始 LR 的双三次上采样做混合，值越高鬼影
-                # 越少，但生成式细节也相应减少。0=纯 FlashVSR，0.3=推荐值。
-                "flashvsr_anti_ghost / FlashVSR抗鬼影": ("FLOAT", {"default": 0.30, "min": 0.0, "max": 1.0, "step": 0.05}),
+                # 产生帧间内容泄漏（转头多脸、身体轮廓拖影等）。
+                # 使用结构-纹理分层混合：结构层（大轮廓/形状）强力用原图压制
+                # 鬼影，纹理层（细节/肌理）轻度混合以保留 FlashVSR 细节。
+                # 值越高鬼影越少，细节相应减少。0=纯FlashVSR，0.4=推荐。
+                "flashvsr_anti_ghost / FlashVSR抗鬼影": ("FLOAT", {"default": 0.40, "min": 0.0, "max": 1.0, "step": 0.05}),
             },
         }
 
@@ -2813,7 +2872,19 @@ class BSAI_H3_Upscale4K:
             lr_np = None
         elif _engine == "rtx":
             # --- NVIDIA RTX Video Super Resolution path ---------------------
-            out = _rtx_upscale(images, scale)
+            # ComfyUI-Yuan-Tool 未安装时自动降级到 SeedVR2，避免整个 workflow 崩
+            try:
+                out = _rtx_upscale(images, scale)
+            except Exception as _e:
+                print("[BSAI-H3-upscale-4K] RTX 超分不可用 (%s)，降级到 SeedVR2" % _e)
+                out = _seedvr2_native_upscale(
+                    images, float(scale), seed=42,
+                    steps=int(g("sv2_steps / SeedVR2步数", 12)),
+                    cfg=float(g("sv2_cfg / SeedVR2保真度", 1.2)),
+                    sampler_name=g("sv2_sampler / SeedVR2采样器", "euler"),
+                    scheduler=g("sv2_scheduler / SeedVR2调度器", "normal"),
+                    color_correction=g("sv2_color / SeedVR2色彩校正", "lab"),
+                )
             eff_scale = float(out.shape[1] / float(images.shape[1]))
             temporal_strength = 0.0
             lr_np = None

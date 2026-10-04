@@ -51,6 +51,69 @@ try:
 except Exception:
     pass
 
+# ==== BSAI NPU 人脸检测卸载：利用 Intel NPU 减轻 GPU1 负担 ====
+# 当 face_det_backend 设为 NPU / 自动 时，人脸检测走 NPU SCRFD，
+# YOLOv8 检测 + ONNX 修复仍在 GPU1。NPU 不可用时自动回退到 GPU1 YOLOv8。
+_NPU_DET_AVAILABLE = None  # None=未探测, True=可用, False=不可用
+_NPU_DET_ERROR = ""
+
+def _npu_detector_available():
+    """探测 NPU 人脸检测是否可用（一次性）。"""
+    global _NPU_DET_AVAILABLE, _NPU_DET_ERROR
+    if _NPU_DET_AVAILABLE is not None:
+        return _NPU_DET_AVAILABLE
+    try:
+        import sys, os
+        # 查找 BSAI-NPU-Service 插件目录
+        here = os.path.dirname(os.path.abspath(__file__))
+        npu_dir = os.path.join(here, "..", "BSAI-NPU-Service")
+        if os.path.isdir(npu_dir) and npu_dir not in sys.path:
+            sys.path.insert(0, npu_dir)
+        from bsai_npu_client import npu, npu_available
+        ok = npu_available()
+        if ok:
+            # 实际调用一次探测（懒加载模型）
+            import numpy as np
+            test_img = np.zeros((64, 64, 3), dtype=np.uint8)
+            _ = npu.detect_faces(test_img)
+            _NPU_DET_AVAILABLE = True
+            print("[BSAI-H3] NPU 人脸检测已就绪（Intel AI Boost 卸载）")
+        else:
+            _NPU_DET_AVAILABLE = False
+            _NPU_DET_ERROR = "NPU service unavailable"
+    except Exception as e:
+        _NPU_DET_AVAILABLE = False
+        _NPU_DET_ERROR = str(e)
+        print(f"[BSAI-H3] NPU 人脸检测不可用: {e}")
+    return _NPU_DET_AVAILABLE
+
+
+def _npu_detect_faces_batch(frames, det_conf=0.35):
+    """用 NPU SCRFD 批量检测人脸，返回 list of np.array (N,4) xyxy。
+    与 YOLOv8 接口对齐，可直接替换。
+    """
+    try:
+        from bsai_npu_client import npu
+        results = []
+        for frame in frames:
+            faces = npu.detect_faces(frame)  # BGR uint8 -> list of {score, bbox, kps}
+            boxes = []
+            scores = []
+            for f in faces:
+                if f.get("score", 0) >= det_conf:
+                    boxes.append(f["bbox"])  # [x1,y1,x2,y2]
+                    scores.append(f.get("score", 0))
+            if boxes:
+                arr = np.array(boxes, dtype=np.float32)
+            else:
+                arr = np.zeros((0, 4), dtype=np.float32)
+            results.append(arr)
+        return results
+    except Exception as e:
+        print(f"[BSAI-H3] NPU detect faces failed (falling back): {e}")
+        return None  # 返回 None 表示失败，调用方应回退到 GPU1
+
+
 # ==== BSAI 插件协同 SDK：加载即自动注册（失败不拖垮插件） ====
 # 说明：本文件为多引擎分发（flashvsr/topaz/dlss/rrdb + 子进程 + 多条 return），
 # 安全插入 allocate 需重构分发方法，按最小安全原则仅 register（HUD 可见 h3_upscale 能力）。
@@ -1177,12 +1240,16 @@ def _restore_faces_frame(img, boxes, sess, mode, blend, fidelity=0.75,
         canvas[dy:dy + nh, dx:dx + nw] = resized
         inp = canvas.astype(np.float32) / 255.0
         inp = inp.transpose(2, 0, 1)[None]
+        # CodeFormer ONNX expects [-1, 1] input range (not [0, 1])
+        inp = inp * 2.0 - 1.0
 
         def _run(t):
             feed = {sess.get_inputs()[0].name: t}
             if len(sess.get_inputs()) > 1:  # CodeFormer: weight (fidelity)
                 feed[sess.get_inputs()[1].name] = np.array([float(fid_eff)], dtype=np.float64)
-            return sess.run(None, feed)[0][0].transpose(1, 2, 0)
+            out = sess.run(None, feed)[0][0].transpose(1, 2, 0)
+            # de-normalize from [-1, 1] back to [0, 1]
+            return (out + 1.0) * 0.5
 
         # --- (3) flip-TTA: always on for small faces, else strength>=0.5 ---
         o = np.clip(_run(inp), 0, 1)
@@ -1215,7 +1282,17 @@ def _restore_faces_frame(img, boxes, sess, mode, blend, fidelity=0.75,
     return out
 
 
-def _face_restore_frames(out_tensor, mode, det_conf, blend, fidelity=0.75, temporal=0.5):
+def _map_det_backend(raw):
+    """把界面选项映射为内部 backend 字符串。"""
+    mapping = {
+        "自动(Auto)": "auto",
+        "NPU 卸载": "NPU",
+        "GPU1 (YOLOv8)": "GPU1",
+    }
+    return mapping.get(raw, "auto")
+
+
+def _face_restore_frames(out_tensor, mode, det_conf, blend, fidelity=0.75, temporal=0.5, det_backend="auto"):
     """Apply face restoration to an SR tensor [n,H,W,3] float 0-1 (CPU).
 
     v2.2.0: multi-scale detection (1280 then 1920 re-scan on frames with
@@ -1237,53 +1314,128 @@ def _face_restore_frames(out_tensor, mode, det_conf, blend, fidelity=0.75, tempo
         权重, 0 关闭)。框抖动不再直接造成修复强度逐帧跳变, 消除强度闪烁,
         同时保持逐帧像素级恢复(不混合结果像素, 规避鬼影)。
 
+    v2.9.0: NPU 人脸检测卸载 —— det_backend 支持 auto/NPU/GPU1，
+    auto 模式优先用 NPU SCRFD（Intel AI Boost），NPU 不可用回退到 GPU1 YOLOv8，
+    显著降低 GPU1 负担（人脸检测从 RTX 5090 转移到 NPU）。
+
     Returns (out_tensor, total_faces_detected)."""
     if mode == "Off" or not _HAS_CV2 or not torch.cuda.is_available():
         return out_tensor, 0
-    try:
-        det, sess = _face_models(mode)
-    except Exception as e:
-        print(f"[BSAI-H3] face restore unavailable ({e}); skipping")
-        return out_tensor, 0
+
+    # ---- 确定人脸检测后端 ----
+    use_npu = False
+    npu_fallback_msg = ""
+    if det_backend in ("NPU", "auto"):
+        if _npu_detector_available():
+            use_npu = True
+            print(f"[BSAI-H3] 人脸检测: NPU SCRFD（Intel AI Boost 卸载 GPU1）")
+        elif det_backend == "NPU":
+            npu_fallback_msg = "NPU 不可用，回退到 GPU1 YOLOv8"
+            print(f"[BSAI-H3] {npu_fallback_msg}")
+
+    if not use_npu:
+        try:
+            det, sess = _face_models(mode)
+        except Exception as e:
+            print(f"[BSAI-H3] face restore unavailable ({e}); skipping")
+            return out_tensor, 0
+    else:
+        # NPU 模式下只需加载修复模型（检测走 NPU）
+        try:
+            _, sess = _face_models(mode)
+        except Exception as e:
+            print(f"[BSAI-H3] face restore model unavailable ({e}); skipping")
+            return out_tensor, 0
     n = out_tensor.shape[0]
     # ---- Phase 1: detect faces in ALL frames first ----
     all_boxes = []
-    det_bs = min(8, n)
-    for s in range(0, n, det_bs):
-        seg = out_tensor[s:s + det_bs]
-        frames = (seg.clamp(0, 1).numpy() * 255.0).astype(np.uint8)
-        res = det.predict([frames[i] for i in range(len(frames))],
-                          conf=det_conf, imgsz=1280, verbose=False)
-        for i in range(len(frames)):
-            boxes = res[i].boxes.xyxy.cpu().numpy() if (res[i].boxes is not None) else np.zeros((0, 4))
-            H, W = frames[i].shape[:2]
-            frame_area = float(H * W)
-            has_large = any(((b[2]-b[0])*(b[3]-b[1]) / frame_area) >= 0.03 for b in boxes) if len(boxes) else False
-            if not has_large and H * W > 500_000:
-                res2 = det.predict(frames[i], conf=max(0.08, det_conf * 0.6),
-                                    imgsz=1920, verbose=False)
-                boxes2 = res2[0].boxes.xyxy.cpu().numpy() if (res2[0].boxes is not None) else np.zeros((0, 4))
-                if len(boxes2):
-                    if len(boxes) == 0:
-                        boxes = boxes2
-                    else:
-                        keep = []
-                        for b2 in boxes2:
-                            x1, y1, x2, y2 = b2
-                            area2 = (x2-x1)*(y2-y1)
-                            overlap = False
-                            for b1 in boxes:
-                                ix1 = max(x1, b1[0]); iy1 = max(y1, b1[1])
-                                ix2 = min(x2, b1[2]); iy2 = min(y2, b1[3])
-                                if ix2 > ix1 and iy2 > iy1:
-                                    inter = (ix2-ix1)*(iy2-iy1)
-                                    if inter / max(area2, 1) > 0.5:
-                                        overlap = True; break
-                            if not overlap:
-                                keep.append(b2)
-                        if keep:
-                            boxes = np.vstack([boxes, np.array(keep)])
+    if use_npu:
+        # NPU 人脸检测：逐帧调用（SCRFD 速度快，逐帧完全够用）
+        for s in range(n):
+            frame = (out_tensor[s].clamp(0, 1).numpy() * 255.0).astype(np.uint8)
+            # NPU 客户端期望 BGR 格式
+            frame_bgr = frame[:, :, ::-1].copy() if frame.shape[2] == 3 else frame
+            faces = _npu_detect_faces_batch([frame_bgr], det_conf=det_conf)
+            if faces is not None and len(faces) > 0:
+                boxes = faces[0]
+            else:
+                # NPU 失败，回退到 GPU1 YOLOv8（仅当 auto 模式）
+                if det_backend == "auto":
+                    print("[BSAI-H3] NPU 检测失败，回退到 GPU1 YOLOv8")
+                    use_npu = False
+                    try:
+                        det, _ = _face_models(mode)
+                    except Exception:
+                        pass
+                    break
+                boxes = np.zeros((0, 4), dtype=np.float32)
+            # 宽高比过滤（与 GPU1 路径一致，排除明显非人脸的检测）
+            if len(boxes) > 0:
+                keep_mask = np.ones(len(boxes), dtype=bool)
+                for bi, b in enumerate(boxes):
+                    x1, y1, x2, y2 = b
+                    bw, bh = max(x2 - x1, 1.0), max(y2 - y1, 1.0)
+                    ratio = bw / bh
+                    if ratio < 0.55 or ratio > 1.65:
+                        keep_mask[bi] = False
+                if not keep_mask.all():
+                    boxes = boxes[keep_mask]
             all_boxes.append(boxes)
+
+    if not use_npu:
+        det_bs = min(8, n)
+        for s in range(0, n, det_bs):
+            seg = out_tensor[s:s + det_bs]
+            frames = (seg.clamp(0, 1).numpy() * 255.0).astype(np.uint8)
+            res = det.predict([frames[i] for i in range(len(frames))],
+                              conf=det_conf, imgsz=1280, verbose=False)
+            for i in range(len(frames)):
+                boxes = res[i].boxes.xyxy.cpu().numpy() if (res[i].boxes is not None) else np.zeros((0, 4))
+                H, W = frames[i].shape[:2]
+                frame_area = float(H * W)
+                has_large = any(((b[2]-b[0])*(b[3]-b[1]) / frame_area) >= 0.03 for b in boxes) if len(boxes) else False
+                if not has_large and H * W > 500_000:
+                    res2 = det.predict(frames[i], conf=max(0.15, det_conf * 0.6),
+                                        imgsz=1920, verbose=False)
+                    boxes2 = res2[0].boxes.xyxy.cpu().numpy() if (res2[0].boxes is not None) else np.zeros((0, 4))
+                    if len(boxes2):
+                        if len(boxes) == 0:
+                            boxes = boxes2
+                        else:
+                            keep = []
+                            for b2 in boxes2:
+                                x1, y1, x2, y2 = b2
+                                area2 = (x2-x1)*(y2-y1)
+                                overlap = False
+                                for b1 in boxes:
+                                    ix1 = max(x1, b1[0]); iy1 = max(y1, b1[1])
+                                    ix2 = min(x2, b1[2]); iy2 = min(y2, b1[3])
+                                    if ix2 > ix1 and iy2 > iy1:
+                                        inter = (ix2-ix1)*(iy2-iy1)
+                                        if inter / max(area2, 1) > 0.5:
+                                            overlap = True; break
+                                if not overlap:
+                                    keep.append(b2)
+                            if keep:
+                                boxes = np.vstack([boxes, np.array(keep)])
+                # --- aspect-ratio filter: reject obviously non-face boxes ---
+                # Real faces are roughly square (typical 0.7~1.4 w/h ratio).
+                # Extremely tall/wide detections (e.g. arm, torso, whole body)
+                # are almost always false positives that cause ghosting/halos.
+                if len(boxes) > 0:
+                    keep_mask = np.ones(len(boxes), dtype=bool)
+                    for bi, b in enumerate(boxes):
+                        x1, y1, x2, y2 = b
+                        bw, bh = max(x2 - x1, 1.0), max(y2 - y1, 1.0)
+                        ratio = bw / bh
+                        # Allow 0.55 ~ 1.65 (generous: covers tilted faces and
+                        # some side profiles). Anything outside is almost certainly
+                        # not a face and will cause artifacts when restored.
+                        if ratio < 0.55 or ratio > 1.65:
+                            keep_mask[bi] = False
+                    if not keep_mask.all():
+                        boxes = boxes[keep_mask]
+                all_boxes.append(boxes)
 
     # ---- Phase 2: temporal EMA smoothing of face boxes + per-track params ----
     # v2.7.0: ① 匹配增强(IoU + 中心距离续链) ② 每条轨迹的修复参数
@@ -1399,9 +1551,19 @@ def _load_plugin_package(plugin_dir, pkg_name):
     return sys.modules[pkg_name]
 
 
-def _flashvsr_upscale(frames, scale, seed=42):
-    """FlashVSR-v1.1 diffusion video SR. Weights: ComfyUI/models/FlashVSR-v1.1/ (unchanged)."""
+def _flashvsr_upscale(frames, scale, seed=42, anti_ghost=0.3, local_range=7):
+    """FlashVSR-v1.1 diffusion video SR. Weights: ComfyUI/models/FlashVSR-v1.1/ (unchanged).
+
+    anti_ghost (0.0~1.0): blend FlashVSR output with a high-quality bicubic
+        upscale of the original LR input. Higher = fewer temporal-attention
+        ghost artifacts (e.g. overlapping faces from neighbouring frames),
+        at the cost of less generative detail. 0.0 = pure FlashVSR.
+    local_range (int): temporal attention window size. Lower = less
+        inter-frame mixing = less ghosting, but potentially less temporal
+        coherence. Default 7 (was 11).
+    """
     import importlib
+    import torch.nn.functional as F
     model_dir = os.path.join(folder_paths.models_dir, "FlashVSR-v1.1")
     required = ["diffusion_pytorch_model_streaming_dmd.safetensors", "Wan2.1_VAE.pth",
                 "LQ_proj_in.ckpt", "TCDecoder.ckpt"]
@@ -1414,7 +1576,7 @@ def _flashvsr_upscale(frames, scale, seed=42):
             f"  放置路径 / Place in: {model_dir}\n"
             f"  需要文件 / Required: {', '.join(required)}"
         )
-    flash_dir = os.path.join(folder_paths.base_path, "custom_nodes", "ComfyUI-FlashVSR_Ultra_Fast")
+    flash_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "flashvsr_vendor")
     _load_plugin_package(flash_dir, "_bsai_flashvsr")
     nodes_mod = importlib.import_module("_bsai_flashvsr.nodes")
     dev = "cuda:0" if torch.cuda.is_available() else "cpu"
@@ -1428,10 +1590,37 @@ def _flashvsr_upscale(frames, scale, seed=42):
     pipe = nodes_mod.init_pipeline("FlashVSR-v1.1", "tiny", dev, torch.bfloat16)
     s = max(2, min(4, int(round(float(scale)))))
     # VRAM-optimized: unload_dit=True, tile_size=128 (was 256), lower sparse/kv ratios
-    out = nodes_mod.flashvsr(pipe, frames, s, True, True, True, 128, 16, True, 1.5, 2.0, 11, seed, True)
+    # v2.x fix: local_range reduced 11->7 to reduce temporal-attention ghosting
+    # (overlapping faces / structures from neighbouring frames on motion).
+    out = nodes_mod.flashvsr(pipe, frames, s, True, True, True, 128, 16, True, 1.5, 2.0,
+                             int(local_range), seed, True)
     if out.is_cuda:
         out = out.cpu()
-    return out.float().clamp(0, 1)
+    out = out.float().clamp(0, 1)
+
+    # --- anti-ghost blend ---
+    # FlashVSR's temporal attention can leak content from neighbouring
+    # frames when there is significant motion (e.g. head turns cause
+    # "multi-face ghost" overlaps).  We optionally blend the output with
+    # a high-quality bicubic upscale of the original LR input.  The LR
+    # upscale has perfect structural fidelity (no ghosting), so blending
+    # at 20-40% substantially suppresses ghost artifacts while retaining
+    # most of FlashVSR's detail and texture enhancement.
+    if anti_ghost > 1e-4 and out.shape[0] > 0:
+        # out: (T, H, W, C) float32 [0,1]
+        # frames: (T, H_lr, W_lr, C) float32 [0,1]
+        t_h, t_w = out.shape[1], out.shape[2]
+        lr_up = F.interpolate(
+            frames.permute(0, 3, 1, 2),  # (T, C, H, W)
+            size=(t_h, t_w),
+            mode="bicubic",
+            align_corners=False,
+            antialias=True,
+        ).permute(0, 2, 3, 1).clamp(0, 1)
+        # Simple alpha blend: out = lr_up * anti_ghost + out * (1 - anti_ghost)
+        out = torch.lerp(out, lr_up, float(anti_ghost))
+
+    return out
 
 
 def _seedvr2_upscale(frames, scale, seed=42):
@@ -2438,6 +2627,9 @@ class BSAI_H3_Upscale4K:
                 # (inverted adaptive strength + 2x pre-upscale + lower fidelity),
                 # fixing H3's distant small-face blur / deformation.
                 "face_restore / 人脸修复": (["Off", "GFPGANv1.4", "CodeFormer", "小脸增强(CodeFormer)"], {"default": "Off"}),
+                # v2.9.0 人脸检测后端选择：利用 NPU/XPU 减轻 GPU1 负担
+                # auto = 优先 NPU，不可用回退 GPU1；NPU = 强制 NPU；GPU1 = 强制 GPU1 YOLOv8
+                "face_det_backend / 检测后端": (["自动(Auto)", "NPU 卸载", "GPU1 (YOLOv8)"], {"default": "自动(Auto)"}),
                 # Face detector confidence threshold (lower = more detections,
                 # including tiny distant faces; may add false positives).
                 # v2.2.0 default 0.15 + multi-scale 1920 re-scan catches small faces.
@@ -2486,6 +2678,11 @@ class BSAI_H3_Upscale4K:
                 "sv2_sampler / SeedVR2采样器": (["euler", "dpmpp_2m", "dpmpp_2m_sde", "ddim", "uni_pc"], {"default": "euler"}),
                 "sv2_scheduler / SeedVR2调度器": (["normal", "karras", "simple", "sgm_uniform"], {"default": "normal"}),
                 "sv2_color / SeedVR2色彩校正": (["lab", "wavelet", "adain", "none"], {"default": "lab"}),
+                # FlashVSR 抗鬼影：扩散视频超分的时序注意力会在运动物体上
+                # 产生帧间内容泄漏（如转头时多脸重叠虚影）。此参数将
+                # FlashVSR 输出与原始 LR 的双三次上采样做混合，值越高鬼影
+                # 越少，但生成式细节也相应减少。0=纯 FlashVSR，0.3=推荐值。
+                "flashvsr_anti_ghost / FlashVSR抗鬼影": ("FLOAT", {"default": 0.30, "min": 0.0, "max": 1.0, "step": 0.05}),
             },
         }
 
@@ -2526,6 +2723,7 @@ class BSAI_H3_Upscale4K:
         detail_radius = g("detail_radius / 细节半径", 1.8)
         softness = g("softness / 柔和度", 0.1)
         face_restore = g("face_restore / 人脸修复", 'Off')
+        face_det_backend_raw = g("face_det_backend / 检测后端", '自动(Auto)')
         face_det_conf = g("face_det_conf / 检测置信度", 0.25)
         face_blend = g("face_blend / 融合强度", 0.65)
         face_fidelity = g("face_fidelity / 保真度", 0.75)
@@ -2537,6 +2735,7 @@ class BSAI_H3_Upscale4K:
         dlss_intensity = g("dlss_intensity / DLSS强度", 1.0)
         dlss_detail = g("dlss_detail / DLSS细节", 1.0)
         dlss_motion = g("dlss_motion / DLSS光流", True)
+        flashvsr_anti_ghost = g("flashvsr_anti_ghost / FlashVSR抗鬼影", 0.30)
         t0 = time.time()
         # Free GPU VRAM before upscaling: H3 diffusion model (~20GB) may still
         # be resident from the previous generation node, which causes OOM when
@@ -2578,7 +2777,7 @@ class BSAI_H3_Upscale4K:
 
         if _engine == "flashvsr":
             # --- FlashVSR-v1.1 diffusion path -------------------------------
-            out = _flashvsr_upscale(images, scale)
+            out = _flashvsr_upscale(images, scale, anti_ghost=float(flashvsr_anti_ghost))
             eff_scale = float(out.shape[1] / float(images.shape[1]))
             temporal_strength = 0.0  # engine handles temporal consistency
             lr_np = None
@@ -2744,12 +2943,15 @@ class BSAI_H3_Upscale4K:
                 # KEEP blend moderate and fidelity high to prevent frame-to-frame
                 # ghosting/flicker caused by aggressive generative restoration.
                 # v2.3.2: blend cap lowered 0.80->0.45, fidelity floor raised 0.40->0.75.
+                # v2.x fix: conf floor raised 0.12->0.20 + added aspect-ratio filter
+                # to eliminate body-part false positives that cause full-body halos.
                 fr_mode = "CodeFormer"
-                fr_conf = min(0.12, float(face_det_conf))
+                fr_conf = min(0.20, float(face_det_conf))
                 fr_blend = min(0.45, float(face_blend))
                 fr_fid = max(0.75, float(face_fidelity))
             out, _ = _face_restore_frames(out, fr_mode, fr_conf, fr_blend, fr_fid,
-                                         temporal=float(face_temporal))
+                                         temporal=float(face_temporal),
+                                         det_backend=_map_det_backend(face_det_backend_raw))
         fr_elapsed = time.time() - t_fr
 
         bh, bw = out.shape[1], out.shape[2]
@@ -3177,6 +3379,7 @@ class BSAI_H3_FaceRestore:
             "required": {
                 "images / 图像": ("IMAGE",),
                 "face_restore / 人脸修复": (["Off", "GFPGANv1.4", "CodeFormer", "小脸增强(CodeFormer)"], {"default": "CodeFormer"}),
+                "face_det_backend / 检测后端": (["自动(Auto)", "NPU 卸载", "GPU1 (YOLOv8)"], {"default": "自动(Auto)"}),
                 "face_det_conf / 检测置信度": ("FLOAT", {"default": 0.15, "min": 0.05, "max": 0.95, "step": 0.05}),
                 "face_blend / 融合强度": ("FLOAT", {"default": 0.70, "min": 0.1, "max": 1.0, "step": 0.05}),
                 "face_fidelity / 保真度": ("FLOAT", {"default": 0.60, "min": 0.0, "max": 1.0, "step": 0.05}),
@@ -3189,7 +3392,8 @@ class BSAI_H3_FaceRestore:
     FUNCTION = "restore"
     CATEGORY = "BSAI/H3"
     DESCRIPTION = (
-        "独立人脸修复节点：YOLOv8-Face 多尺度检测 + GFPGAN/CodeFormer 重建五官，\n"
+        "独立人脸修复节点：多后端人脸检测 + GFPGAN/CodeFormer 重建五官，\n"
+        "支持 NPU 卸载（Intel AI Boost）减轻 GPU1 负担，\n"
         "解决 H3 中远景小脸崩坏 / 五官模糊丢失，可在任意工作流单独使用。\n"
         "v2.2.0: 反转自适应强度（小脸更强重建）+ 小脸2x预放大 + 多尺度1920复检 +\n"
         "小脸CodeFormer自动降保真 + 新增「小脸增强(CodeFormer)」预设，\n"
@@ -3202,6 +3406,7 @@ class BSAI_H3_FaceRestore:
         g = kw.get
         images = g("images / 图像")
         face_restore = g("face_restore / 人脸修复", 'Off')
+        face_det_backend_raw = g("face_det_backend / 检测后端", '自动(Auto)')
         face_det_conf = g("face_det_conf / 检测置信度", 0.15)
         face_blend = g("face_blend / 融合强度", 0.70)
         face_fidelity = g("face_fidelity / 保真度", 0.60)
@@ -3217,7 +3422,8 @@ class BSAI_H3_FaceRestore:
             fr_blend = max(0.80, float(face_blend))
             fr_fid = min(0.40, float(face_fidelity))
         out, nf = _face_restore_frames(images, fr_mode, fr_conf, fr_blend, fr_fid,
-                                     temporal=float(face_temporal))
+                                     temporal=float(face_temporal),
+                                     det_backend=_map_det_backend(face_det_backend_raw))
         info = (
             f"face restore: {face_restore} (conf={face_det_conf}, blend={face_blend}, fid={face_fidelity}, temporal={face_temporal}) | "
             f"faces detected: {nf} | frames: {images.shape[0]} | "
@@ -3628,6 +3834,7 @@ class BSAI_TopazEngine_FaceRestore:
                 "qp / 输入质量": ("INT", {"default": 14, "min": 0, "max": 40,
                                          "tooltip": "输入编码质量，越小越无损 / lower = more lossless"}),
                 "face_restore / 人脸修复": (["Off", "GFPGANv1.4", "CodeFormer", "小脸增强(CodeFormer)"], {"default": "Off"}),
+                "face_det_backend / 检测后端": (["自动(Auto)", "NPU 卸载", "GPU1 (YOLOv8)"], {"default": "自动(Auto)"}),
                 "face_det_conf / 检测置信度": ("FLOAT", {"default": 0.15, "min": 0.05, "max": 0.95, "step": 0.05}),
                 "face_blend / 融合强度": ("FLOAT", {"default": 0.70, "min": 0.1, "max": 1.0, "step": 0.05}),
                 "face_fidelity / 保真度": ("FLOAT", {"default": 0.60, "min": 0.0, "max": 1.0, "step": 0.05}),
@@ -3665,6 +3872,7 @@ class BSAI_TopazEngine_FaceRestore:
         fps = g("fps / 帧率", 24)
         qp = g("qp / 输入质量", 14)
         face_restore = g("face_restore / 人脸修复", "Off")
+        face_det_backend_raw = g("face_det_backend / 检测后端", '自动(Auto)')
         face_det_conf = g("face_det_conf / 检测置信度", 0.15)
         face_blend = g("face_blend / 融合强度", 0.70)
         face_fidelity = g("face_fidelity / 保真度", 0.60)
@@ -3711,7 +3919,8 @@ class BSAI_TopazEngine_FaceRestore:
                 fr_blend = max(0.80, float(face_blend))
                 fr_fid = min(0.40, float(face_fidelity))
             out_t, nf = _face_restore_frames(out_t, fr_mode, fr_conf, fr_blend, fr_fid,
-                                            temporal=float(face_temporal))
+                                            temporal=float(face_temporal),
+                                            det_backend=_map_det_backend(face_det_backend_raw))
         if (detail_amount > 0 or softness > 0) and torch.cuda.is_available():
             dev = torch.cuda.current_device()
             x = out_t.to(dev).permute(0, 3, 1, 2)

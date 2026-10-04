@@ -1714,19 +1714,86 @@ def _dlssnr_exe_dir():
     return d
 
 
-def _dlssnr_pack_candidates():
-    """Locate video2dlssnr packs under known roots (walked, bounded depth).
+def _dlssnr_sibling_candidates():
+    """Sibling integration packs on the same level as this pack that already
+    ship a video2dlssnr runtime (already-extracted exe or the release zip).
 
-    Returns both already-extracted exe paths and the integration zip paths, so
-    the caller can either use the exe directly or auto-provision from a zip.
+    层级：插件 -> custom_nodes -> ComfyUI -> 整合包根；在「整合包根的上一层」
+    （及历史 C:\\BSAI 树）枚举名称含 comfy/bsai/aki 的同级目录，精确拼三种已知
+    布局探测其 DLSS5 目录。本包自身被排除，绝不做全盘遍历。
+
+    Walk up from the plugin to the pack root, then probe same-level siblings
+    (plus the legacy C:\\BSAI tree) at the three known DLSS5 layouts -- exact
+    path checks only, this pack itself excluded, no full-disk walk.
     """
+    here = os.path.dirname(os.path.abspath(__file__))
+    cf_root = os.path.dirname(os.path.dirname(here))        # .../<pack>/ComfyUI
+    pack = os.path.dirname(cf_root)                          # .../<pack>
+    bases = [os.path.dirname(pack), r"C:\BSAI"]
+    rel_layouts = (
+        (os.path.join("ComfyUI", "models", "DLSS5"),),
+        (os.path.join("models", "DLSS5"),),
+        ("DLSS5",),
+    )
+    out, seen = [], set()
+    my_name = os.path.basename(pack).lower()
+    for parent in bases:
+        if not parent or not os.path.isdir(parent):
+            continue
+        try:
+            names = sorted(os.listdir(parent))
+        except OSError:
+            continue
+        for nm in names:
+            if not nm or nm.lower() == my_name:
+                continue
+            low = nm.lower()
+            if not (("comfy" in low) or ("bsai" in low) or ("aki" in low)):
+                continue
+            base = os.path.join(parent, nm)
+            if not os.path.isdir(base):
+                continue
+            for (rel,) in rel_layouts:
+                d = os.path.join(base, rel)
+                if not os.path.isdir(d):
+                    continue
+                try:
+                    entries = os.listdir(d)
+                except OSError:
+                    continue
+                for fn in entries:
+                    lowf = fn.lower()
+                    hit = None
+                    if lowf == "video2dlssnr.exe":
+                        hit = os.path.join(d, fn)
+                    elif lowf.endswith(".zip") and "video2dlssnr" in lowf:
+                        hit = os.path.join(d, fn)
+                    if hit:
+                        p = os.path.normpath(hit)
+                        if p not in seen:
+                            seen.add(p); out.append(p)
+    return out
+
+
+def _dlssnr_pack_candidates():
+    """Locate video2dlssnr packs under the install-derived area + known roots.
+
+    顺序：安装路径兄弟整合包（精确命中，最省事）→ VIDEO2DLSSNR_PACK_DIR →
+    历史默认 C:\\BSAI\\DLSS5（有界深度遍历）。返回“已解出的 exe”与“整合包 zip”
+    两类路径，调用方可直接使用 exe 或自动从 zip 解包部署。
+
+    Order: sibling packs derived from the live install path (exact hits first)
+    → VIDEO2DLSSNR_PACK_DIR → the legacy C:\\BSAI\\DLSS5 root (bounded walk).
+    Returns both already-extracted exe paths and integration zip paths, so the
+    caller can either use the exe directly or auto-provision from a zip.
+    """
+    out = _dlssnr_sibling_candidates()
+    seen = set(out)
     roots = []
     env = os.environ.get("VIDEO2DLSSNR_PACK_DIR", "").strip().strip('"')
     if env:
         roots.append(env)
     roots.append(r"C:\BSAI\DLSS5")
-    out = []
-    seen = set()
     for root in roots:
         if not os.path.isdir(root):
             continue
@@ -1754,10 +1821,12 @@ def _dlssnr_provision():
     """Auto-provision video2dlssnr.exe + runtime DLLs from a local pack zip
     into <ComfyUI>/models/DLSS5/. Returns exe path or None.
 
-    Pack search order: VIDEO2DLSSNR_ZIP env var, then known local collections
-    (C:\\BSAI\\DLSS5 tree). Only the runnable artifacts (.exe + nvngx_* dlls)
-    are copied; proprietary DLLs stay user-supplied — this just unpacks what the
-    user already owns, same design philosophy as the Topaz engine (v1.8.2).
+    Pack search order: VIDEO2DLSSNR_ZIP env var, then install-derived sibling
+    packs (other ComfyUI roots next to this one, e.g. G:\\...\\Comfyui_BSAI),
+    then the legacy C:\\BSAI\\DLSS5 tree. Only the runnable artifacts (.exe +
+    nvngx_* dlls) are copied; proprietary DLLs stay user-supplied — this just
+    unpacks what the user already owns, same design philosophy as the Topaz
+    engine (v1.8.2).
     """
     dest = _dlssnr_exe_dir()
     exe = os.path.join(dest, "video2dlssnr.exe")
@@ -1820,12 +1889,24 @@ def _dlssnr_find_exe():
     if prov:
         return prov
     raise RuntimeError(
-        "[BSAI-H3/DLSS5] 未找到 video2dlssnr.exe。请任选一种：\n"
-        "  1) 设置环境变量 VIDEO2DLSSNR_EXE 指向其完整路径；\n"
-        "  2) 把 video2dlssnr/out/ 整个目录（exe + nvngx_dlss.dll + nvngx_dlssnr.dll）"
-        "复制到 " + _dlssnr_exe_dir() + " ；\n"
-        "  3) 把可执行文件放入本插件 bin/ 目录。\n"
-        "项目: https://github.com/DaniilSokolyuk/video2dlssnr"
+        "[BSAI-H3/DLSS5] 未找到 video2dlssnr.exe。DLSS 5 引擎需要 4 个文件放入 " + _dlssnr_exe_dir() + " ：\n"
+        "  video2dlssnr.exe (0.4MB) + nvngx_dlss.dll (56MB) + nvngx_dlssnr.dll (158MB) + nvngx.dll_dlssnr.dll (13KB)\n"
+        "请任选一种：\n"
+        "  1) 设置环境变量 VIDEO2DLSSNR_EXE 指向 exe 完整路径；\n"
+        "  2) 把 video2dlssnr/out/ 整个目录（exe + 3 个 nvngx DLL）复制到 " + _dlssnr_exe_dir() + " ；\n"
+        "  3) 把可执行文件放入本插件 bin/ 目录；\n"
+        "  4) 若本机其它 ComfyUI 整合包 models/DLSS5/ 已有这套文件，插件会自动发现并直接使用（也可把该目录设为环境变量 VIDEO2DLSSNR_PACK_DIR）；\n"
+        "  5) 运行插件目录下的 python install.py 自动获取/复制。\n"
+        "项目: https://github.com/DaniilSokolyuk/video2dlssnr\n"
+        "[EN] video2dlssnr.exe not found. The DLSS 5 engine needs 4 files in " + _dlssnr_exe_dir() + " :\n"
+        "  video2dlssnr.exe (0.4MB) + nvngx_dlss.dll (56MB) + nvngx_dlssnr.dll (158MB) + nvngx.dll_dlssnr.dll (13KB)\n"
+        "Choose any one:\n"
+        "  1) Set env var VIDEO2DLSSNR_EXE to the full exe path;\n"
+        "  2) Copy the whole video2dlssnr/out/ dir (exe + 3 nvngx DLLs) into " + _dlssnr_exe_dir() + " ;\n"
+        "  3) Put the exe into this plugin's bin/ dir;\n"
+        "  4) If another ComfyUI pack on this machine already has these files under models/DLSS5/, the plugin auto-discovers it (or set env var VIDEO2DLSSNR_PACK_DIR to that dir);\n"
+        "  5) Run `python install.py` in the plugin dir to fetch/copy automatically.\n"
+        "Project: https://github.com/DaniilSokolyuk/video2dlssnr"
     )
 
 

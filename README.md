@@ -155,6 +155,32 @@ ComfyUI/models/
 
 ---
 
+## 🛠️ DLSS5 报错「未找到 video2dlssnr.exe」排错 / Troubleshooting (bilingual)
+
+**现象 / Symptom**：节点 130 执行报 `RuntimeError: [BSAI-H3/DLSS5] 未找到 video2dlssnr.exe`。
+DLSS 5 引擎是"本机调用"设计：exe 与 3 个 NVIDIA 专有 DLL **不随插件分发**，需就位于 `ComfyUI/models/DLSS5/`。
+The DLSS 5 engine invokes a local runtime: the exe + 3 proprietary NVIDIA DLLs are **not shipped with the plugin** and must exist under `ComfyUI/models/DLSS5/`.
+
+**所需 4 个文件 / Required files (put all 4 in `ComfyUI/models/DLSS5/`)**：
+
+| 文件 file | 大小 size | 来源 source |
+|---|---|---|
+| `video2dlssnr.exe` | 0.4 MB | 官方 light 包 official light zip: [video2dlssnr_release_light.zip](https://github.com/DaniilSokolyuk/video2dlssnr/releases/download/v1.2/video2dlssnr_release_light.zip) |
+| `nvngx_dlss.dll` | 56 MB | NVIDIA 专有 proprietary：驱动包 driver pack / 全量包 full zip / 本机其它整合包 other local packs |
+| `nvngx_dlssnr.dll` | 158 MB | 同上 same as above |
+| `nvngx.dll_dlssnr.dll` | 13 KB | 同上 same as above |
+
+> 全量包（exe+DLL 一次到位，约 247MB）full bundle: [video2dlssnr_release.zip](https://github.com/DaniilSokolyuk/video2dlssnr/releases/download/v1.2/video2dlssnr_release.zip)
+
+**自动发现（v2.9.3 起）/ Auto-discovery (since v2.9.3)**：运行时查找不再只扫描写死的 `C:\BSAI\DLSS5`——插件与 `install.py` 会从**实际安装路径**向外发现同层其它 ComfyUI 整合包的 `models/DLSS5/`（例如 `G:\Comfyui_BSAI\ComfyUI\models\DLSS5\`），命中即自动复制/直接使用，无需任何手动操作；旧默认目录与环境变量 `VIDEO2DLSSNR_PACK_DIR` / `VIDEO2DLSSNR_EXE` 仍然有效。
+The search area is now derived from the live install path: sibling ComfyUI packs' `models/DLSS5/` on the same drive/level are probed automatically (e.g. `G:\Comfyui_BSAI\ComfyUI\models\DLSS5\`) and reused without any manual step; the legacy `C:\BSAI\DLSS5` default and the `VIDEO2DLSSNR_PACK_DIR` / `VIDEO2DLSSNR_EXE` env vars keep working.
+
+**手动兜底 / Manual fallback**：
+1. 运行 `python install.py`（自动扫描本地包复制，缺 exe 时联网下载官方 light 包 / auto-copies local packs, downloads the official light zip if exe missing）；
+2. 或手动把 4 个文件放入 `ComfyUI/models/DLSS5/`（或放入本插件 `bin/` 只放 exe，DLL 仍需同目录）/ or copy the 4 files into `ComfyUI/models/DLSS5/` (exe-only into plugin `bin/` works too, DLLs must sit beside it)。
+
+---
+
 ## 🚀 快速安装
 
 1. 把本仓库放入 `ComfyUI/custom_nodes/BSAI-H3-upscale-4K/`；
@@ -180,6 +206,14 @@ ComfyUI/models/
 ---
 
 ## 📝 更新日志
+
+### v2.9.3 — DLSS5 本地引擎按安装路径自动发现（修复「未找到 video2dlssnr.exe」）/ Install-path-aware DLSS5 auto-discovery
+- **背景 / Context**：用户报节点执行 `RuntimeError: [BSAI-H3/DLSS5] 未找到 video2dlssnr.exe`。运行时其实已存在于本机另一整合包 `G:\Comfyui_BSAI\ComfyUI\models\DLSS5\`（4 文件齐全），但插件与 install.py 的本地包扫描只写死了 `C:\BSAI\DLSS5`，跨盘/跨目录的既有文件发现不了。
+  The runtime already existed in a sibling pack on another drive, but both the node and `install.py` only scanned the hard-coded `C:\BSAI\DLSS5`.
+- **修复 / Fix**：查找根改为从**插件实际安装路径**推导——自动探测同层（及历史 `C:\BSAI` 树）名称含 comfy/bsai/aki 的兄弟整合包的 `ComfyUI/models/DLSS5`、`models/DLSS5`、`DLSS5` 三种布局（精确拼路径探测，不做全盘遍历）；命中 exe 或 zip 即直接使用/自动解包复制。环境变量 `VIDEO2DLSSNR_PACK_DIR` / `VIDEO2DLSSNR_EXE` 与旧默认路径保持兼容优先。
+  Search roots are now derived from the live install path: sibling packs (same level, plus the legacy `C:\BSAI` tree) are probed at the three known layouts — exact-path checks only, no full-disk walk. Env vars and the legacy default keep working.
+- **文档 / Docs**：缺件报错信息升级为中英双语并完整列出 4 个所需文件（exe 0.4MB + nvngx_dlss 56MB + nvngx_dlssnr 158MB + nvngx.dll_dlssnr 13KB）及获取途径；README 新增双语排错章节；install.py 待办提示双语化。
+  The missing-runtime error is now bilingual with the exact 4-file checklist and sources; README gained a bilingual troubleshooting section; install.py hints are bilingual.
 
 ### v2.8.1 — UI 布局：自动路由偏好移至模型选择之上
 - `auto_prefer / 自动路由偏好` 参数从参数区底部移到节点**第一栏（模型选择之上）**：先选档位偏好再看引擎，符合"自动路由"的操作直觉；仅当 model_name = 自动路由 时生效（行为不变）

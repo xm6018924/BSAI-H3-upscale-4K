@@ -412,12 +412,53 @@ V2D_LIGHT_ZIP = V2D_RELEASE_BASE + "/video2dlssnr_release_light.zip"   # 225KB, 
 V2D_FULL_ZIP = V2D_RELEASE_BASE + "/video2dlssnr_release.zip"          # ~247MB, exe + NVIDIA DLL
 
 
+def sibling_dlss_dirs():
+    """按"实际安装路径"向外发现：与当前整合包同层（及历史 C:\\BSAI 树下）的
+    其它 ComfyUI 整合包/引擎目录，命中其 models/DLSS5（或 DLSS5）目录。
+
+    Derives the search area from this installer's real location: sibling packs
+    next to the current pack root (plus the legacy C:\\BSAI tree) that already
+    ship a DLSS5 runtime. Exact-layout probing only, no full-disk walk.
+    """
+    pack = os.path.dirname(comfyui_root())              # .../<pack root>
+    parent = os.path.dirname(pack)                      # dir holding all packs
+    dirs, seen = [], set()
+    my_name = os.path.basename(pack).lower()
+    for base in (parent, r"C:\BSAI"):
+        if not os.path.isdir(base):
+            continue
+        try:
+            names = sorted(os.listdir(base))
+        except OSError:
+            continue
+        for nm in names:
+            low = nm.lower()
+            if low == my_name:
+                continue
+            if not (("comfy" in low) or ("bsai" in low) or ("dlss" in low)):
+                continue
+            cand = os.path.join(base, nm)
+            if not os.path.isdir(cand):
+                continue
+            for rel in (os.path.join("ComfyUI", "models", "DLSS5"),
+                        os.path.join("models", "DLSS5"), "DLSS5"):
+                d = os.path.join(cand, rel)
+                if os.path.isdir(d) and d not in seen:
+                    seen.add(d); dirs.append(d)
+    return dirs
+
+
 def find_local_dlss(extra_dirs):
-    """在已知位置 + --dlss-dir 里递归找 video2dlssnr.exe / zip / 含 DLL 的目录。"""
+    """在"安装路径兄弟整合包"+ 已知位置 + --dlss-dir 里找 exe / zip / 含 DLL 的目录。
+
+    Searches install-derived sibling packs first, then known locations and
+    --dlss-dir overrides, for video2dlssnr.exe / zip / a dir containing DLLs.
+    """
     roots = []
     for d in extra_dirs:
         if d:
             roots.append(os.path.abspath(d))
+    roots.extend(sibling_dlss_dirs())
     home = os.path.expanduser("~")
     for cand in ("C:\\BSAI\\DLSS5", os.path.join(home, "DLSS5"),
                  os.path.join(home, "Downloads", "DLSS5")):
@@ -527,11 +568,15 @@ def check_dlss5(extra_dirs, dlss5_full):
     if not have_exe:
         missing.append("video2dlssnr.exe")
     missing += [n for n in DLSS_DLL_NAMES if not os.path.isfile(os.path.join(dest, n))]
-    print(f"{TAG} [待办] DLSS5 引擎缺: {', '.join(missing)}")
+    print(f"{TAG} [待办] DLSS5 引擎缺 / missing: {', '.join(missing)}")
+    print(f"{TAG}         所需 4 文件 / 4 required files -> {dest}:")
+    print(f"{TAG}           video2dlssnr.exe (0.4MB) + " + " + ".join(DLSS_DLL_NAMES) + " (共约 215MB)")
     print(f"{TAG}         - video2dlssnr.exe: 已自动下载（{V2D_LIGHT_ZIP}）")
+    print(f"{TAG}           (auto-downloaded from the official light release)")
     if "nvngx_dlssnr.dll" in missing or "nvngx_dlss.dll" in missing:
-        print(f"{TAG}         - nvngx_dlssnr.dll / nvngx_dlss.dll: NVIDIA 专有运行时，需自行获取后放入 {dest}")
-        print(f"{TAG}           （来源: 本地 DLSS5 整合包 / NVIDIA 官方 / 用 --dlss5-full 下载含 DLL 的全量包）")
+        print(f"{TAG}         - nvngx_*.dll: NVIDIA 专有运行时，需自行获取后放入上面目录")
+        print(f"{TAG}           来源 / sources: 本机其它整合包 models/DLSS5/（已自动扫描复制）/ NVIDIA 驱动包 / --dlss5-full 全量包（含 DLL, 约 247MB）")
+        print(f"{TAG}           Proprietary NVIDIA runtime: copy from another local pack's models/DLSS5/ (auto-scanned), or NVIDIA driver/SDK, or re-run with --dlss5-full")
     return False
 
 

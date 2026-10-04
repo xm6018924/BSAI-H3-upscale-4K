@@ -1912,23 +1912,49 @@ def _seedvr2_native_upscale(frames, scale, seed=42, steps=8, cfg=1.0,
 
 def _rtx_upscale(frames, scale, quality="超高"):
     """NVIDIA RTX Video Super Resolution (nvidia-vfx, no model files).
-    如果 ComfyUI-Yuan-Tool 插件未安装，抛 FileNotFoundError 让上层降级到 SeedVR2。"""
-    import importlib
-    yuan_dir = os.path.join(folder_paths.base_path, "custom_nodes", "ComfyUI-Yuan-Tool")
-    yuan_nodes = os.path.join(yuan_dir, "nodes.py")
-    if not os.path.isfile(yuan_nodes):
-        raise FileNotFoundError(
-            "ComfyUI-Yuan-Tool 插件未安装（缺少 %s）。"
-            "请改用 FlashVSR/SeedVR2 引擎，或安装 ComfyUI-Yuan-Tool。" % yuan_nodes
-        )
-    _load_plugin_package(yuan_dir, "_bsai_yuan")
-    rtx_mod = importlib.import_module("_bsai_yuan.Yuan_RTX_Upscale")
-    YuanRTXVideoUpscaleH3 = rtx_mod.YuanRTXVideoUpscaleH3
-    resize_params = {"resize_type": "按倍数缩放", "scale": float(scale), "width": 0, "height": 0}
-    out = YuanRTXVideoUpscaleH3._run_super_resolution(frames, resize_params, quality)
-    if out.is_cuda:
-        out = out.cpu()
-    return out.float().clamp(0, 1)
+    直接内联 nvvfx 调用，不再依赖 ComfyUI-Yuan-Tool 插件。"""
+    try:
+        import nvvfx
+    except ImportError as e:
+        raise ImportError(
+            "未安装 nvidia-vfx 库，请执行: pip install nvidia-vfx"
+        ) from e
+
+    MAX_PIXELS = 1024 * 1024 * 16
+    quality_mapping = {
+        "低": nvvfx.effects.QualityLevel.LOW,
+        "中": nvvfx.effects.QualityLevel.MEDIUM,
+        "高": nvvfx.effects.QualityLevel.HIGH,
+        "超高": nvvfx.effects.QualityLevel.ULTRA,
+    }
+    selected_quality = quality_mapping.get(quality, nvvfx.effects.QualityLevel.HIGH)
+
+    _, h, w, c = frames.shape
+    output_width = max(8, round(w * scale / 8) * 8)
+    output_height = max(8, round(h * scale / 8) * 8)
+    out_pixels = output_width * output_height
+    batch_size = max(1, MAX_PIXELS // out_pixels)
+
+    out_tensor = torch.empty(
+        (frames.shape[0], output_height, output_width, c),
+        device=frames.device,
+        dtype=frames.dtype,
+    )
+    with nvvfx.VideoSuperRes(selected_quality) as sr:
+        sr.output_width = output_width
+        sr.output_height = output_height
+        sr.load()
+        for i in range(0, frames.shape[0], batch_size):
+            batch = frames[i:i + batch_size]
+            batch_cuda = batch.cuda().permute(0, 3, 1, 2).float().contiguous()
+            for j in range(batch_cuda.shape[0]):
+                input_frame = batch_cuda[j]
+                dlpack_out = sr.run(input_frame).image
+                out_tensor[i + j: i + j + 1] = torch.from_dlpack(dlpack_out).movedim(0, -1).unsqueeze(0)
+
+    if out_tensor.is_cuda:
+        out_tensor = out_tensor.cpu()
+    return out_tensor.float().clamp(0, 1)
 
 
 # ---------------------------------------------------------------------------

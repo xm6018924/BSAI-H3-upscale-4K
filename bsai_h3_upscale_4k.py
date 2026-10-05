@@ -1606,6 +1606,9 @@ def _flashvsr_upscale(frames, scale, seed=42, anti_ghost=0.4, local_range=5):
     out = out.float().clamp(0, 1)
 
     # --- anti-ghost blend (structure / texture decomposition) ---
+    import time as _t
+    _t0 = _t.time()
+    print(f"[BSAI-H3-upscale] FlashVSR done, output: {out.shape[2]}x{out.shape[1]}x{out.shape[0]}f, anti-ghost blending...")
     # FlashVSR's temporal attention leaks structural content from neighbouring
     # frames when there is motion (body silhouettes, head turns → multi-face
     # ghost).  A uniform alpha blend suppresses ghosts but also washes out
@@ -1642,27 +1645,31 @@ def _flashvsr_upscale(frames, scale, seed=42, anti_ghost=0.4, local_range=5):
             k += 1
         sigma = k / 3.0
 
-        # Compute structure via Gaussian blur — manual kernel + conv2d
-        # (F.gaussian_blur not available on all PyTorch builds).
+        # Compute structure via separable Gaussian blur (two 1D passes = 23x
+        # faster than one k*k 2D conv on CPU for k=47).
         out_chw = out.permute(0, 3, 1, 2)         # (T, C, H, W)
         lr_chw = lr_up.permute(0, 3, 1, 2)
 
-        # Build 2D Gaussian kernel (separable would be faster but this is
-        # only a small post-pass after FlashVSR; correctness > speed here).
         coords = torch.arange(k, dtype=torch.float32) - (k - 1.0) / 2.0
         gauss_1d = torch.exp(-(coords ** 2) / (2.0 * sigma ** 2))
-        gauss_2d = gauss_1d[:, None] * gauss_1d[None, :]
-        gauss_2d = gauss_2d / gauss_2d.sum()
-        # Per-channel kernel: (C, 1, k, k) for depthwise conv
+        gauss_1d = gauss_1d / gauss_1d.sum()
         C = out_chw.shape[1]
-        kernel = gauss_2d.view(1, 1, k, k).repeat(C, 1, 1, 1).to(out_chw.device).to(out_chw.dtype)
-        pad = k // 2
+        dev = out_chw.device
+        dt = out_chw.dtype
+        k_h = gauss_1d.view(1, 1, 1, k).repeat(C, 1, 1, 1).to(dev).to(dt)  # horizontal
+        k_v = gauss_1d.view(1, 1, k, 1).repeat(C, 1, 1, 1).to(dev).to(dt)  # vertical
+        pad_h = (0, 0, k // 2, k // 2)
+        pad_v = (k // 2, k // 2, 0, 0)
 
-        def _gauss_blur(x):
-            return F.conv2d(x, kernel, padding=pad, groups=C)
+        def _gauss_blur_sep(x):
+            x = F.pad(x, pad_h, mode="reflect")
+            x = F.conv2d(x, k_h, groups=C)
+            x = F.pad(x, pad_v, mode="reflect")
+            x = F.conv2d(x, k_v, groups=C)
+            return x
 
-        out_struct = _gauss_blur(out_chw)
-        lr_struct = _gauss_blur(lr_chw)
+        out_struct = _gauss_blur_sep(out_chw)
+        lr_struct = _gauss_blur_sep(lr_chw)
 
         # Detail = original - structure
         out_detail = out_chw - out_struct
@@ -1675,6 +1682,7 @@ def _flashvsr_upscale(frames, scale, seed=42, anti_ghost=0.4, local_range=5):
         out_chw = (mixed_struct + mixed_detail).clamp(0, 1)
         out = out_chw.permute(0, 2, 3, 1).contiguous()
 
+    print(f"[BSAI-H3-upscale] anti-ghost done in {_t.time()-_t0:.1f}s")
     return out
 
 
@@ -3019,10 +3027,15 @@ class BSAI_H3_Upscale4K:
         detail_eff, mode_eff, soft_eff, adaptive_used = _apply_input_adaptive(
             input_adaptive, in_short, detail_amount, detail_mode, softness)
         # Temporal consistency (motion-compensated neighbour blend) + detail USM
+        # Clean VRAM before GPU post-processing (FlashVSR may leave fragmented memory)
+        if torch.cuda.is_available():
+            gc.collect(); torch.cuda.empty_cache(); torch.cuda.synchronize()
         t_td = time.time()
+        print(f"[BSAI-H3-upscale] post-processing: detail={detail_eff:.2f}, soft={soft_eff:.2f}, temporal={temporal_strength:.2f}...")
         out = _video_temporal_detail(out, lr_np, temporal_strength, detail_eff,
                                      detail_radius, eff_scale, mode_eff)
         td_elapsed = time.time() - t_td
+        print(f"[BSAI-H3-upscale] detail+temporal done in {td_elapsed:.1f}s")
 
         # Softness (Topaz-style) — GPU, then back to CPU.
         # OOM fallback: if GPU runs out (e.g. 4K 56-frame batch), process on CPU.

@@ -1645,21 +1645,19 @@ def _flashvsr_upscale(frames, scale, seed=42, anti_ghost=0.4, local_range=5):
             k += 1
         sigma = k / 3.0
 
-        # Compute structure via separable Gaussian blur on GPU (CPU was 340s
-        # for 124 frames at 2752x1536; GPU does it in seconds).
-        out_chw = out.permute(0, 3, 1, 2)         # (T, C, H, W)
-        lr_chw = lr_up.permute(0, 3, 1, 2)
+        # Compute structure via separable Gaussian blur on GPU in chunks
+        # (all 124 frames at once = ~50GB VRAM, OOM; chunk 20 frames = ~8GB).
+        out_chw = out.permute(0, 3, 1, 2).contiguous()   # (T, C, H, W) on CPU
+        lr_chw = lr_up.permute(0, 3, 1, 2).contiguous()
 
         coords = torch.arange(k, dtype=torch.float32) - (k - 1.0) / 2.0
         gauss_1d = torch.exp(-(coords ** 2) / (2.0 * sigma ** 2))
         gauss_1d = gauss_1d / gauss_1d.sum()
         C = out_chw.shape[1]
-        # Move to GPU for the heavy blur pass (clean VRAM first)
+        T = out_chw.shape[0]
         gpu_dev = "cuda:0" if torch.cuda.is_available() else "cpu"
         if gpu_dev != "cpu":
             import gc as _gc3; _gc3.collect(); torch.cuda.empty_cache()
-        out_chw = out_chw.to(gpu_dev)
-        lr_chw = lr_chw.to(gpu_dev)
         k_h = gauss_1d.view(1, 1, 1, k).repeat(C, 1, 1, 1).to(gpu_dev)
         k_v = gauss_1d.view(1, 1, k, 1).repeat(C, 1, 1, 1).to(gpu_dev)
         pad_h = (0, 0, k // 2, k // 2)
@@ -1672,20 +1670,26 @@ def _flashvsr_upscale(frames, scale, seed=42, anti_ghost=0.4, local_range=5):
             x = F.conv2d(x, k_v, groups=C)
             return x
 
-        out_struct = _gauss_blur_sep(out_chw)
-        lr_struct = _gauss_blur_sep(lr_chw)
+        CHUNK = 20
+        out_parts = []
+        for lo in range(0, T, CHUNK):
+            hi = min(lo + CHUNK, T)
+            o_chunk = out_chw[lo:hi].to(gpu_dev)
+            l_chunk = lr_chw[lo:hi].to(gpu_dev)
+            o_struct = _gauss_blur_sep(o_chunk)
+            l_struct = _gauss_blur_sep(l_chunk)
+            o_detail = o_chunk - o_struct
+            l_detail = l_chunk - l_struct
+            m_struct = torch.lerp(o_struct, l_struct, struct_w)
+            m_detail = torch.lerp(o_detail, l_detail, detail_w)
+            result = (m_struct + m_detail).clamp(0, 1).cpu()
+            out_parts.append(result)
+            del o_chunk, l_chunk, o_struct, l_struct, o_detail, l_detail, m_struct, m_detail, result
+            if gpu_dev != "cpu":
+                torch.cuda.empty_cache()
+            print(f"[BSAI-H3-upscale] anti-ghost chunk {lo}-{hi}/{T}", flush=True)
 
-        # Detail = original - structure
-        out_detail = out_chw - out_struct
-        lr_detail = lr_chw - lr_struct
-
-        # Blend structure strongly, detail lightly
-        mixed_struct = torch.lerp(out_struct, lr_struct, struct_w)
-        mixed_detail = torch.lerp(out_detail, lr_detail, detail_w)
-
-        out_chw = (mixed_struct + mixed_detail).clamp(0, 1).cpu()
-        del out_struct, lr_struct, out_detail, lr_detail, mixed_struct, mixed_detail
-        import gc as _gc2; _gc2.collect(); torch.cuda.empty_cache()
+        out_chw = torch.cat(out_parts, dim=0)
         out = out_chw.permute(0, 2, 3, 1).contiguous()
 
     print(f"[BSAI-H3-upscale] anti-ghost done in {_t.time()-_t0:.1f}s")

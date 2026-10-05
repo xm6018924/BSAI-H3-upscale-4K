@@ -1645,8 +1645,8 @@ def _flashvsr_upscale(frames, scale, seed=42, anti_ghost=0.4, local_range=5):
             k += 1
         sigma = k / 3.0
 
-        # Compute structure via separable Gaussian blur (two 1D passes = 23x
-        # faster than one k*k 2D conv on CPU for k=47).
+        # Compute structure via separable Gaussian blur on GPU (CPU was 340s
+        # for 124 frames at 2752x1536; GPU does it in seconds).
         out_chw = out.permute(0, 3, 1, 2)         # (T, C, H, W)
         lr_chw = lr_up.permute(0, 3, 1, 2)
 
@@ -1654,10 +1654,14 @@ def _flashvsr_upscale(frames, scale, seed=42, anti_ghost=0.4, local_range=5):
         gauss_1d = torch.exp(-(coords ** 2) / (2.0 * sigma ** 2))
         gauss_1d = gauss_1d / gauss_1d.sum()
         C = out_chw.shape[1]
-        dev = out_chw.device
-        dt = out_chw.dtype
-        k_h = gauss_1d.view(1, 1, 1, k).repeat(C, 1, 1, 1).to(dev).to(dt)  # horizontal
-        k_v = gauss_1d.view(1, 1, k, 1).repeat(C, 1, 1, 1).to(dev).to(dt)  # vertical
+        # Move to GPU for the heavy blur pass (clean VRAM first)
+        gpu_dev = "cuda:0" if torch.cuda.is_available() else "cpu"
+        if gpu_dev != "cpu":
+            import gc as _gc3; _gc3.collect(); torch.cuda.empty_cache()
+        out_chw = out_chw.to(gpu_dev)
+        lr_chw = lr_chw.to(gpu_dev)
+        k_h = gauss_1d.view(1, 1, 1, k).repeat(C, 1, 1, 1).to(gpu_dev)
+        k_v = gauss_1d.view(1, 1, k, 1).repeat(C, 1, 1, 1).to(gpu_dev)
         pad_h = (0, 0, k // 2, k // 2)
         pad_v = (k // 2, k // 2, 0, 0)
 
@@ -1679,7 +1683,9 @@ def _flashvsr_upscale(frames, scale, seed=42, anti_ghost=0.4, local_range=5):
         mixed_struct = torch.lerp(out_struct, lr_struct, struct_w)
         mixed_detail = torch.lerp(out_detail, lr_detail, detail_w)
 
-        out_chw = (mixed_struct + mixed_detail).clamp(0, 1)
+        out_chw = (mixed_struct + mixed_detail).clamp(0, 1).cpu()
+        del out_struct, lr_struct, out_detail, lr_detail, mixed_struct, mixed_detail
+        import gc as _gc2; _gc2.collect(); torch.cuda.empty_cache()
         out = out_chw.permute(0, 2, 3, 1).contiguous()
 
     print(f"[BSAI-H3-upscale] anti-ghost done in {_t.time()-_t0:.1f}s")
@@ -3029,7 +3035,8 @@ class BSAI_H3_Upscale4K:
         # Temporal consistency (motion-compensated neighbour blend) + detail USM
         # Clean VRAM before GPU post-processing (FlashVSR may leave fragmented memory)
         if torch.cuda.is_available():
-            gc.collect(); torch.cuda.empty_cache(); torch.cuda.synchronize()
+            import gc as _gc
+            _gc.collect(); torch.cuda.empty_cache(); torch.cuda.synchronize()
         t_td = time.time()
         print(f"[BSAI-H3-upscale] post-processing: detail={detail_eff:.2f}, soft={soft_eff:.2f}, temporal={temporal_strength:.2f}...")
         out = _video_temporal_detail(out, lr_np, temporal_strength, detail_eff,

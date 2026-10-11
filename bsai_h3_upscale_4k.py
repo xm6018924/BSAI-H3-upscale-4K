@@ -29,6 +29,7 @@ import time
 import threading
 import urllib.request
 import shutil
+import functools
 
 import numpy as np
 import torch
@@ -45,11 +46,40 @@ import folder_paths
 
 # Speed: let cuDNN autotune conv kernels for the fixed video-frame sizes used here.
 # Measured ~2x faster on RTX 5090 vs default heuristics.
-try:
-    torch.backends.cudnn.benchmark = True
-    torch.backends.cudnn.allow_tf32 = True
-except Exception:
-    pass
+#
+# NOTE(全局副作用修复): 原先在模块导入时直接设置
+#   torch.backends.cudnn.benchmark = True
+#   torch.backends.cudnn.allow_tf32  = True
+# 这是进程级全局设置，会覆盖 ComfyUI 默认值（未加 --fast 时本应为 False），
+# 并泄漏给所有其它插件（实测导致 ComfyUI-Qwen-TTS 声码器首次 decode 对大量
+# 卷积形状做 cuDNN 穷举搜索，冷启单次卡约 40 分钟）。
+# 现已改为 @_cudnn_fast 装饰器：仅在本插件各推理函数执行期间临时开启，
+# 函数结束立即恢复进入前的原值，不再影响其它插件。
+def _cudnn_fast(fn):
+    """推理期间临时开启 cuDNN autotune（benchmark / allow_tf32），结束即恢复。
+
+    嵌套调用安全：恢复的是"进入本函数前"的值，外层函数退出时再恢复成更早的值，
+    最终回到进程原始状态。属性不存在（CPU-only 等）时静默跳过，不抛异常。
+    """
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        b = torch.backends.cudnn
+        old_bench = getattr(b, "benchmark", False)
+        old_tf32 = getattr(b, "allow_tf32", False)
+        try:
+            try:
+                b.benchmark = True
+                b.allow_tf32 = True
+            except Exception:
+                pass
+            return fn(*args, **kwargs)
+        finally:
+            try:
+                b.benchmark = old_bench
+                b.allow_tf32 = old_tf32
+            except Exception:
+                pass
+    return wrapper
 
 # ==== BSAI NPU 人脸检测卸载：利用 Intel NPU 减轻 GPU1 负担 ====
 # 当 face_det_backend 设为 NPU / 自动 时，人脸检测走 NPU SCRFD，
@@ -829,6 +859,7 @@ def _compute_flow_pairs(lr_np, max_size=512):
     if not _HAS_CV2 or lr_np is None or lr_np.shape[0] < 2:
         return []
     h, w = lr_np.shape[1], lr_np.shape[2]
+    B = lr_np.shape[0]
     ds = 1.0
     th, tw = h, w
     if max(max(h, w), 1) > max_size:
@@ -2818,6 +2849,7 @@ class BSAI_H3_Upscale4K:
         "FlashVSR / SeedVR2 diffusion tiers (own weight paths), NVIDIA RTX VSR, "
         "and Topaz generative tier (Starlight 2.6 / Astra / Wonder 3.5), all with our post-processing on top."
     )
+    @_cudnn_fast
     def upscale(self, **kw):
         g = kw.get
         images = g("images / 图像")
@@ -3468,6 +3500,7 @@ class BSAI_H3_Upscale4K_Latent:
                 f"{w_out * ds}x{h_out * ds} | eff_scale {eff_actual:.4f}x | "
                 f"learned-3d: {name} | {precision}")
         return (result, w_out * ds, h_out * ds, float(eff_actual), info)
+    @_cudnn_fast
     def upscale(self, **kw):
         g = kw.get
         samples = g("samples / 潜空间")
@@ -3530,6 +3563,7 @@ class BSAI_H3_FaceRestore:
         "GFPGAN/CodeFormer regenerate, fixes small/distant broken faces.\n"
         "v2.2.0: inverted adaptive strength (small=stronger) + 2x pre-upscale + 1920 re-scan."
     )
+    @_cudnn_fast
     def restore(self, **kw):
         g = kw.get
         images = g("images / 图像")
@@ -3989,6 +4023,7 @@ class BSAI_TopazEngine_FaceRestore:
         "参数名中英双语 / Parameters bilingual (EN / 中文)."
     )
 
+    @_cudnn_fast
     def run(self, **kw):
         g = kw.get
         images = g("images / 图像")
@@ -4123,6 +4158,7 @@ class BSAI_H3_DLSS5:
         "DLSS 5 standalone video upscaler: DLSS SR + Neural Rendering via video2dlssnr.exe."
     )
 
+    @_cudnn_fast
     def run(self, **kw):
         g = kw.get
         images = g("images / 图像")

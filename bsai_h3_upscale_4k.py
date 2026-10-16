@@ -532,7 +532,7 @@ def _load_model(path, use_fp16):
         from safetensors.torch import load_file
         state = load_file(path)
     else:
-        state = torch.load(path, map_location="cpu", weights_only=False)
+        state = torch.load(path, map_location="cpu", weights_only=True)
         if "params_ema" in state:
             state = state["params_ema"]
         elif "params" in state:
@@ -1316,8 +1316,8 @@ def _restore_faces_frame(img, boxes, sess, mode, blend, fidelity=0.75,
 def _map_det_backend(raw):
     """把界面选项映射为内部 backend 字符串。"""
     mapping = {
-        "自动(Auto)": "auto",
-        "NPU 卸载": "NPU",
+        "Auto": "auto",
+        "NPU Offload": "NPU",
         "GPU1 (YOLOv8)": "GPU1",
     }
     return mapping.get(raw, "auto")
@@ -2218,23 +2218,14 @@ def _dlssnr_find_exe():
     if prov:
         return prov
     raise RuntimeError(
-        "[BSAI-H3/DLSS5] 未找到 video2dlssnr.exe。DLSS 5 引擎需要 4 个文件放入 " + _dlssnr_exe_dir() + " ：\n"
-        "  video2dlssnr.exe (0.4MB) + nvngx_dlss.dll (56MB) + nvngx_dlssnr.dll (158MB) + nvngx.dll_dlssnr.dll (13KB)\n"
-        "请任选一种：\n"
-        "  1) 设置环境变量 VIDEO2DLSSNR_EXE 指向 exe 完整路径；\n"
-        "  2) 把 video2dlssnr/out/ 整个目录（exe + 3 个 nvngx DLL）复制到 " + _dlssnr_exe_dir() + " ；\n"
-        "  3) 把可执行文件放入本插件 bin/ 目录；\n"
-        "  4) 若本机其它 ComfyUI 整合包 models/DLSS5/ 已有这套文件，插件会自动发现并直接使用（也可把该目录设为环境变量 VIDEO2DLSSNR_PACK_DIR）；\n"
-        "  5) 运行插件目录下的 python install.py 自动获取/复制。\n"
-        "项目: https://github.com/DaniilSokolyuk/video2dlssnr\n"
-        "[EN] video2dlssnr.exe not found. The DLSS 5 engine needs 4 files in " + _dlssnr_exe_dir() + " :\n"
+        "[BSAI-H3/DLSS5] video2dlssnr.exe not found. The DLSS 5 engine needs 4 files in " + _dlssnr_exe_dir() + " :\n"
         "  video2dlssnr.exe (0.4MB) + nvngx_dlss.dll (56MB) + nvngx_dlssnr.dll (158MB) + nvngx.dll_dlssnr.dll (13KB)\n"
         "Choose any one:\n"
         "  1) Set env var VIDEO2DLSSNR_EXE to the full exe path;\n"
         "  2) Copy the whole video2dlssnr/out/ dir (exe + 3 nvngx DLLs) into " + _dlssnr_exe_dir() + " ;\n"
         "  3) Put the exe into this plugin's bin/ dir;\n"
         "  4) If another ComfyUI pack on this machine already has these files under models/DLSS5/, the plugin auto-discovers it (or set env var VIDEO2DLSSNR_PACK_DIR to that dir);\n"
-        "  5) Run `python install.py` in the plugin dir to fetch/copy automatically.\n"
+        "  5) Manually download video2dlssnr.exe from the official release page below and verify its SHA-256 before use.\n"
         "Project: https://github.com/DaniilSokolyuk/video2dlssnr"
     )
 
@@ -2518,7 +2509,7 @@ def _vosr_upscale(frames, scale=4.0, cfg_scale=0.5, infer_steps=1):
         proc = subprocess.run(cmd, cwd=home, capture_output=True, text=True,
                               timeout=1800)
         if proc.returncode != 0:
-            raise RuntimeError("[BSAI-H3/VOSR] 推理失败 (exit %s)\n%s" %
+            raise RuntimeError("[BSAI-H3/VOSR] inference failed (exit %s)\n%s" %
                                (proc.returncode, (proc.stderr or "")[-2000:]))
         out_files = sorted(f2 for f2 in os.listdir(out_dir) if f2.endswith(".png"))
         if len(out_files) < b:
@@ -2571,11 +2562,11 @@ def _apply_input_adaptive(input_adaptive, in_short, detail_amount, detail_mode, 
     低清输入激进重建，避免过度锐化/伪影）。
     返回 (detail_eff, mode_eff, soft_eff, used_label)。"""
     detail_eff, mode_eff, soft_eff = detail_amount, detail_mode, softness
-    if input_adaptive == "自动":
+    if input_adaptive == "Auto":
         uhd = in_short >= 720.0
-    elif input_adaptive == "UHD 保守档":
+    elif input_adaptive == "UHD Conservative":
         uhd = True
-    elif input_adaptive == "HD 增强档":
+    elif input_adaptive == "HD Enhance":
         uhd = False
     else:
         uhd = None
@@ -2584,15 +2575,15 @@ def _apply_input_adaptive(input_adaptive, in_short, detail_amount, detail_mode, 
         detail_eff = min(float(detail_amount) * 0.6, 0.35)
         mode_eff = "classic"
         soft_eff = max(float(softness), 0.15)
-        return detail_eff, mode_eff, soft_eff, "UHD 保守档"
+        return detail_eff, mode_eff, soft_eff, "UHD Conservative"
     if uhd is False:
         # <720p: 细节增强 1.2 倍(上限 0.6，防生成式引擎叠加 USM 过度锐化/伪影)
         detail_eff = min(float(detail_amount) * 1.2, 0.6)
         return detail_eff, mode_eff, soft_eff, "HD 增强档"
-    return detail_eff, mode_eff, soft_eff, "关"
+    return detail_eff, mode_eff, soft_eff, "Off"
 
 
-def _auto_route(images, prefer="质量优先", scale=4.0, user_face='Off',
+def _auto_route(images, prefer="Quality", scale=4.0, user_face='Off',
                 user_detail=0.5, user_detail_mode='smart', user_adaptive='自动'):
     """v2.7.0: 模型自动路由（对标 HitPaw VikPea 多模型选择器：General /
     Animation / Portrait / UltraHD / Generative 按需选型）。零新依赖——
@@ -2640,7 +2631,7 @@ def _auto_route(images, prefer="质量优先", scale=4.0, user_face='Off',
                  f", 输入 {int(W)}x{int(H)} ({'HD/UHD' if in_short >= 720 else 'SD'})")
     # ---- 偏好 → 引擎 ----
     over = {}
-    if prefer == "质量优先":
+    if prefer == "Quality":
         if has_seed_fp8 and cuda:
             engine = "SeedVR2 7B (扩散视频超分)"
             notes.append("引擎: SeedVR2 fp8 (扩散, 精度最高)")
@@ -2661,16 +2652,16 @@ def _auto_route(images, prefer="质量优先", scale=4.0, user_face='Off',
             over["sv2_steps"] = 16
             over["sv2_cfg"] = 1.5
             notes.append("SeedVR2 INT8: 采样增强 16步/CFG1.5 (质量优先)")
-    elif prefer == "速度优先":
+    elif prefer == "Speed":
         engine = "realesr-general-x4v3.pth"
         notes.append("引擎: Real-ESRGAN general (速度优先)")
-    elif prefer == "人像优先":
+    elif prefer == "Portrait":
         engine = "RealESRGAN_x4plus.pth" if has("upscale_models", "RealESRGAN_x4plus.pth") else "realesr-general-x4v3.pth"
         notes.append("引擎: " + engine)
         over["face_restore"] = "CodeFormer"
         over["face_temporal"] = 0.5
         notes.append("后处理: 强制 CodeFormer 人脸修复 + 时域稳定")
-    elif prefer == "动漫优先":
+    elif prefer == "Anime":
         engine = anime if anime else "realesr-general-x4v3.pth"
         notes.append("引擎: " + (anime or "general (无 anime 权重, 回退 general+smart)"))
         if not anime:
@@ -2678,24 +2669,49 @@ def _auto_route(images, prefer="质量优先", scale=4.0, user_face='Off',
     else:  # UHD 优先
         engine = "realesr-general-x4v3.pth"
         notes.append("引擎: Real-ESRGAN general")
-        over["input_adaptive"] = "UHD 保守档"
+        over["input_adaptive"] = "UHD Conservative"
         notes.append("后处理: UHD 保守细节 (防过度锐化)")
     # ---- 通用智能补强 ----
-    if face_found and user_face == "Off" and prefer != "人像优先":
+    if face_found and user_face == "Off" and prefer != "Portrait":
         over["face_restore"] = "CodeFormer"
         over["face_temporal"] = 0.5
         # 轻修复：CodeFormer 保真 0.45 + 融合 0.55 —— 只补细节、不改脸型，避免“塑料感”
         over["face_fidelity"] = 0.45
         over["face_blend"] = 0.55
         notes.append("检测到人脸 → 自动开启 CodeFormer(轻修复 保真0.45/融合0.55) + 时域稳定")
-    if prefer == "质量优先" and "input_adaptive" not in over:
+    if prefer == "Quality" and "input_adaptive" not in over:
         if in_short >= 720:
-            over["input_adaptive"] = "UHD 保守档"
+            over["input_adaptive"] = "UHD Conservative"
             notes.append("高清输入 → UHD 保守细节")
         elif in_short < 540:
-            over["input_adaptive"] = "HD 增强档"
+            over["input_adaptive"] = "HD Enhance"
             notes.append("低清输入 → HD 增强细节 (生成式重建)")
     return engine, over, notes
+
+
+# Legacy (pre-i18n) Chinese widget values -> current English values, so workflows
+# saved before the UI localization keep working without re-selecting widgets.
+_LEGACY_AUTO_PREFER = {"质量优先": "Quality", "速度优先": "Speed", "人像优先": "Portrait",
+                       "动漫优先": "Anime", "UHD优先": "UHD"}
+_LEGACY_INPUT_ADAPTIVE = {"自动": "Auto", "关": "Off", "UHD 保守档": "UHD Conservative",
+                          "HD 增强档": "HD Enhance"}
+_LEGACY_DET_BACKEND = {"自动(Auto)": "Auto", "NPU 卸载": "NPU Offload",
+                       "GPU1 (YOLOv8)": "GPU1 (YOLOv8)"}
+_LEGACY_FACE_RESTORE = {"Small-Face (CodeFormer)": "Small-Face (CodeFormer)"}
+_LEGACY_ENGINE = {
+    "自动路由 (按内容/输入推荐)": "Auto Route (content-based)",
+    "FlashVSR-v1.1 (扩散视频超分)": "FlashVSR-v1.1 (diffusion video SR)",
+    "SeedVR2 7B (扩散视频超分)": "SeedVR2 7B (diffusion video SR)",
+    "SeedVR2 7B INT8 (ComfyUI原生)": "SeedVR2 7B INT8 (native ComfyUI)",
+    "DLSS 5 (NVIDIA 神经渲染超分)": "DLSS 5 (NVIDIA neural SR)",
+    "VOSR 2.0 (CVPR2026生成式超分)": "VOSR 2.0 (CVPR2026 generative SR)",
+    "VOSR 2.0 + DLSS 5 (双引擎完美档)": "VOSR 2.0 + DLSS 5 (dual-engine)",
+    "VOSR 2.0 + RTX (视频推荐两级放大)": "VOSR 2.0 + RTX (recommended 2-stage)",
+    "Topaz 星光 2.6 (生成式完美档)": "Topaz Starlight 2.6 (generative)",
+    "Topaz Astra (生成式)": "Topaz Astra (generative)",
+    "Topaz Wonder 3.5 (生成式)": "Topaz Wonder 3.5 (generative)",
+}
+_LEGACY_TOPAZ_MODEL = {"星光 2.6": "Starlight 2.6"}
 
 
 class BSAI_H3_Upscale4K:
@@ -2704,15 +2720,15 @@ class BSAI_H3_Upscale4K:
     # Third-party diffusion / GPU engine options (prepended to the model list).
     # Each keeps its own weights path unchanged; loaded lazily via wrappers above.
     ENGINE_OPTIONS = {
-        "自动路由 (按内容/输入推荐)": "auto",
-        "FlashVSR-v1.1 (扩散视频超分)": "flashvsr",
-        "SeedVR2 7B (扩散视频超分)": "seedvr2",
-        "SeedVR2 7B INT8 (ComfyUI原生)": "seedvr2_int8",
+        "Auto Route (content-based)": "auto",
+        "FlashVSR-v1.1 (diffusion video SR)": "flashvsr",
+        "SeedVR2 7B (diffusion video SR)": "seedvr2",
+        "SeedVR2 7B INT8 (native ComfyUI)": "seedvr2_int8",
         "NVIDIA RTX Video Super Res": "rtx",
-        "DLSS 5 (NVIDIA 神经渲染超分)": "dlss5",
-        "VOSR 2.0 (CVPR2026生成式超分)": "vosr2",
-        "VOSR 2.0 + DLSS 5 (双引擎完美档)": "vosr_dlss",
-        "VOSR 2.0 + RTX (视频推荐两级放大)": "vosr_rtx",
+        "DLSS 5 (NVIDIA neural SR)": "dlss5",
+        "VOSR 2.0 (CVPR2026 generative SR)": "vosr2",
+        "VOSR 2.0 + DLSS 5 (dual-engine)": "vosr_dlss",
+        "VOSR 2.0 + RTX (recommended 2-stage)": "vosr_rtx",
     }
 
     # Generative Topaz engine options (prepended to the Real-ESRGAN model list).
@@ -2720,9 +2736,9 @@ class BSAI_H3_Upscale4K:
     # Real-ESRGAN — single-node "完美档" with our detail/softness/face-restore
     # post-processing still available on top.
     TOPAZ_OPTIONS = {
-        "Topaz 星光 2.6 (生成式完美档)": "slp-26",
-        "Topaz Astra (生成式)": "astra",
-        "Topaz Wonder 3.5 (生成式)": "wonder-3.5",
+        "Topaz Starlight 2.6 (generative)": "slp-26",
+        "Topaz Astra (generative)": "astra",
+        "Topaz Wonder 3.5 (generative)": "wonder-3.5",
     }
 
     @classmethod
@@ -2730,121 +2746,121 @@ class BSAI_H3_Upscale4K:
         models = list(cls.ENGINE_OPTIONS.keys()) + list(cls.TOPAZ_OPTIONS.keys()) + list_available_models()
         return {
             "required": {
-                "images / 图像": ("IMAGE",),
+                "images": ("IMAGE",),
                 # v2.8.1 自动路由偏好（仅当 model_name = 自动路由 时生效）：置于模型选择之上，
                 # 先选偏好档位再看引擎，符合“按内容/输入推荐”的操作直觉。
-                "auto_prefer / 自动路由偏好": (["质量优先", "速度优先", "人像优先", "动漫优先", "UHD优先"], {"default": "质量优先"}),
+                "auto_prefer": (["Quality", "Speed", "Portrait", "Anime", "UHD"], {"default": "Quality"}),
                 # general-x4v3 default: ~8x faster than x4plus with nearly identical
                 # quality (PSNR ~39 dB on test frames). x4plus = max quality, slowest.
-                "model_name / 模型": (models, {"default": "realesr-general-x4v3.pth"}),
+                "model_name": (models, {"default": "realesr-general-x4v3.pth"}),
                 # Scale supports any value 1.0-8.0 (incl. Topaz-style precise ratios
                 # like 2.67 / 3.0): integer multiples of the model run directly,
                 # other ratios are super-resolved to the next model integer scale and
                 # then resized to the exact target (even-pixel aligned). 4 = 4K class.
-                "scale / 放大倍数": ("FLOAT", {"default": 4.0, "min": 1.0, "max": 8.0, "step": 0.01}),
+                "scale": ("FLOAT", {"default": 4.0, "min": 1.0, "max": 8.0, "step": 0.01}),
                 # tile_size=0 => full-image fast path (recommended on RTX 30xx+).
                 # Use a positive tile only if you run out of VRAM.
-                "tile_size / 分块大小": ("INT", {"default": 0, "min": 0, "max": 2048, "step": 16}),
-                "tile_pad / 分块重叠": ("INT", {"default": 16, "min": 0, "max": 128, "step": 4}),
-                "batch_frames / 批帧数": ("INT", {"default": 4, "min": 1, "max": 128, "step": 1}),
-                "use_fp16 / 半精度": ("BOOLEAN", {"default": True}),
+                "tile_size": ("INT", {"default": 0, "min": 0, "max": 2048, "step": 16}),
+                "tile_pad": ("INT", {"default": 16, "min": 0, "max": 128, "step": 4}),
+                "batch_frames": ("INT", {"default": 4, "min": 1, "max": 128, "step": 1}),
+                "use_fp16": ("BOOLEAN", {"default": True}),
                 # torch.compile: ~1.6-1.9x faster on fixed-size video frames.
                 # One-time compile cost on first run, then cached process-wide.
-                "use_compile / 编译加速": ("BOOLEAN", {"default": True}),
+                "use_compile": ("BOOLEAN", {"default": True}),
                 # Temporal consistency: motion-compensated blend with neighbours
                 # (Farneback optical flow on LR, GPU warp on SR). 0 = off.
-                "temporal_strength / 时序强度": ("FLOAT", {"default": 0.20, "min": 0.0, "max": 0.8, "step": 0.05}),
+                "temporal_strength": ("FLOAT", {"default": 0.20, "min": 0.0, "max": 0.8, "step": 0.05}),
                 # Detail enhancement: separable-Gaussian unsharp mask on SR. 0 = off.
-                "detail_amount / 细节强度": ("FLOAT", {"default": 0.50, "min": 0.0, "max": 1.5, "step": 0.05}),
-                "detail_radius / 细节半径": ("FLOAT", {"default": 1.8, "min": 0.3, "max": 8.0, "step": 0.1}),
+                "detail_amount": ("FLOAT", {"default": 0.50, "min": 0.0, "max": 1.5, "step": 0.05}),
+                "detail_radius": ("FLOAT", {"default": 1.8, "min": 0.3, "max": 8.0, "step": 0.1}),
                 # Softness (borrowed from Topaz Starlight): after detail USM, blend
                 # back a small fraction of a Gaussian-blurred copy to tame overshoot
                 # and blocky artifacts. 0 = off, ~0.3 gentle, 1.0 very soft.
-                "softness / 柔和度": ("FLOAT", {"default": 0.10, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "softness": ("FLOAT", {"default": 0.10, "min": 0.0, "max": 1.0, "step": 0.05}),
                 # Face restoration: detects faces (YOLOv8-Face, multi-scale)
                 # then regenerates facial structure with GFPGAN / CodeFormer
                 # (ONNX, GPU). v2.2.0: small faces get STRONGER restoration
                 # (inverted adaptive strength + 2x pre-upscale + lower fidelity),
                 # fixing H3's distant small-face blur / deformation.
-                "face_restore / 人脸修复": (["Off", "GFPGANv1.4", "CodeFormer", "小脸增强(CodeFormer)"], {"default": "Off"}),
+                "face_restore": (["Off", "GFPGANv1.4", "CodeFormer", "Small-Face (CodeFormer)"], {"default": "Off"}),
                 # v2.9.0 人脸检测后端选择：利用 NPU/XPU 减轻 GPU1 负担
                 # auto = 优先 NPU，不可用回退 GPU1；NPU = 强制 NPU；GPU1 = 强制 GPU1 YOLOv8
-                "face_det_backend / 检测后端": (["自动(Auto)", "NPU 卸载", "GPU1 (YOLOv8)"], {"default": "自动(Auto)"}),
+                "face_det_backend": (["Auto", "NPU Offload", "GPU1 (YOLOv8)"], {"default": "Auto"}),
                 # Face detector confidence threshold (lower = more detections,
                 # including tiny distant faces; may add false positives).
                 # v2.2.0 default 0.15 + multi-scale 1920 re-scan catches small faces.
-                "face_det_conf / 检测置信度": ("FLOAT", {"default": 0.15, "min": 0.05, "max": 0.95, "step": 0.05}),
+                "face_det_conf": ("FLOAT", {"default": 0.15, "min": 0.05, "max": 0.95, "step": 0.05}),
                 # How strongly the restored face is blended over the original
                 # crop. 1.0 = full restore, ~0.70 = balanced (small faces get
                 # adaptive strength boost in v2.2.0).
-                "face_blend / 融合强度": ("FLOAT", {"default": 0.70, "min": 0.1, "max": 1.0, "step": 0.05}),
+                "face_blend": ("FLOAT", {"default": 0.70, "min": 0.1, "max": 1.0, "step": 0.05}),
                 # CodeFormer fidelity (0 = heavy regeneration for badly-broken
                 # faces, 1 = preserve original structure/details). v2.2.0
                 # default 0.60: small faces auto-push even lower (more rebuild).
-                "face_fidelity / 保真度": ("FLOAT", {"default": 0.60, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "face_fidelity": ("FLOAT", {"default": 0.60, "min": 0.0, "max": 1.0, "step": 0.05}),
                 # Detail rebuild mode: classic = unsharp mask only; smart =
                 # unsharp + light local-contrast rebuild (generative-style
                 # texture, gated to avoid halos) — reads closer to Topaz /
                 # FlashVSR's reconstructed texture.
-                "detail_mode / 细节模式": (["classic", "smart"], {"default": "smart"}),
+                "detail_mode": (["classic", "smart"], {"default": "smart"}),
                 # v2.7.0 输入自适应（对标 HitPaw Ultra HD：高清输入保守细节防过锐，
                 # 低清输入激进重建）。对全部像素路径生效。
-                "input_adaptive / 输入自适应": (["自动", "关", "UHD 保守档", "HD 增强档"], {"default": "自动"}),
+                "input_adaptive": (["Auto", "Off", "UHD Conservative", "HD Enhance"], {"default": "Auto"}),
                 # v2.7.0 人脸时域稳定（对标 HitPaw portrait_restore 时空对齐）：
                 # 跨帧跟踪 + 修复强度参数 EMA，消除“框抖动→强度跳变”闪烁。
                 # 0=关(等同 v2.6 行为)；0.5=推荐；1.0=完全跟随历史轨迹。
-                "face_temporal / 人脸时域稳定": ("FLOAT", {"default": 0.50, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "face_temporal": ("FLOAT", {"default": 0.50, "min": 0.0, "max": 1.0, "step": 0.05}),
                 # DLSS 5 专属参数（仅当 model_name 选择 DLSS 5 时生效）：
                 # style=NR 风格（Cinematic 默认最干净）；intensity/detail 控制
                 # 神经渲染叠加强度；motion=光流运动矢量（时序稳定，防闪烁）。
-                "dlss_style / DLSS风格": (["Cinematic", "Default", "Natural"], {"default": "Cinematic"}),
-                "dlss_intensity / DLSS强度": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05}),
-                "dlss_detail / DLSS细节": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05}),
-                "dlss_motion / DLSS光流": ("BOOLEAN", {"default": True}),
+                "dlss_style": (["Cinematic", "Default", "Natural"], {"default": "Cinematic"}),
+                "dlss_intensity": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05}),
+                "dlss_detail": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05}),
+                "dlss_motion": ("BOOLEAN", {"default": True}),
                 # VOSR 2.0 专属参数
-                "vosr_cfg / VOSR保真度": ("FLOAT", {"default": 0.5, "min": -2.0, "max": 2.0, "step": 0.1}),
-                "vosr_steps / VOSR步数": ("INT", {"default": 1, "min": 1, "max": 25, "step": 1}),
+                "vosr_cfg": ("FLOAT", {"default": 0.5, "min": -2.0, "max": 2.0, "step": 0.1}),
+                "vosr_steps": ("INT", {"default": 1, "min": 1, "max": 25, "step": 1}),
                 # VOSR+DLSS串联时的各自倍率
-                "vosr_scale / VOSR倍率": ("INT", {"default": 2, "min": 2, "max": 4, "step": 1}),
-                "dlss_chain_scale / DLSS串联倍率": ("INT", {"default": 2, "min": 1, "max": 3, "step": 1}),
-                "rtx_chain_scale / RTX串联倍率": ("INT", {"default": 2, "min": 1, "max": 3, "step": 1}),
+                "vosr_scale": ("INT", {"default": 2, "min": 2, "max": 4, "step": 1}),
+                "dlss_chain_scale": ("INT", {"default": 2, "min": 1, "max": 3, "step": 1}),
+                "rtx_chain_scale": ("INT", {"default": 2, "min": 1, "max": 3, "step": 1}),
                 # SeedVR2 7B INT8 (ComfyUI 原生) 专属参数：走 ComfyUI 官方 NaDiT
                 # 采样链（comfy.sample.sample），对齐官方 KSampler 配置。
                 # 权重自动查找：diffusion_models/seedvr2_7b_int8_convrot.safetensors
                 # (INT8 优先) → 其它 seedvr2_*.safetensors → SEEDVR2/；VAE 自动查找
                 # SEEDVR2/ → vae/seedvr2_ema_vae_fp16.safetensors → vae/ema_vae_fp16。
-                "sv2_steps / SeedVR2步数": ("INT", {"default": 12, "min": 1, "max": 100, "step": 1}),
-                "sv2_cfg / SeedVR2保真度": ("FLOAT", {"default": 1.2, "min": 0.0, "max": 10.0, "step": 0.1}),
-                "sv2_sampler / SeedVR2采样器": (["euler", "dpmpp_2m", "dpmpp_2m_sde", "ddim", "uni_pc"], {"default": "euler"}),
-                "sv2_scheduler / SeedVR2调度器": (["normal", "karras", "simple", "sgm_uniform"], {"default": "normal"}),
-                "sv2_color / SeedVR2色彩校正": (["lab", "wavelet", "adain", "none"], {"default": "lab"}),
+                "sv2_steps": ("INT", {"default": 12, "min": 1, "max": 100, "step": 1}),
+                "sv2_cfg": ("FLOAT", {"default": 1.2, "min": 0.0, "max": 10.0, "step": 0.1}),
+                "sv2_sampler": (["euler", "dpmpp_2m", "dpmpp_2m_sde", "ddim", "uni_pc"], {"default": "euler"}),
+                "sv2_scheduler": (["normal", "karras", "simple", "sgm_uniform"], {"default": "normal"}),
+                "sv2_color": (["lab", "wavelet", "adain", "none"], {"default": "lab"}),
                 # FlashVSR 抗鬼影：扩散视频超分的时序注意力会在运动物体上
                 # 产生帧间内容泄漏（转头多脸、身体轮廓拖影等）。
                 # 使用结构-纹理分层混合：结构层（大轮廓/形状）强力用原图压制
                 # 鬼影，纹理层（细节/肌理）轻度混合以保留 FlashVSR 细节。
                 # 值越高鬼影越少，细节相应减少。0=纯FlashVSR，0.4=推荐。
-                "flashvsr_anti_ghost / FlashVSR抗鬼影": ("FLOAT", {"default": 0.40, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "flashvsr_anti_ghost": ("FLOAT", {"default": 0.40, "min": 0.0, "max": 1.0, "step": 0.05}),
             },
         }
 
     RETURN_TYPES = ("IMAGE", "INT", "INT", "FLOAT", "STRING")
-    RETURN_NAMES = ("IMAGE / 图像", "width / 宽", "height / 高", "scale_used / 实际倍率", "info / 信息")
+    RETURN_NAMES = ("IMAGE", "width", "height", "scale_used", "info")
     FUNCTION = "upscale"
     CATEGORY = "BSAI/H3"
     DESCRIPTION = (
-        "H3 视频专用 AI 超分（像素域）：多引擎集合节点\n"
-        "  • Real-ESRGAN 极速档：general-x4v3 / x4plus，光流时序 + 多尺度细节 + 人脸修复\n"
-        "  • FlashVSR-v1.1 / SeedVR2 7B：扩散式视频超分（各自权重路径不变）\n"
-        "  • NVIDIA RTX Video Super Res：nvidia-vfx GPU 超分（无模型文件）\n"
-        "  • DLSS 5（NVIDIA 神经渲染超分）：DLSS SR + Neural Rendering，RTX 硬件超分，\n"
-        "    video2dlssnr 管道驱动（需 exe + nvngx_dlss.dll + nvngx_dlssnr.dll）\n"
-        "  • VOSR 2.0（CVPR 2026生成式超分）：DiT生成式图像超分，补全细节纹理\n"
-        "  • VOSR 2.0 + DLSS 5 双引擎：VOSR生成细节 -> DLSS硬件放大，质量+速度兼得\n"
-        "  • VOSR 2.0 + RTX 双引擎（视频推荐两级放大）：VOSR去模糊 -> RTX二次清晰化\n"
-        "  • Topaz 生成式完美档：星光 2.6 / Astra / Wonder 3.5 神经引擎（本机 ComfyUI/models/Topaz_Engine），\n"
-        "    单节点即可达 Topaz 官方级人脸细节与纹理，后续 detail/softness/face_restore 仍可叠加。\n"
-        "    Wonder 3.5 = Topaz Photo 图像模型（走 neuroserver/ 引擎，权重在 Topaz Labs LLC/.../models/neuroserver/wonder-all），\n"
-        "    视频输入按逐帧处理（每帧独立调用引擎，速度较慢，约1分钟/帧@512px）。\n"
+        "AI video super-resolution (pixel domain) for H3: a unified multi-engine node.\n"
+        "  • Real-ESRGAN fast tier: general-x4v3 / x4plus, optical-flow temporal + multi-scale detail + face restore\n"
+        "  • FlashVSR-v1.1 / SeedVR2 7B: diffusion video SR (own weight paths unchanged)\n"
+        "  • NVIDIA RTX Video Super Res: nvidia-vfx GPU SR (no model files)\n"
+        "  • DLSS 5 (NVIDIA neural-render SR): DLSS SR + Neural Rendering, RTX hardware SR,\n"
+        "    driven by the video2dlssnr pipeline (needs exe + nvngx_dlss.dll + nvngx_dlssnr.dll)\n"
+        "  • VOSR 2.0 (CVPR 2026 generative SR): DiT generative image SR, completes detail texture\n"
+        "  • VOSR 2.0 + DLSS 5 dual engine: VOSR detail -> DLSS hardware upscale (quality + speed)\n"
+        "  • VOSR 2.0 + RTX dual engine (recommended 2-stage for video): VOSR deblur -> RTX re-sharpen\n"
+        "  • Topaz generative tier: Starlight 2.6 / Astra / Wonder 3.5 neural engine (local ComfyUI/models/Topaz_Engine),\n"
+        "    Topaz-grade face detail and texture in a single node; detail/softness/face_restore still stack on top.\n"
+        "    Wonder 3.5 = Topaz Photo image model (neuroserver/ engine, weights in Topaz Labs LLC/.../models/neuroserver/wonder-all),\n"
+        "    video input is processed frame by frame (slower, ~1 min/frame @512px).\n"
         "Unified multi-engine video super-resolution node: Real-ESRGAN fast tier, "
         "FlashVSR / SeedVR2 diffusion tiers (own weight paths), NVIDIA RTX VSR, "
         "and Topaz generative tier (Starlight 2.6 / Astra / Wonder 3.5), all with our post-processing on top."
@@ -2852,32 +2868,36 @@ class BSAI_H3_Upscale4K:
     @_cudnn_fast
     def upscale(self, **kw):
         g = kw.get
-        images = g("images / 图像")
-        model_name = g("model_name / 模型")
-        scale = g("scale / 放大倍数", 4.0)
-        tile_size = g("tile_size / 分块大小", 0)
-        tile_pad = g("tile_pad / 分块重叠", 16)
-        batch_frames = g("batch_frames / 批帧数", 4)
-        use_fp16 = g("use_fp16 / 半精度", True)
-        use_compile = g("use_compile / 编译加速", True)
-        temporal_strength = g("temporal_strength / 时序强度", 0.2)
-        detail_amount = g("detail_amount / 细节强度", 0.5)
-        detail_radius = g("detail_radius / 细节半径", 1.8)
-        softness = g("softness / 柔和度", 0.1)
-        face_restore = g("face_restore / 人脸修复", 'Off')
-        face_det_backend_raw = g("face_det_backend / 检测后端", '自动(Auto)')
-        face_det_conf = g("face_det_conf / 检测置信度", 0.25)
-        face_blend = g("face_blend / 融合强度", 0.65)
-        face_fidelity = g("face_fidelity / 保真度", 0.75)
-        face_temporal = g("face_temporal / 人脸时域稳定", 0.50)
-        detail_mode = g("detail_mode / 细节模式", 'smart')
-        input_adaptive = g("input_adaptive / 输入自适应", '自动')
-        auto_prefer = g("auto_prefer / 自动路由偏好", '质量优先')
-        dlss_style = g("dlss_style / DLSS风格", 'Cinematic')
-        dlss_intensity = g("dlss_intensity / DLSS强度", 1.0)
-        dlss_detail = g("dlss_detail / DLSS细节", 1.0)
-        dlss_motion = g("dlss_motion / DLSS光流", True)
-        flashvsr_anti_ghost = g("flashvsr_anti_ghost / FlashVSR抗鬼影", 0.30)
+        images = g("images")
+        model_name = g("model_name")
+        scale = g("scale", 4.0)
+        tile_size = g("tile_size", 0)
+        tile_pad = g("tile_pad", 16)
+        batch_frames = g("batch_frames", 4)
+        use_fp16 = g("use_fp16", True)
+        use_compile = g("use_compile", True)
+        temporal_strength = g("temporal_strength", 0.2)
+        detail_amount = g("detail_amount", 0.5)
+        detail_radius = g("detail_radius", 1.8)
+        softness = g("softness", 0.1)
+        face_restore = g("face_restore", 'Off')
+        face_restore = _LEGACY_FACE_RESTORE.get(face_restore, face_restore)
+        face_det_backend_raw = g("face_det_backend", 'Auto')
+        face_det_backend_raw = _LEGACY_DET_BACKEND.get(face_det_backend_raw, face_det_backend_raw)
+        face_det_conf = g("face_det_conf", 0.25)
+        face_blend = g("face_blend", 0.65)
+        face_fidelity = g("face_fidelity", 0.75)
+        face_temporal = g("face_temporal", 0.50)
+        detail_mode = g("detail_mode", 'smart')
+        input_adaptive = g("input_adaptive", 'Auto')
+        input_adaptive = _LEGACY_INPUT_ADAPTIVE.get(input_adaptive, input_adaptive)
+        auto_prefer = g("auto_prefer", 'Quality')
+        auto_prefer = _LEGACY_AUTO_PREFER.get(auto_prefer, auto_prefer)
+        dlss_style = g("dlss_style", 'Cinematic')
+        dlss_intensity = g("dlss_intensity", 1.0)
+        dlss_detail = g("dlss_detail", 1.0)
+        dlss_motion = g("dlss_motion", True)
+        flashvsr_anti_ghost = g("flashvsr_anti_ghost", 0.30)
         t0 = time.time()
         # Free GPU VRAM before upscaling: H3 diffusion model (~20GB) may still
         # be resident from the previous generation node, which causes OOM when
@@ -2931,11 +2951,11 @@ class BSAI_H3_Upscale4K:
             lr_np = None
         elif _engine == "seedvr2_int8":
             # --- SeedVR2 7B INT8 (ComfyUI 原生链) path ----------------------
-            sv2_steps = g("sv2_steps / SeedVR2步数", 12)
-            sv2_cfg = g("sv2_cfg / SeedVR2保真度", 1.2)
-            sv2_sampler = g("sv2_sampler / SeedVR2采样器", "euler")
-            sv2_scheduler = g("sv2_scheduler / SeedVR2调度器", "normal")
-            sv2_color = g("sv2_color / SeedVR2色彩校正", "lab")
+            sv2_steps = g("sv2_steps", 12)
+            sv2_cfg = g("sv2_cfg", 1.2)
+            sv2_sampler = g("sv2_sampler", "euler")
+            sv2_scheduler = g("sv2_scheduler", "normal")
+            sv2_color = g("sv2_color", "lab")
             if "sv2_steps" in over:  # 质量优先档采样增强（补偿 INT8 量化损失）
                 sv2_steps = int(over["sv2_steps"])
             if "sv2_cfg" in over:
@@ -2958,11 +2978,11 @@ class BSAI_H3_Upscale4K:
                 print("[BSAI-H3-upscale-4K] RTX 超分不可用 (%s)，降级到 SeedVR2" % _e)
                 out = _seedvr2_native_upscale(
                     images, float(scale), seed=42,
-                    steps=int(g("sv2_steps / SeedVR2步数", 12)),
-                    cfg=float(g("sv2_cfg / SeedVR2保真度", 1.2)),
-                    sampler_name=g("sv2_sampler / SeedVR2采样器", "euler"),
-                    scheduler=g("sv2_scheduler / SeedVR2调度器", "normal"),
-                    color_correction=g("sv2_color / SeedVR2色彩校正", "lab"),
+                    steps=int(g("sv2_steps", 12)),
+                    cfg=float(g("sv2_cfg", 1.2)),
+                    sampler_name=g("sv2_sampler", "euler"),
+                    scheduler=g("sv2_scheduler", "normal"),
+                    color_correction=g("sv2_color", "lab"),
                 )
             eff_scale = float(out.shape[1] / float(images.shape[1]))
             temporal_strength = 0.0
@@ -2982,8 +3002,8 @@ class BSAI_H3_Upscale4K:
             lr_np = None
         elif _engine == "vosr2":
             # --- VOSR 2.0 (CVPR 2026 generative SR) path -------------------
-            vosr_cfg = g("vosr_cfg / VOSR保真度", 0.5)
-            vosr_steps = g("vosr_steps / VOSR步数", 1)
+            vosr_cfg = g("vosr_cfg", 0.5)
+            vosr_steps = g("vosr_steps", 1)
             out = _vosr_upscale(images, scale=float(scale),
                                 cfg_scale=float(vosr_cfg), infer_steps=int(vosr_steps))
             eff_scale = float(out.shape[1] / float(images.shape[1]))
@@ -2991,8 +3011,8 @@ class BSAI_H3_Upscale4K:
             lr_np = None
         elif _engine == "vosr_dlss":
             # --- VOSR 2.0 -> DLSS 5 two-stage pipeline ---------------------
-            vosr_scale = g("vosr_scale / VOSR倍率", 2)
-            dlss_chain_scale = g("dlss_chain_scale / DLSS串联倍率", 2)
+            vosr_scale = g("vosr_scale", 2)
+            dlss_chain_scale = g("dlss_chain_scale", 2)
             out = _vosr_dlss_chain(
                 images, vosr_scale=int(vosr_scale), dlss_scale=int(dlss_chain_scale),
                 dlss_style=dlss_style, dlss_intensity=float(dlss_intensity),
@@ -3003,8 +3023,8 @@ class BSAI_H3_Upscale4K:
             lr_np = None
         elif _engine == "vosr_rtx":
             # --- VOSR 2.0 -> RTX 两级放大（视频推荐：先 VOSR 去模糊，再接 RTX 二次清晰化）--
-            vosr_scale = g("vosr_scale / VOSR倍率", 2)
-            rtx_chain_scale = g("rtx_chain_scale / RTX串联倍率", 2)
+            vosr_scale = g("vosr_scale", 2)
+            rtx_chain_scale = g("rtx_chain_scale", 2)
             out = _vosr_rtx_chain(
                 images, vosr_scale=int(vosr_scale), rtx_scale=int(rtx_chain_scale),
             )
@@ -3098,7 +3118,7 @@ class BSAI_H3_Upscale4K:
             fr_conf = face_det_conf
             fr_blend = face_blend
             fr_fid = face_fidelity
-            if face_restore == "小脸增强(CodeFormer)":
+            if face_restore == "Small-Face (CodeFormer)":
                 # small-face preset: lower det threshold to catch tiny faces, but
                 # KEEP blend moderate and fidelity high to prevent frame-to-frame
                 # ghosting/flicker caused by aggressive generative restoration.
@@ -3332,7 +3352,7 @@ def _load_latent_3d_model(name, device, precision):
         from safetensors.torch import load_file
         sd = load_file(path, device="cpu")
     else:
-        sd = torch.load(path, map_location="cpu", weights_only=False)
+        sd = torch.load(path, map_location="cpu", weights_only=True)
     if isinstance(sd, dict) and "model" in sd:
         sd = sd["model"]
     sd = {k: (v.to(torch.float16) if v.dtype == torch.float8_e4m3fn else v) for k, v in sd.items()}
@@ -3399,20 +3419,20 @@ class BSAI_H3_Upscale4K_Latent:
             model_opts = models
             model_def = _pick_default_latent_model(models)
         else:
-            model_opts = ["(未找到模型，请放入 models/latent_upscale_models/)"]
+            model_opts = ["(no models found - place them in models/latent_upscale_models/)"]
             model_def = model_opts[0]
         return {
             "required": {
-                "samples / 潜空间": ("LATENT",),
-                "upscale_method / 放大方法": (cls.upscale_methods, {"default": "learned-3d"}),
-                "scale_by / 放大倍数": ("FLOAT", {"default": 1.5, "min": 1.0, "max": 8.0, "step": 0.01}),
-                "model_name / 模型": (model_opts, {"default": model_def}),
-                "precision / 精度": (["fp32", "fp16", "bf16"], {"default": "fp16"}),
+                "samples": ("LATENT",),
+                "upscale_method": (cls.upscale_methods, {"default": "learned-3d"}),
+                "scale_by": ("FLOAT", {"default": 1.5, "min": 1.0, "max": 8.0, "step": 0.01}),
+                "model_name": (model_opts, {"default": model_def}),
+                "precision": (["fp32", "fp16", "bf16"], {"default": "fp16"}),
             },
         }
 
     RETURN_TYPES = ("LATENT", "INT", "INT", "FLOAT", "STRING")
-    RETURN_NAMES = ("LATENT / 潜空间", "width / 宽", "height / 高", "effective_scale / 实际倍率", "info / 信息")
+    RETURN_NAMES = ("LATENT", "width", "height", "effective_scale", "info")
     FUNCTION = "upscale"
     CATEGORY = "BSAI/H3"
     DESCRIPTION = (
@@ -3448,11 +3468,11 @@ class BSAI_H3_Upscale4K_Latent:
 
     def _upscale_learned(self, samples, source, lw, lh, scale_by, model_name, precision):
         if scale_by < 1.0:
-            raise ValueError("learned-3d 仅支持放大 (scale_by >= 1.0)")
+            raise ValueError("learned-3d only supports upscaling (scale_by >= 1.0)")
         if scale_by > 4.0:
-            raise ValueError("learned-3d 网络仅支持 1.0-4.0 倍放大，请调低 scale_by")
+            raise ValueError("learned-3d network only supports 1.0-4.0x upscale; lower scale_by")
         if not torch.cuda.is_available():
-            raise RuntimeError("learned-3d 需要 CUDA GPU")
+            raise RuntimeError("learned-3d requires a CUDA GPU")
         models = _scan_latent_models()
         if not models:
             raise FileNotFoundError(
@@ -3503,11 +3523,11 @@ class BSAI_H3_Upscale4K_Latent:
     @_cudnn_fast
     def upscale(self, **kw):
         g = kw.get
-        samples = g("samples / 潜空间")
-        upscale_method = g("upscale_method / 放大方法", 'learned-3d')
-        scale_by = g("scale_by / 放大倍数", 1.5)
-        model_name = g("model_name / 模型")
-        precision = g("precision / 精度", 'fp16')
+        samples = g("samples")
+        upscale_method = g("upscale_method", 'learned-3d')
+        scale_by = g("scale_by", 1.5)
+        model_name = g("model_name")
+        precision = g("precision", 'fp16')
         import comfy.utils
         source = samples["samples"]
         lw, lh = source.shape[-1], source.shape[-2]
@@ -3538,27 +3558,27 @@ class BSAI_H3_FaceRestore:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "images / 图像": ("IMAGE",),
-                "face_restore / 人脸修复": (["Off", "GFPGANv1.4", "CodeFormer", "小脸增强(CodeFormer)"], {"default": "CodeFormer"}),
-                "face_det_backend / 检测后端": (["自动(Auto)", "NPU 卸载", "GPU1 (YOLOv8)"], {"default": "自动(Auto)"}),
-                "face_det_conf / 检测置信度": ("FLOAT", {"default": 0.15, "min": 0.05, "max": 0.95, "step": 0.05}),
-                "face_blend / 融合强度": ("FLOAT", {"default": 0.70, "min": 0.1, "max": 1.0, "step": 0.05}),
-                "face_fidelity / 保真度": ("FLOAT", {"default": 0.60, "min": 0.0, "max": 1.0, "step": 0.05}),
-                "face_temporal / 人脸时域稳定": ("FLOAT", {"default": 0.50, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "images": ("IMAGE",),
+                "face_restore": (["Off", "GFPGANv1.4", "CodeFormer", "Small-Face (CodeFormer)"], {"default": "CodeFormer"}),
+                "face_det_backend": (["Auto", "NPU Offload", "GPU1 (YOLOv8)"], {"default": "Auto"}),
+                "face_det_conf": ("FLOAT", {"default": 0.15, "min": 0.05, "max": 0.95, "step": 0.05}),
+                "face_blend": ("FLOAT", {"default": 0.70, "min": 0.1, "max": 1.0, "step": 0.05}),
+                "face_fidelity": ("FLOAT", {"default": 0.60, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "face_temporal": ("FLOAT", {"default": 0.50, "min": 0.0, "max": 1.0, "step": 0.05}),
             },
         }
 
     RETURN_TYPES = ("IMAGE", "INT", "STRING")
-    RETURN_NAMES = ("IMAGE / 图像", "faces_detected / 检测人脸数", "info / 信息")
+    RETURN_NAMES = ("IMAGE", "faces_detected", "info")
     FUNCTION = "restore"
     CATEGORY = "BSAI/H3"
     DESCRIPTION = (
-        "独立人脸修复节点：多后端人脸检测 + GFPGAN/CodeFormer 重建五官，\n"
-        "支持 NPU 卸载（Intel AI Boost）减轻 GPU1 负担，\n"
-        "解决 H3 中远景小脸崩坏 / 五官模糊丢失，可在任意工作流单独使用。\n"
-        "v2.2.0: 反转自适应强度（小脸更强重建）+ 小脸2x预放大 + 多尺度1920复检 +\n"
-        "小脸CodeFormer自动降保真 + 新增「小脸增强(CodeFormer)」预设，\n"
-        "对标 Topaz / FlashVSR 自然脸，专门修复全身照远景小脸模糊变形。\n"
+        "Standalone face restoration for any frames: multi-backend face detection "
+        "with GFPGAN/CodeFormer regeneration of facial features,\n"
+        "NPU offload (Intel AI Boost) reduces GPU1 load,\n"
+        "fixes small/distant broken faces and lost features in H3 wide shots; usable in any workflow.\n"
+        "v2.2.0: inverted adaptive strength (small = stronger rebuild) + 2x pre-upscale + 1920 re-scan +\n"
+        "auto-lowered fidelity for small faces + new \"Small-Face (CodeFormer)\" preset.\n"
         "Standalone face restoration for any frames: YOLOv8-Face multi-scale detect +\n"
         "GFPGAN/CodeFormer regenerate, fixes small/distant broken faces.\n"
         "v2.2.0: inverted adaptive strength (small=stronger) + 2x pre-upscale + 1920 re-scan."
@@ -3566,19 +3586,21 @@ class BSAI_H3_FaceRestore:
     @_cudnn_fast
     def restore(self, **kw):
         g = kw.get
-        images = g("images / 图像")
-        face_restore = g("face_restore / 人脸修复", 'Off')
-        face_det_backend_raw = g("face_det_backend / 检测后端", '自动(Auto)')
-        face_det_conf = g("face_det_conf / 检测置信度", 0.15)
-        face_blend = g("face_blend / 融合强度", 0.70)
-        face_fidelity = g("face_fidelity / 保真度", 0.60)
-        face_temporal = g("face_temporal / 人脸时域稳定", 0.50)
+        images = g("images")
+        face_restore = g("face_restore", 'Off')
+        face_restore = _LEGACY_FACE_RESTORE.get(face_restore, face_restore)
+        face_det_backend_raw = g("face_det_backend", 'Auto')
+        face_det_backend_raw = _LEGACY_DET_BACKEND.get(face_det_backend_raw, face_det_backend_raw)
+        face_det_conf = g("face_det_conf", 0.15)
+        face_blend = g("face_blend", 0.70)
+        face_fidelity = g("face_fidelity", 0.60)
+        face_temporal = g("face_temporal", 0.50)
         t0 = time.time()
         fr_mode = face_restore
         fr_conf = face_det_conf
         fr_blend = face_blend
         fr_fid = face_fidelity
-        if face_restore == "小脸增强(CodeFormer)":
+        if face_restore == "Small-Face (CodeFormer)":
             fr_mode = "CodeFormer"
             fr_conf = min(0.12, float(face_det_conf))
             fr_blend = max(0.80, float(face_blend))
@@ -3626,7 +3648,7 @@ def _topaz_ffmpeg():
         p = os.path.join(eng, sub, "ffmpeg.exe")
         if os.path.exists(p):
             return p, os.path.join(eng, sub, "ffprobe.exe")
-    raise RuntimeError("Topaz 引擎 ffmpeg 未找到 - 请把引擎包放到 ComfyUI/models/Topaz_Engine (或旧路径 ComfyUI/topaz_engine)")
+    raise RuntimeError("Topaz engine ffmpeg not found - place the engine pack in ComfyUI/models/Topaz_Engine (or legacy ComfyUI/topaz_engine)")
 
 
 def _topaz_write_video(frames, fps, path, qp=14):
@@ -3677,7 +3699,7 @@ def _topaz_run(in_path, out_path, scale, frames, w, h, strength, max_gpu_mem, mo
     eng = _topaz_engine_dir()
     ns = os.path.join(eng, "neuroserver171", "neuroserver.exe")
     if not os.path.exists(ns):
-        raise RuntimeError(f"neuroserver.exe 未找到: {ns} - 请把 Topaz 引擎包放到 ComfyUI/models/Topaz_Engine")
+        raise RuntimeError(f"neuroserver.exe not found: {ns} - place the Topaz engine pack in ComfyUI/models/Topaz_Engine")
     model_store = os.path.join(eng, "models")
     tvmd = os.path.join(eng, "tvmd")
     lic = os.path.join(tvmd, "VR.lic") if os.path.exists(os.path.join(tvmd, "VR.lic")) \
@@ -3793,9 +3815,9 @@ def _topaz_engine_wonder():
     ns = os.path.join(eng, "neuroserver", "neuroserver.exe")
     if not os.path.exists(ns):
         raise RuntimeError(
-            f"Wonder 3.5 需要 Topaz Photo 自带引擎: {ns} 未找到。\n"
-            f"请把 Topaz Photo 安装目录下的 neuroserver 引擎包整体放到 "
-            f"ComfyUI/models/Topaz_Engine/neuroserver（含 Lib/dml/DLLs）。")
+            f"Wonder 3.5 requires the Topaz Photo built-in engine: {ns} not found.\n"
+            f"Place the whole neuroserver engine pack from your Topaz Photo install under "
+            f"ComfyUI/models/Topaz_Engine/neuroserver (including Lib/dml/DLLs).")
     store_candidates = (
         os.path.join(eng, "Topaz Labs LLC", "Topaz Photo", "models", "neuroserver"),
         os.path.join(eng, "Topaz Labs LLC", "Topaz Photo", "models"),
@@ -3807,8 +3829,8 @@ def _topaz_engine_wonder():
             break
     if store is None:
         raise RuntimeError(
-            f"未找到 Wonder 3.5 权重包 wonder-all（查找于 {store_candidates}）。\n"
-            f"请确认权重位于 <Topaz_Engine>/Topaz Labs LLC/Topaz Photo/models/neuroserver/wonder-all。")
+            f"Wonder 3.5 weight pack wonder-all not found (searched {store_candidates}).\n"
+            f"Make sure the weights are under <Topaz_Engine>/Topaz Labs LLC/Topaz Photo/models/neuroserver/wonder-all.")
     return ns, store
 
 
@@ -3893,9 +3915,9 @@ def _topaz_upscale_images(frames, scale, strength, max_gpu_mem):
     """
     b, h, w, c = frames.shape
     if c != 3:
-        raise ValueError(f"Topaz Wonder 需要 RGB 3 通道, got {c}")
+        raise ValueError(f"Topaz Wonder requires RGB 3 channels, got {c}")
     if b < 1:
-        raise ValueError("空帧输入")
+        raise ValueError("empty frame input")
     if b > 1:
         print(f"[BSAI-H3/Topaz] Wonder 3.5 为图像模型，视频按逐帧处理: {b} 帧，"
               f"约需 {b} 次引擎调用（每帧独立加载模型，较慢）...")
@@ -3916,7 +3938,7 @@ def _topaz_upscale_images(frames, scale, strength, max_gpu_mem):
                  '-frames:v', '1', '-pix_fmt', 'rgb24', fin],
                 input=frames[i].tobytes(), stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
             if p.returncode != 0:
-                raise RuntimeError(f'ffmpeg 单帧写图失败: {p.stderr.decode(errors="replace")[:300]}')
+                raise RuntimeError(f'ffmpeg single-frame write failed: {p.stderr.decode(errors="replace")[:300]}')
             t0 = time.time()
             print(f"[BSAI-H3/Topaz] Wonder 3.5 帧 {i + 1}/{b} ({w}x{h} -> {ow}x{oh}, x{scale}) ...")
             _topaz_run_image(fin, fout, scale, w, h, strength, max_gpu_mem)
@@ -3925,12 +3947,12 @@ def _topaz_upscale_images(frames, scale, strength, max_gpu_mem):
                  '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-'],
                 capture_output=True)
             if pr.returncode != 0:
-                raise RuntimeError(f'ffmpeg 读回输出失败: {pr.stderr.decode(errors="replace")[:300]}')
+                raise RuntimeError(f'ffmpeg read-back of output failed: {pr.stderr.decode(errors="replace")[:300]}')
             raw = np.frombuffer(pr.stdout, dtype=np.uint8)
             need = ow * oh * 3
             if raw.size != need:
                 raise RuntimeError(
-                    f'Wonder 输出尺寸不符: 期望 {ow}x{oh}, 实际 {raw.size // 3} 像素'
+                    f'Wonder output size mismatch: expected {ow}x{oh}, got {raw.size // 3} pixels'
                     f'({raw.size // (oh * 3)}x{raw.size // (ow * 3)})')
             outs.append(raw.reshape(oh, ow, 3))
             print(f"[BSAI-H3/Topaz] 帧 {i + 1}/{b} 完成 ({time.time() - t0:.1f}s)")
@@ -3972,8 +3994,8 @@ class BSAI_TopazEngine_FaceRestore:
     与修复脸部细节」。
     """
 
-    TOPAZ_MODELS = ["星光 2.6", "Astra", "Astra HQ", "Astra Sharp", "Astra Fast", "Wonder 3.5"]
-    TOPAZ_MODEL_IDS = {"星光 2.6": "slp-26", "Astra": "astra", "Astra HQ": "astrahq",
+    TOPAZ_MODELS = ["Starlight 2.6", "Astra", "Astra HQ", "Astra Sharp", "Astra Fast", "Wonder 3.5"]
+    TOPAZ_MODEL_IDS = {"Starlight 2.6": "slp-26", "Astra": "astra", "Astra HQ": "astrahq",
                        "Astra Sharp": "astrasharp", "Astra Fast": "astrafast",
                        "Wonder 3.5": "wonder-3.5"}
 
@@ -3981,69 +4003,72 @@ class BSAI_TopazEngine_FaceRestore:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "images / 图像": ("IMAGE",),
-                "model / 模型": (cls.TOPAZ_MODELS, {"default": "星光 2.6",
-                                    "tooltip": "星光2.6=默认最佳；Astra系列需≥9帧；Wonder 3.5=图像模型逐帧处理(慢) / Starlight2.6 default, Astra needs >=9 frames, Wonder 3.5 = image model, per-frame (slow)"}),
-                "scale / 放大倍数": ("FLOAT", {"default": 2.0, "min": 1.0, "max": 4.0, "step": 0.01,
-                                              "tooltip": "输出放大倍数 1-4（支持小数）/ Upscale factor 1-4 (fraction ok)"}),
-                "enhancement_strength / 增强强度": ("FLOAT", {"default": 1.0, "min": 0.5, "max": 1.5, "step": 0.1,
-                                                              "tooltip": "0.7柔和 / 1.0默认 / 1.3细节最猛"}),
-                "max_gpu_mem / 显存上限": ("FLOAT", {"default": 22.0, "min": 8.0, "max": 32.0, "step": 0.1,
-                                                    "tooltip": "引擎显存上限(GB)。24GB 卡实测 22 最稳(峰值~9.6GB)，14 为旧默认 / Max VRAM cap (GB), 22 stable on 24GB cards"}),
-                "torch_compile / 编译优化": (["Off", "inductor", "cudagraphs"], {"default": "Off",
-                    "tooltip": "引擎内置 torch.compile 开关（透传 torch_compile + args_dit/vae）。slp-26 实测无加速甚至略慢，默认 Off / torch.compile switch, benchmarked no speedup on slp-26"}),
-                "fps / 帧率": ("INT", {"default": 24, "min": 1, "max": 120}),
-                "qp / 输入质量": ("INT", {"default": 14, "min": 0, "max": 40,
-                                         "tooltip": "输入编码质量，越小越无损 / lower = more lossless"}),
-                "face_restore / 人脸修复": (["Off", "GFPGANv1.4", "CodeFormer", "小脸增强(CodeFormer)"], {"default": "Off"}),
-                "face_det_backend / 检测后端": (["自动(Auto)", "NPU 卸载", "GPU1 (YOLOv8)"], {"default": "自动(Auto)"}),
-                "face_det_conf / 检测置信度": ("FLOAT", {"default": 0.15, "min": 0.05, "max": 0.95, "step": 0.05}),
-                "face_blend / 融合强度": ("FLOAT", {"default": 0.70, "min": 0.1, "max": 1.0, "step": 0.05}),
-                "face_fidelity / 保真度": ("FLOAT", {"default": 0.60, "min": 0.0, "max": 1.0, "step": 0.05}),
-                "face_temporal / 人脸时域稳定": ("FLOAT", {"default": 0.50, "min": 0.0, "max": 1.0, "step": 0.05}),
-                "detail_amount / 细节强度": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.5, "step": 0.05}),
-                "detail_radius / 细节半径": ("FLOAT", {"default": 1.8, "min": 0.3, "max": 8.0, "step": 0.1}),
-                "softness / 柔和度": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05}),
-                "detail_mode / 细节模式": (["classic", "smart"], {"default": "smart"}),
+                "images": ("IMAGE",),
+                "model": (cls.TOPAZ_MODELS, {"default": "Starlight 2.6",
+                                    "tooltip": "Starlight 2.6 = default best; Astra family needs >=9 frames; Wonder 3.5 = image model, per-frame (slow)"}),
+                "scale": ("FLOAT", {"default": 2.0, "min": 1.0, "max": 4.0, "step": 0.01,
+                                              "tooltip": "Upscale factor 1-4 (fraction ok)"}),
+                "enhancement_strength": ("FLOAT", {"default": 1.0, "min": 0.5, "max": 1.5, "step": 0.1,
+                                                              "tooltip": "0.7 soft / 1.0 default / 1.3 most detail"}),
+                "max_gpu_mem": ("FLOAT", {"default": 22.0, "min": 8.0, "max": 32.0, "step": 0.1,
+                                                    "tooltip": "Max VRAM cap (GB); 22 is stable on 24GB cards (peak ~9.6GB), 14 was the old default"}),
+                "torch_compile": (["Off", "inductor", "cudagraphs"], {"default": "Off",
+                    "tooltip": "torch.compile switch (passes torch_compile + args_dit/vae); no speedup measured on slp-26, default Off"}),
+                "fps": ("INT", {"default": 24, "min": 1, "max": 120}),
+                "qp": ("INT", {"default": 14, "min": 0, "max": 40,
+                                         "tooltip": "Input encode quality, lower = more lossless"}),
+                "face_restore": (["Off", "GFPGANv1.4", "CodeFormer", "Small-Face (CodeFormer)"], {"default": "Off"}),
+                "face_det_backend": (["Auto", "NPU Offload", "GPU1 (YOLOv8)"], {"default": "Auto"}),
+                "face_det_conf": ("FLOAT", {"default": 0.15, "min": 0.05, "max": 0.95, "step": 0.05}),
+                "face_blend": ("FLOAT", {"default": 0.70, "min": 0.1, "max": 1.0, "step": 0.05}),
+                "face_fidelity": ("FLOAT", {"default": 0.60, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "face_temporal": ("FLOAT", {"default": 0.50, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "detail_amount": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.5, "step": 0.05}),
+                "detail_radius": ("FLOAT", {"default": 1.8, "min": 0.3, "max": 8.0, "step": 0.1}),
+                "softness": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "detail_mode": (["classic", "smart"], {"default": "smart"}),
             },
         }
 
     RETURN_TYPES = ("IMAGE", "INT", "INT", "FLOAT", "STRING")
-    RETURN_NAMES = ("IMAGE / 图像", "width / 宽", "height / 高", "scale_used / 实际倍率", "info / 信息")
+    RETURN_NAMES = ("IMAGE", "width", "height", "scale_used", "info")
     FUNCTION = "run"
     CATEGORY = "BSAI/H3"
     DESCRIPTION = (
-        "BSAI Topaz Engine Face Restore：调用本机 Topaz 神经引擎（星光 2.6 / Astra / "
-        "Wonder 3.5，默认 ComfyUI/models/Topaz_Engine）生成式放大，再叠加本插件的人脸修复\n"
-        "（保真模式）+ 细节增强。底座效果对标 Topaz 官方，在其基础上继续优化\n"
-        "脸部细节。Wonder 3.5 为 Topaz Photo 图像模型（引擎 neuroserver/，权重 "
-        "Topaz Labs LLC/Topaz Photo/models/neuroserver/wonder-all），视频按逐帧处理。\n"
+        "BSAI Topaz Engine Face Restore: drives the local Topaz neural engine "
+        "(Starlight 2.6 / Astra / Wonder 3.5, default ComfyUI/models/Topaz_Engine) for "
+        "generative upscale, then stacks this plugin's fidelity-first face restore "
+        "and detail enhancement on top. Wonder 3.5 is a Topaz Photo image model "
+        "(neuroserver/ engine, weights under Topaz Labs LLC/Topaz Photo/models/neuroserver/wonder-all), "
+        "so video is processed frame by frame. "
         "Topaz engine tier: generative upscale (Starlight/Astra/Wonder 3.5) +\n"
-        "our fidelity-first face restore + optional detail/softness on top.\n"
-        "参数名中英双语 / Parameters bilingual (EN / 中文)."
+        "our fidelity-first face restore + optional detail/softness on top."
     )
 
     @_cudnn_fast
     def run(self, **kw):
         g = kw.get
-        images = g("images / 图像")
-        model = g("model / 模型", "星光 2.6")
-        scale = g("scale / 放大倍数", 2.0)
-        enhancement_strength = g("enhancement_strength / 增强强度", 1.0)
-        max_gpu_mem = g("max_gpu_mem / 显存上限", 22.0)
-        torch_compile = g("torch_compile / 编译优化", "Off")
-        fps = g("fps / 帧率", 24)
-        qp = g("qp / 输入质量", 14)
-        face_restore = g("face_restore / 人脸修复", "Off")
-        face_det_backend_raw = g("face_det_backend / 检测后端", '自动(Auto)')
-        face_det_conf = g("face_det_conf / 检测置信度", 0.15)
-        face_blend = g("face_blend / 融合强度", 0.70)
-        face_fidelity = g("face_fidelity / 保真度", 0.60)
-        face_temporal = g("face_temporal / 人脸时域稳定", 0.50)
-        detail_amount = g("detail_amount / 细节强度", 0.0)
-        detail_radius = g("detail_radius / 细节半径", 1.5)
-        softness = g("softness / 柔和度", 0.0)
-        detail_mode = g("detail_mode / 细节模式", "classic")
+        images = g("images")
+        model = g("model", "Starlight 2.6")
+        model = _LEGACY_TOPAZ_MODEL.get(model, model)
+        scale = g("scale", 2.0)
+        enhancement_strength = g("enhancement_strength", 1.0)
+        max_gpu_mem = g("max_gpu_mem", 22.0)
+        torch_compile = g("torch_compile", "Off")
+        fps = g("fps", 24)
+        qp = g("qp", 14)
+        face_restore = g("face_restore", "Off")
+        face_restore = _LEGACY_FACE_RESTORE.get(face_restore, face_restore)
+        face_det_backend_raw = g("face_det_backend", 'Auto')
+        face_det_backend_raw = _LEGACY_DET_BACKEND.get(face_det_backend_raw, face_det_backend_raw)
+        face_det_conf = g("face_det_conf", 0.15)
+        face_blend = g("face_blend", 0.70)
+        face_fidelity = g("face_fidelity", 0.60)
+        face_temporal = g("face_temporal", 0.50)
+        detail_amount = g("detail_amount", 0.0)
+        detail_radius = g("detail_radius", 1.5)
+        softness = g("softness", 0.0)
+        detail_mode = g("detail_mode", "classic")
         t0 = time.time()
         # ── RGBA / 通道序自适应：Topaz 引擎只收 RGB，4 通道自动 alpha 合成转 RGB ──
         if images.dim() == 4:
@@ -4064,7 +4089,7 @@ class BSAI_TopazEngine_FaceRestore:
         else:
             b, h, w, c = images.shape
         if c != 3:
-            raise ValueError(f"Topaz 档需要 RGB 3 通道, got {c}")
+            raise ValueError(f"Topaz tier requires RGB 3 channels, got {c}")
         model_id = self.TOPAZ_MODEL_IDS.get(model, "slp-26")
         frames = (images * 255.0).clamp(0, 255).cpu().numpy().astype(np.uint8)
         out = _topaz_upscale(frames, fps, scale, enhancement_strength, max_gpu_mem, qp, model_id,
@@ -4076,7 +4101,7 @@ class BSAI_TopazEngine_FaceRestore:
             fr_conf = face_det_conf
             fr_blend = face_blend
             fr_fid = face_fidelity
-            if face_restore == "小脸增强(CodeFormer)":
+            if face_restore == "Small-Face (CodeFormer)":
                 fr_mode = "CodeFormer"
                 fr_conf = min(0.12, float(face_det_conf))
                 fr_blend = max(0.80, float(face_blend))
@@ -4120,33 +4145,33 @@ class BSAI_H3_DLSS5:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "images / 图像": ("IMAGE",),
-                "scale / 放大倍数": ("FLOAT", {"default": 2.0, "min": 1.0, "max": 3.0, "step": 0.05,
-                                               "tooltip": "DLSS SR 放大倍数 1-3（1 = 原生分辨率仅神经渲染）"}),
-                "style / 风格": (["Cinematic", "Default", "Natural"], {"default": "Cinematic",
-                                                                        "tooltip": "Cinematic 最干净 / Natural 保留肤色 / Default 默认"}),
-                "preset / 预设": (["Default", "Preset 1", "Preset 2", "Preset 3"], {"default": "Default"}),
-                "intensity / 强度": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05}),
-                "local_structure / 局部结构": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05}),
-                "local_tone / 局部色调": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05}),
-                "skin / 皮肤": ("FLOAT", {"default": 0.0, "min": -1.0, "max": 2.0, "step": 0.05,
-                                          "tooltip": "0=保留原图肌肤肌理感（视频实测建议）；>0=加强皮肤处理；<0=模型默认"}),
-                "global_tone / 全局色调": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 2.0, "step": 0.05,
-                                                     "tooltip": "<0 = 模型默认"}),
-                "detail / 细节": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05,
-                                            "tooltip": "0 = 纯超分不加细节，1 = 全量神经渲染（视频实测建议 1 或更高）"}),
-                "color / 色彩": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05,
-                                           "tooltip": "0 = 保持原色相（视频实测：开 1 皮肤油腻，建议 0）；1 = 采用 NR 色彩"}),
-                "motion / 光流运动矢量": ("BOOLEAN", {"default": True,
-                                                       "tooltip": "光流运动矢量 -> 时序稳定防闪烁"}),
-                "motion_engine / 光流引擎": (["auto", "nvof", "lk"], {"default": "auto",
-                                                                       "tooltip": "auto=NVOFA硬件光流，否则LK计算着色器"}),
-                "adapter / GPU适配器": ("INT", {"default": 0, "min": 0, "max": 15}),
+                "images": ("IMAGE",),
+                "scale": ("FLOAT", {"default": 2.0, "min": 1.0, "max": 3.0, "step": 0.05,
+                                               "tooltip": "DLSS SR upscale factor 1-3 (1 = native resolution, neural render only)"}),
+                "style": (["Cinematic", "Default", "Natural"], {"default": "Cinematic",
+                                                                        "tooltip": "Cinematic cleanest / Natural keeps skin tone / Default"}),
+                "preset": (["Default", "Preset 1", "Preset 2", "Preset 3"], {"default": "Default"}),
+                "intensity": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05}),
+                "local_structure": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05}),
+                "local_tone": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05}),
+                "skin": ("FLOAT", {"default": 0.0, "min": -1.0, "max": 2.0, "step": 0.05,
+                                          "tooltip": "0 = keep original skin texture (recommended for video); >0 = stronger skin processing; <0 = model default"}),
+                "global_tone": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 2.0, "step": 0.05,
+                                                     "tooltip": "<0 = model default"}),
+                "detail": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05,
+                                            "tooltip": "0 = pure SR without added detail, 1 = full neural render (1 or higher recommended for video)"}),
+                "color": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05,
+                                           "tooltip": "0 = keep original hue (for video, 1 makes skin greasy, 0 recommended); 1 = use NR color"}),
+                "motion": ("BOOLEAN", {"default": True,
+                                                       "tooltip": "Optical flow motion vectors -> temporal stability against flicker"}),
+                "motion_engine": (["auto", "nvof", "lk"], {"default": "auto",
+                                                                       "tooltip": "auto = NVOF hardware optical flow, otherwise LK compute shader"}),
+                "adapter": ("INT", {"default": 0, "min": 0, "max": 15}),
             },
         }
 
     RETURN_TYPES = ("IMAGE", "INT", "INT", "FLOAT", "STRING")
-    RETURN_NAMES = ("IMAGE / 图像", "width / 宽", "height / 高", "scale_used / 实际倍率", "info / 信息")
+    RETURN_NAMES = ("IMAGE", "width", "height", "scale_used", "info")
     FUNCTION = "run"
     CATEGORY = "BSAI/H3"
     DESCRIPTION = (
@@ -4161,20 +4186,20 @@ class BSAI_H3_DLSS5:
     @_cudnn_fast
     def run(self, **kw):
         g = kw.get
-        images = g("images / 图像")
-        scale = g("scale / 放大倍数", 2.0)
-        style = g("style / 风格", "Cinematic")
-        preset = g("preset / 预设", "Default")
-        intensity = g("intensity / 强度", 1.0)
-        local_structure = g("local_structure / 局部结构", 1.0)
-        local_tone = g("local_tone / 局部色调", 1.0)
-        skin = g("skin / 皮肤", -1.0)
-        global_tone = g("global_tone / 全局色调", -1.0)
-        detail = g("detail / 细节", 1.0)
-        color = g("color / 色彩", 1.0)
-        motion = g("motion / 光流运动矢量", True)
-        motion_engine = g("motion_engine / 光流引擎", "auto")
-        adapter = g("adapter / GPU适配器", 0)
+        images = g("images")
+        scale = g("scale", 2.0)
+        style = g("style", "Cinematic")
+        preset = g("preset", "Default")
+        intensity = g("intensity", 1.0)
+        local_structure = g("local_structure", 1.0)
+        local_tone = g("local_tone", 1.0)
+        skin = g("skin", -1.0)
+        global_tone = g("global_tone", -1.0)
+        detail = g("detail", 1.0)
+        color = g("color", 1.0)
+        motion = g("motion", True)
+        motion_engine = g("motion_engine", "auto")
+        adapter = g("adapter", 0)
         t0 = time.time()
         try:
             model_management.unload_all_models()

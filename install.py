@@ -127,13 +127,12 @@ def git_available():
     return shutil.which("git") is not None
 
 
-# GitHub 加速镜像（空电脑直连 GitHub 常超时 rc=128，按顺序回退）
+# Clones are made DIRECTLY from the original upstream repository only.
+# No third-party proxy mirrors (ghproxy/gitclone/...) are used: mirror downloads
+# are an untrusted supply-chain path flagged in security review. If a direct
+# clone times out, the installer reports it and leaves manual instructions.
 GITHUB_MIRRORS = [
-    "",  # 直连优先
-    "https://ghproxy.com/",
-    "https://mirror.ghproxy.com/",
-    "https://gh-proxy.com/",
-    "https://gitclone.com/github.com/",
+    "",  # direct from upstream only
 ]
 
 
@@ -148,11 +147,13 @@ def _to_mirror_url(url, mirror_prefix):
     return mirror_prefix + url
 
 
-def git_clone_with_retry(url, dest, max_retry=3, timeout=300):
+def git_clone_with_retry(url, dest, max_retry=3, timeout=300, pin_commit=None):
     """
-    带重试 + 镜像回退 + 残留清理的 git clone。
-    空电脑直连 GitHub 常因超时/SSL 返回 rc=128，这里逐镜像尝试。
-    返回 (success: bool, last_error: str)
+    git clone with retry + leftover cleanup. Direct upstream only (no proxy
+    mirror fallback — untrusted mirrors are a supply-chain risk). When
+    pin_commit is set, the clone is checked out at that exact commit so the
+    vendored code is reproducible; the resulting HEAD is logged for audit.
+    Returns (success: bool, last_error: str)
     """
     # 克隆前清理失败残留（空目录 / 不完整 .git）
     if os.path.isdir(dest):
@@ -183,6 +184,25 @@ def git_clone_with_retry(url, dest, max_retry=3, timeout=300):
                     env=env,
                 )
                 if r.returncode == 0 and os.path.isdir(dest) and os.path.isdir(os.path.join(dest, ".git")):
+                    if pin_commit:
+                        chk = subprocess.run(
+                            ["git", "-C", dest, "checkout", "--quiet", pin_commit],
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            encoding="utf-8", errors="replace", timeout=120,
+                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                        )
+                        if chk.returncode != 0:
+                            last_err = (chk.stdout or "").strip()[-300:]
+                            print(f"{TAG}     pin_commit checkout failed: {last_err[:120]}")
+                            return False, last_err
+                    rev = subprocess.run(
+                        ["git", "-C", dest, "rev-parse", "HEAD"],
+                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                        encoding="utf-8", errors="replace", timeout=60,
+                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                    )
+                    head = (rev.stdout or "").strip()[:40]
+                    print(f"{TAG}     cloned {url} at {head}")
                     return True, ""
                 last_err = (r.stdout or "").strip()[-300:]
                 print(f"{TAG}     rc={r.returncode}，{last_err[:120]}")
@@ -531,33 +551,17 @@ def check_dlss5(extra_dirs, dlss5_full):
             print(f"{TAG} 解包完成 -> {dest}（{n} 个文件）")
         except Exception as e:
             print(f"{TAG} [失败] 解包 {hits['zip']}: {e}")
-    # 2) 本地复制/解包后复查；仍无 exe 才自动下载官方 release
+    # 2) 本地复制/解包后复查；不再自动下载官方 release 二进制。
+    #     Security review: auto-downloading an executable + NVIDIA DLLs from a
+    #     release URL without a pinned SHA-256 is an untrusted supply-chain path.
+    #     Users who want DLSS 5 must obtain the runtime manually and verify it.
     have_exe = os.path.isfile(os.path.join(dest, "video2dlssnr.exe"))
     if not have_exe:
-        dl_url = V2D_FULL_ZIP if dlss5_full else V2D_LIGHT_ZIP
-        print(f"{TAG} 本地无整合包，自动下载官方 release: {os.path.basename(dl_url)} ...")
-        tmp = os.path.join(dest, os.path.basename(dl_url) + ".part")
-        req = urllib.request.Request(dl_url, headers={"User-Agent": "Mozilla/5.0 BSAI-H3-installer"})
-        try:
-            with urllib.request.urlopen(req, timeout=60) as r, open(tmp, "wb") as f:
-                while True:
-                    chunk = r.read(1 << 16)
-                    if not chunk:
-                        break
-                    f.write(chunk)
-            zip_path = tmp[:-len(".part")]
-            os.replace(tmp, zip_path)
-            n = _extract_zip_into(zip_path, dest)
-            os.remove(zip_path)
-            print(f"{TAG} 官方 release 下载并解包完成（{n} 个文件）-> {dest}")
-        except Exception as e:
-            if os.path.exists(tmp):
-                try:
-                    os.remove(tmp)
-                except OSError:
-                    pass
-            print(f"{TAG} [失败] 下载官方 release: {e}")
-            print(f"{TAG}         可手动: {dl_url}")
+        print(f"{TAG} [手动] 未找到本地 video2dlssnr.exe，不再自动下载 release 二进制")
+        print(f"{TAG}        请从官方项目 release 手动下载（exe 建议核对 SHA-256 后使用）:")
+        print(f"{TAG}          {V2D_RELEASE_BASE}")
+        print(f"{TAG}        [EN] Manual step: download video2dlssnr.exe from the official "
+              f"release page above, verify its SHA-256, then place it in {dest}.")
     # 3) 复查
     have_exe = os.path.isfile(os.path.join(dest, "video2dlssnr.exe"))
     have_dlls = all(os.path.isfile(os.path.join(dest, n)) for n in DLSS_DLL_NAMES)

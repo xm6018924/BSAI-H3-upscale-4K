@@ -2009,6 +2009,49 @@ def _rtx_upscale(frames, scale, quality="超高"):
     return out_tensor.float().clamp(0, 1)
 
 
+def _rtx_vfx_upscale(frames, scale, op="去噪", level="ULTRA", strength=1.0):
+    """NVIDIA RTX VFX 去噪/去模糊（官方 ComfyUI_Nvidia_VFX_Nodes 同款 nvvfx
+    DENOISE_*/DEBLUR_* 档位，同分辨率处理，无模型文件，全部在 RTX 显卡上完成）。
+
+    阶段1：按 op 执行同分辨率去噪/去模糊（官方语义：DENOISE/DEBLUR 保持输入尺寸）；
+    阶段2：若 scale > 1.0 再用 RTX ULTRA 放大到目标倍率（先清理后放大）。
+    要求：NVIDIA RTX 显卡 + nvidia-vfx 库（pip install nvidia-vfx）。
+    """
+    try:
+        import nvvfx
+    except ImportError as e:
+        raise ImportError(
+            "未安装 nvidia-vfx 库，请执行: pip install nvidia-vfx"
+        ) from e
+
+    op_prefix = "DENOISE" if str(op).startswith("去噪") else "DEBLUR"
+    level_name = str(level).strip().upper()
+    if level_name not in ("LOW", "MEDIUM", "HIGH", "ULTRA"):
+        level_name = "ULTRA"
+    quality = getattr(nvvfx.QualityLevel, f"{op_prefix}_{level_name}")
+
+    # 阶段1：同分辨率去噪/去模糊（DENOISE/DEBLUR 保持输入尺寸）
+    _, h, w, c = frames.shape
+    frames_cuda = frames.cuda().permute(0, 3, 1, 2).float().contiguous()
+    cleaned = torch.empty((frames.shape[0], h, w, c), device="cpu", dtype=torch.float32)
+    print(f"[BSAI-H3-upscale-4K] RTX VFX {op_prefix}_{level_name}: {w}x{h} -> 同分辨率清理 (strength={strength})", flush=True)
+    with nvvfx.VideoSuperRes(quality=quality, strength=float(strength)) as fx:
+        fx.output_width = w
+        fx.output_height = h
+        fx.load()
+        for i, frame in enumerate(frames_cuda):
+            dlpack_out = fx.run(frame).image
+            # 官方要求 from_dlpack 后立即 .clone()，否则 capsule 二次释放导致原生崩溃
+            up = torch.from_dlpack(dlpack_out).clone()  # (3, H, W)
+            cleaned[i] = up.movedim(0, -1)
+    cleaned = cleaned.float().clamp(0, 1)
+
+    # 阶段2：需要放大时用 RTX ULTRA 放大（先清理后放大）
+    if scale is not None and float(scale) > 1.0:
+        return _rtx_upscale(cleaned, float(scale), quality="超高")
+    return cleaned
+
+
 # ---------------------------------------------------------------------------
 # DLSS 5 engine wrapper (NVIDIA DLSS Super Resolution + Neural Rendering)
 # ---------------------------------------------------------------------------
@@ -2725,6 +2768,7 @@ class BSAI_H3_Upscale4K:
         "SeedVR2 7B (diffusion video SR)": "seedvr2",
         "SeedVR2 7B INT8 (native ComfyUI)": "seedvr2_int8",
         "NVIDIA RTX Video Super Res": "rtx",
+"NVIDIA RTX VSR - 去噪/去模糊 (VFX)": "rtx_vfx",
         "DLSS 5 (NVIDIA neural SR)": "dlss5",
         "VOSR 2.0 (CVPR2026 generative SR)": "vosr2",
         "VOSR 2.0 + DLSS 5 (dual-engine)": "vosr_dlss",
@@ -2817,6 +2861,15 @@ class BSAI_H3_Upscale4K:
                 "dlss_intensity": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05}),
                 "dlss_detail": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05}),
                 "dlss_motion": ("BOOLEAN", {"default": True}),
+                # RTX VFX 去噪/去模糊专属参数（仅当 model_name 选择
+                # "NVIDIA RTX VSR - 去噪/去模糊 (VFX)" 时生效）：
+                # 与官方 ComfyUI_Nvidia_VFX_Nodes 的 RTXVideoSuperResolution 同源
+                # （nvvfx DENOISE_*/DEBLUR_* 档位，同分辨率清理）。
+                # op = 去噪(DENOISE)/去模糊(DEBLUR)；level = 档位强度；
+                # strength = 效果强度(0-1)；scale>1 时清理后自动 RTX ULTRA 放大。
+                "rtx_vfx_op": (["去噪", "去模糊"], {"default": "去噪"}),
+                "rtx_vfx_level": (["LOW", "MEDIUM", "HIGH", "ULTRA"], {"default": "ULTRA"}),
+                "rtx_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05}),
                 # VOSR 2.0 专属参数
                 "vosr_cfg": ("FLOAT", {"default": 0.5, "min": -2.0, "max": 2.0, "step": 0.1}),
                 "vosr_steps": ("INT", {"default": 1, "min": 1, "max": 25, "step": 1}),
@@ -2897,6 +2950,9 @@ class BSAI_H3_Upscale4K:
         dlss_intensity = g("dlss_intensity", 1.0)
         dlss_detail = g("dlss_detail", 1.0)
         dlss_motion = g("dlss_motion", True)
+        rtx_vfx_op = g("rtx_vfx_op", '去噪')
+        rtx_vfx_level = g("rtx_vfx_level", 'ULTRA')
+        rtx_strength = g("rtx_strength", 1.0)
         flashvsr_anti_ghost = g("flashvsr_anti_ghost", 0.30)
         t0 = time.time()
         # Free GPU VRAM before upscaling: H3 diffusion model (~20GB) may still
@@ -2976,6 +3032,29 @@ class BSAI_H3_Upscale4K:
                 out = _rtx_upscale(images, scale)
             except Exception as _e:
                 print("[BSAI-H3-upscale-4K] RTX 超分不可用 (%s)，降级到 SeedVR2" % _e)
+                out = _seedvr2_native_upscale(
+                    images, float(scale), seed=42,
+                    steps=int(g("sv2_steps", 12)),
+                    cfg=float(g("sv2_cfg", 1.2)),
+                    sampler_name=g("sv2_sampler", "euler"),
+                    scheduler=g("sv2_scheduler", "normal"),
+                    color_correction=g("sv2_color", "lab"),
+                )
+            eff_scale = float(out.shape[1] / float(images.shape[1]))
+            temporal_strength = 0.0
+            lr_np = None
+        elif _engine == "rtx_vfx":
+            # --- NVIDIA RTX VFX 去噪/去模糊（官方 DENOISE_*/DEBLUR_* 档位）----
+            # 同分辨率清理，scale>1 时清理后自动 RTX ULTRA 放大；
+            # 不可用时与 RTX 分支一致降级到 SeedVR2，避免 workflow 崩。
+            try:
+                out = _rtx_vfx_upscale(
+                    images, scale,
+                    op=str(rtx_vfx_op), level=str(rtx_vfx_level),
+                    strength=float(rtx_strength),
+                )
+            except Exception as _e:
+                print("[BSAI-H3-upscale-4K] RTX VFX 去噪/去模糊不可用 (%s)，降级到 SeedVR2" % _e)
                 out = _seedvr2_native_upscale(
                     images, float(scale), seed=42,
                     steps=int(g("sv2_steps", 12)),

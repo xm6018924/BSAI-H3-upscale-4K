@@ -196,6 +196,7 @@ The search area is now derived from the live install path: sibling ComfyUI packs
 - **像素域超分**：Real-ESRGAN 系（x4plus / anime / general）+ 光流时域增强 + 批量帧
 - **扩散视频超分**：FlashVSR-v1.1 / SeedVR2 7B（fp8 numz 路径 + **INT8 ComfyUI 原生路径**双引擎）
 - **硬件超分**：NVIDIA RTX Video Super Res / DLSS 5 神经渲染（RTX 显卡最快 4K 路线）
+- **RTX 去噪 / 去模糊（VFX）**：`NVIDIA RTX VSR - 去噪/去模糊 (VFX)` 引擎——官方 ComfyUI_Nvidia_VFX_Nodes 同款 nvvfx `DENOISE_*`/`DEBLUR_*` 档位（同分辨率清理，无模型文件）；`op` 选 去噪/去模糊、`level` 选 LOW~ULTRA、`strength` 调强度；`scale>1` 时清理后自动接 RTX ULTRA 放大（先清理后放大）
 - **生成式超分**：VOSR 2.0（CVPR 2026，模糊图→清晰，海报文字还原最强）+ 双引擎组合
   - `VOSR 2.0 + DLSS 5（双引擎完美档）`：VOSR 生成细节 → DLSS 硬件放大
   - `VOSR 2.0 + RTX（视频推荐两级放大）`：VOSR 去模糊 → RTX 二次清晰化
@@ -206,6 +207,9 @@ The search area is now derived from the live install path: sibling ComfyUI packs
 ---
 
 ## 📝 更新日志
+
+### v2.9.4 — 并入官方 NVIDIA RTX VFX 去噪/去模糊档位 / Official RTX VFX DENOISE_*/DEBLUR_* tiers merged
+- **新增引擎**「NVIDIA RTX VSR - 去噪/去模糊 (VFX)」：与官方 ComfyUI_Nvidia_VFX_Nodes 的 RTXVideoSuperResolution 同源（nvvfx `DENOISE_LOW~ULTRA` / `DEBLUR_LOW~ULTRA`，同分辨率处理，无需模型文件）。专属参数 `rtx_vfx_op`（去噪/去模糊）、`rtx_vfx_level`（LOW/MEDIUM/HIGH/ULTRA）、`rtx_strength`（0-1）；`scale>1` 时先同分辨率清理，再自动接 RTX ULTRA 放大到目标倍率（先清理后放大）。引擎不可用时自动降级 SeedVR2，workflow 不中断。
 
 ### v2.9.3 — DLSS5 本地引擎按安装路径自动发现（修复「未找到 video2dlssnr.exe」）/ Install-path-aware DLSS5 auto-discovery
 - **背景 / Context**：用户报节点执行 `RuntimeError: [BSAI-H3/DLSS5] 未找到 video2dlssnr.exe`。运行时其实已存在于本机另一整合包 `G:\Comfyui_BSAI\ComfyUI\models\DLSS5\`（4 文件齐全），但插件与 install.py 的本地包扫描只写死了 `C:\BSAI\DLSS5`，跨盘/跨目录的既有文件发现不了。

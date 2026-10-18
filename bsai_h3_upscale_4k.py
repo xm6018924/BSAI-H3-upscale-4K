@@ -107,14 +107,14 @@ def _npu_detector_available():
             test_img = np.zeros((64, 64, 3), dtype=np.uint8)
             _ = npu.detect_faces(test_img)
             _NPU_DET_AVAILABLE = True
-            print("[BSAI-H3] NPU 人脸检测已就绪（Intel AI Boost 卸载）")
+            print("[BSAI-H3] NPU face detection ready (offloaded to Intel AI Boost)")
         else:
             _NPU_DET_AVAILABLE = False
             _NPU_DET_ERROR = "NPU service unavailable"
     except Exception as e:
         _NPU_DET_AVAILABLE = False
         _NPU_DET_ERROR = str(e)
-        print(f"[BSAI-H3] NPU 人脸检测不可用: {e}")
+        print(f"[BSAI-H3] NPU face detection unavailable: {e}")
     return _NPU_DET_AVAILABLE
 
 
@@ -161,7 +161,7 @@ try:
         hardware=["cuda"],
     )
 except Exception as _bsai_e:  # 注册失败不得拖垮插件
-    print(f"[BSAI SDK] BSAI-H3-upscale-4K 注册失败(忽略): {_bsai_e}")
+    print(f"[BSAI SDK] BSAI-H3-upscale-4K registration failed (ignored): {_bsai_e}")
 # ==== BSAI SDK 块结束 ====
 
 # ---------------------------------------------------------------------------
@@ -1359,9 +1359,9 @@ def _face_restore_frames(out_tensor, mode, det_conf, blend, fidelity=0.75, tempo
     if det_backend in ("NPU", "auto"):
         if _npu_detector_available():
             use_npu = True
-            print(f"[BSAI-H3] 人脸检测: NPU SCRFD（Intel AI Boost 卸载 GPU1）")
+            print(f"[BSAI-H3] face detection: NPU SCRFD (Intel AI Boost offload, freeing GPU1)")
         elif det_backend == "NPU":
-            npu_fallback_msg = "NPU 不可用，回退到 GPU1 YOLOv8"
+            npu_fallback_msg = "NPU unavailable, falling back to GPU1 YOLOv8"
             print(f"[BSAI-H3] {npu_fallback_msg}")
 
     if not use_npu:
@@ -1395,7 +1395,7 @@ def _face_restore_frames(out_tensor, mode, det_conf, blend, fidelity=0.75, tempo
             else:
                 # NPU 失败，回退到 GPU1 YOLOv8（仅当 auto 模式）
                 if det_backend == "auto":
-                    print("[BSAI-H3] NPU 检测失败，回退到 GPU1 YOLOv8")
+                    print("[BSAI-H3] NPU detection failed, falling back to GPU1 YOLOv8")
                     use_npu = False
                     all_boxes = []  # 清空部分结果，GPU1 路径从头重新检测
                     try:
@@ -1608,11 +1608,11 @@ def _flashvsr_upscale(frames, scale, seed=42, anti_ghost=0.4, local_range=5):
     missing = [f for f in required if not os.path.isfile(os.path.join(model_dir, f))]
     if missing:
         raise RuntimeError(
-            "FlashVSR-v1.1 模型权重缺失 / FlashVSR-v1.1 weights missing:\n"
-            f"  缺失 / Missing: {', '.join(missing)}\n"
-            "  下载 / Download: https://huggingface.co/JunhaoZhuang/FlashVSR\n"
-            f"  放置路径 / Place in: {model_dir}\n"
-            f"  需要文件 / Required: {', '.join(required)}"
+            "FlashVSR-v1.1 model weights missing:\n"
+            f"  Missing: {', '.join(missing)}\n"
+            "  Download: https://huggingface.co/JunhaoZhuang/FlashVSR\n"
+            f"  Place in: {model_dir}\n"
+            f"  Required: {', '.join(required)}"
         )
     flash_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "flashvsr_vendor")
     _load_plugin_package(flash_dir, "_bsai_flashvsr")
@@ -1736,11 +1736,11 @@ def _seedvr2_upscale(frames, scale, seed=42):
     missing = [f for f in [dit_file, vae_file] if not os.path.isfile(os.path.join(model_dir, f))]
     if missing:
         raise RuntimeError(
-            "SeedVR2 模型权重缺失 / SeedVR2 weights missing:\n"
-            f"  缺失 / Missing: {', '.join(missing)}\n"
-            "  下载 / Download: https://huggingface.co/ByteDance/SeedVR2-7B (或社区镜像)\n"
-            f"  放置路径 / Place in: {model_dir}\n"
-            f"  需要文件 / Required: {dit_file}, {vae_file}"
+            "SeedVR2 weights missing:\n"
+            f"  Missing: {', '.join(missing)}\n"
+            "  Download: https://huggingface.co/ByteDance/SeedVR2-7B (or a community mirror)\n"
+            f"  Place in: {model_dir}\n"
+            f"  Required: {dit_file}, {vae_file}"
         )
     seed_dir = os.path.join(folder_paths.base_path, "custom_nodes", "ComfyUI-SeedVR2_VideoUpscaler")
     _load_plugin_package(seed_dir, "_bsai_seedvr2")
@@ -1828,8 +1828,8 @@ def _seedvr2_native_upscale(frames, scale, seed=42, steps=8, cfg=1.0,
         _ns = None
     if _ns is None:
         raise RuntimeError(
-            "SeedVR2 原生节点不可用：请确认 ComfyUI 已内置 comfy_extras/nodes_seedvr.py\n"
-            f"（错误: {_e}）")
+            "SeedVR2 native node unavailable: make sure this ComfyUI build ships comfy_extras/nodes_seedvr.py\n"
+            f" (error: {_e})")
 
     models_dir = folder_paths.models_dir
     diffusion_dir = os.path.join(models_dir, "diffusion_models")
@@ -1853,10 +1853,10 @@ def _seedvr2_native_upscale(frames, scale, seed=42, steps=8, cfg=1.0,
     dit_path = next((p for p in cand_dit if os.path.isfile(p)), None)
     if dit_path is None:
         raise RuntimeError(
-            "SeedVR2 INT8 权重缺失 / SeedVR2 INT8 weights missing:\n"
-            "  已查找:\n    " + "\n    ".join(cand_dit) + "\n"
-            "  下载 / Download: https://huggingface.co/Comfy-Org/SeedVR2_comfyui_repackaged\n"
-            "  （或使用现有 fp8/fp16 权重: seedvr2_ema_7b_fp8_e4m3fn_mixed_block35_fp16.safetensors）")
+            "SeedVR2 INT8 weights missing:\n"
+            "  Searched:\n    " + "\n    ".join(cand_dit) + "\n"
+            "  Download: https://huggingface.co/Comfy-Org/SeedVR2_comfyui_repackaged\n"
+            "  (or use existing fp8/fp16 weights: seedvr2_ema_7b_fp8_e4m3fn_mixed_block35_fp16.safetensors)")
 
     # ---- VAE 权重自动查找（SEEDVR2 -> vae） ----
     cand_vae = [
@@ -1867,9 +1867,9 @@ def _seedvr2_native_upscale(frames, scale, seed=42, steps=8, cfg=1.0,
     vae_path = next((p for p in cand_vae if os.path.isfile(p)), None)
     if vae_path is None:
         raise RuntimeError(
-            "SeedVR2 VAE 缺失 / SeedVR2 VAE missing:\n"
-            "  已查找:\n    " + "\n    ".join(cand_vae) + "\n"
-            "  下载 / Download: https://huggingface.co/numz/SeedVR2_comfyUI (ema_vae_fp16.safetensors)")
+            "SeedVR2 VAE missing:\n"
+            "  Searched:\n    " + "\n    ".join(cand_vae) + "\n"
+            "  Download: https://huggingface.co/numz/SeedVR2_comfyUI (ema_vae_fp16.safetensors)")
 
     # Aggressive VRAM cleanup before 7B DiT + VAE (~18GB)
     try:
@@ -1959,22 +1959,22 @@ def _seedvr2_native_upscale(frames, scale, seed=42, steps=8, cfg=1.0,
     return out
 
 
-def _rtx_upscale(frames, scale, quality="超高"):
+def _rtx_upscale(frames, scale, quality="Ultra"):
     """NVIDIA RTX Video Super Resolution (nvidia-vfx, no model files).
     直接内联 nvvfx 调用，不再依赖 ComfyUI-Yuan-Tool 插件。"""
     try:
         import nvvfx
     except ImportError as e:
         raise ImportError(
-            "未安装 nvidia-vfx 库，请执行: pip install nvidia-vfx"
+            "nvidia-vfx package not installed. Run: pip install nvidia-vfx"
         ) from e
 
     MAX_PIXELS = 1024 * 1024 * 16
     quality_mapping = {
-        "低": nvvfx.effects.QualityLevel.LOW,
-        "中": nvvfx.effects.QualityLevel.MEDIUM,
-        "高": nvvfx.effects.QualityLevel.HIGH,
-        "超高": nvvfx.effects.QualityLevel.ULTRA,
+        "Low": nvvfx.effects.QualityLevel.LOW,
+        "Medium": nvvfx.effects.QualityLevel.MEDIUM,
+        "High": nvvfx.effects.QualityLevel.HIGH,
+        "Ultra": nvvfx.effects.QualityLevel.ULTRA,
     }
     selected_quality = quality_mapping.get(quality, nvvfx.effects.QualityLevel.HIGH)
 
@@ -2009,7 +2009,7 @@ def _rtx_upscale(frames, scale, quality="超高"):
     return out_tensor.float().clamp(0, 1)
 
 
-def _rtx_vfx_upscale(frames, scale, op="去噪", level="ULTRA", strength=1.0):
+def _rtx_vfx_upscale(frames, scale, op="Denoise", level="ULTRA", strength=1.0):
     """NVIDIA RTX VFX 去噪/去模糊（官方 ComfyUI_Nvidia_VFX_Nodes 同款 nvvfx
     DENOISE_*/DEBLUR_* 档位，同分辨率处理，无模型文件，全部在 RTX 显卡上完成）。
 
@@ -2021,10 +2021,10 @@ def _rtx_vfx_upscale(frames, scale, op="去噪", level="ULTRA", strength=1.0):
         import nvvfx
     except ImportError as e:
         raise ImportError(
-            "未安装 nvidia-vfx 库，请执行: pip install nvidia-vfx"
+            "nvidia-vfx package not installed. Run: pip install nvidia-vfx"
         ) from e
 
-    op_prefix = "DENOISE" if str(op).startswith("去噪") else "DEBLUR"
+    op_prefix = "DENOISE" if str(op).lower().startswith("denoise") else "DEBLUR"
     level_name = str(level).strip().upper()
     if level_name not in ("LOW", "MEDIUM", "HIGH", "ULTRA"):
         level_name = "ULTRA"
@@ -2034,7 +2034,7 @@ def _rtx_vfx_upscale(frames, scale, op="去噪", level="ULTRA", strength=1.0):
     _, h, w, c = frames.shape
     frames_cuda = frames.cuda().permute(0, 3, 1, 2).float().contiguous()
     cleaned = torch.empty((frames.shape[0], h, w, c), device="cpu", dtype=torch.float32)
-    print(f"[BSAI-H3-upscale-4K] RTX VFX {op_prefix}_{level_name}: {w}x{h} -> 同分辨率清理 (strength={strength})", flush=True)
+    print(f"[BSAI-H3-upscale-4K] RTX VFX {op_prefix}_{level_name}: {w}x{h} -> same-resolution cleanup (strength={strength})", flush=True)
     with nvvfx.VideoSuperRes(quality=quality, strength=float(strength)) as fx:
         fx.output_width = w
         fx.output_height = h
@@ -2048,7 +2048,7 @@ def _rtx_vfx_upscale(frames, scale, op="去噪", level="ULTRA", strength=1.0):
 
     # 阶段2：需要放大时用 RTX ULTRA 放大（先清理后放大）
     if scale is not None and float(scale) > 1.0:
-        return _rtx_upscale(cleaned, float(scale), quality="超高")
+        return _rtx_upscale(cleaned, float(scale), quality="Ultra")
     return cleaned
 
 
@@ -2215,7 +2215,7 @@ def _dlssnr_provision():
         return None
     try:
         import zipfile
-        print(f"[BSAI-H3/DLSS5] 检测到本地整合包，自动部署 video2dlssnr -> {dest} ...", flush=True)
+        print(f"[BSAI-H3/DLSS5] local pack detected, auto-provisioning video2dlssnr -> {dest} ...", flush=True)
         with zipfile.ZipFile(zsrc) as zf:
             for m in zf.infolist():
                 if m.is_dir():
@@ -2232,10 +2232,10 @@ def _dlssnr_provision():
                 with zf.open(m) as s, open(target, "wb") as o:
                     o.write(s.read())
         if os.path.isfile(exe):
-            print(f"[BSAI-H3/DLSS5] 部署完成: {exe}", flush=True)
+            print(f"[BSAI-H3/DLSS5] provisioned: {exe}", flush=True)
             return exe
     except Exception as e:
-        print(f"[BSAI-H3/DLSS5] 自动部署失败: {e}（可手动把 video2dlssnr/out/ 整个复制到 {dest}）", flush=True)
+        print(f"[BSAI-H3/DLSS5] auto-provision failed: {e} (you can copy the whole video2dlssnr/out/ dir into {dest} manually)", flush=True)
     return None
 
 
@@ -2255,7 +2255,7 @@ def _dlssnr_find_exe():
     # known local packs: prefer an already-extracted exe before unzipping
     for cand in _dlssnr_pack_candidates():
         if cand.lower().endswith(".exe"):
-            print(f"[BSAI-H3/DLSS5] 使用本地引擎: {cand}", flush=True)
+            print(f"[BSAI-H3/DLSS5] using local engine: {cand}", flush=True)
             return cand
     prov = _dlssnr_provision()
     if prov:
@@ -2322,7 +2322,7 @@ def _dlssnr_tiled_upscale(frames, scale, style, preset, intensity,
                     width=ow, adapter=adapter)
             except RuntimeError as e:
                 raise RuntimeError(
-                    "[BSAI-H3/DLSS5] 分块超分失败（块 %d/%d, %dx%d）：%s"
+                    "[BSAI-H3/DLSS5] tiled SR failed (tile %d/%d, %dx%d): %s"
                     % (r * cols + c + 1, rows * cols, ow, oh, str(e)[:300]))
             # 输出块尺寸校正（scale 非整除时可能有 ±2px 偏差）
             if sr.shape[1] != oh or sr.shape[2] != ow:
@@ -2392,7 +2392,7 @@ def _dlssnr_upscale(frames, scale, style="Cinematic", preset="Default", intensit
 
     alpha = np.full((b, h, w, 1), 255, np.uint8)
     rgba = np.concatenate([src, alpha], axis=3)
-    print(f"[BSAI-H3/DLSS5] {os.path.basename(exe)} | {w}x{h} x{b}帧 -> {out_w}x{out_h} "
+    print(f"[BSAI-H3/DLSS5] {os.path.basename(exe)} | {w}x{h} x{b} frames -> {out_w}x{out_h} "
           f"(style={style}, detail={detail}, motion={motion_engine})", flush=True)
     p = _sp.Popen(cmd, stdin=_sp.PIPE, stdout=_sp.PIPE, stderr=_sp.PIPE)
     err = []
@@ -2429,10 +2429,10 @@ def _dlssnr_upscale(frames, scale, style="Cinematic", preset="Default", intensit
     tf.join(timeout=5); td.join(timeout=5)
     if rc != 0 or got != need:
         raise RuntimeError(
-            "[BSAI-H3/DLSS5] DLSS 5 超分失败 (exit %s, got %d/%d bytes)\n%s\n"
-            "提示: 需要 NVIDIA RTX 显卡；Neural Rendering 需驱动 >= 616.56（旧驱动下 "
-            "driver NGX 以 OutOfDate 拒绝 feature 18）。请确认 nvngx_dlss.dll / "
-            "nvngx_dlssnr.dll 与 exe 同目录。" % (rc, got, need, "\n".join(err)[-2000:]))
+            "[BSAI-H3/DLSS5] DLSS 5 SR failed (exit %s, got %d/%d bytes)\n%s\n"
+            "Hint: an NVIDIA RTX GPU is required; Neural Rendering needs driver >= 616.56 "
+            "(older drivers are rejected by NGX as OutOfDate for feature 18). Make sure nvngx_dlss.dll / "
+            "nvngx_dlssnr.dll sit next to the exe." % (rc, got, need, "\n".join(err)[-2000:]))
     return (torch.from_numpy(
         np.frombuffer(buf, np.uint8).reshape(b, out_h, out_w, 4)[..., :3]).float() / 255.0)
 
@@ -2491,8 +2491,8 @@ def _vosr_upscale(frames, scale=4.0, cfg_scale=0.5, infer_steps=1):
     ckpt = _vosr_ckpt_dir()
     if not script or not ckpt:
         raise RuntimeError(
-            "[BSAI-H3/VOSR] VOSR未安装。将VOSR仓库放到 models/VOSR 或设置VOSR_HOME，权重放preset/ckpts/VOSR2/\n"
-            "下载: https://github.com/cswry/VOSR | ComfyUI: https://github.com/ylchen333/ComfyUI-VOSR2")
+            "[BSAI-H3/VOSR] VOSR is not installed. Place the VOSR repo under models/VOSR or set VOSR_HOME, and put weights under preset/ckpts/VOSR2/\n"
+            "Download: https://github.com/cswry/VOSR | ComfyUI: https://github.com/ylchen333/ComfyUI-VOSR2")
     home = _vosr_home()
     up = max(2, min(4, int(round(scale))))
     b, h, w, _ = frames.shape
@@ -2530,7 +2530,7 @@ def _vosr_upscale(frames, scale=4.0, cfg_scale=0.5, infer_steps=1):
                                          cv2.BORDER_REFLECT_101)
             cv2.imwrite(os.path.join(in_dir, f"frame_{i:05d}.png"),
                         cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
-        print(f"[BSAI-H3/VOSR] {b}帧 {w}x{h} -> VOSR 2.0 (x{up})"
+        print(f"[BSAI-H3/VOSR] {b} frames {w}x{h} -> VOSR 2.0 (x{up})"
               + (f", tile={tile}/vae1024" if tile else "") + " ...", flush=True)
         t0 = time.time()
         cmd = [_vosr_python(), script, "-c", ckpt, "-i", in_dir, "-o", out_dir,
@@ -2557,8 +2557,8 @@ def _vosr_upscale(frames, scale=4.0, cfg_scale=0.5, infer_steps=1):
         out_files = sorted(f2 for f2 in os.listdir(out_dir) if f2.endswith(".png"))
         if len(out_files) < b:
             raise RuntimeError(
-                "[BSAI-H3/VOSR] 输出帧数不足: %d/%d（returncode=%s）\n"
-                "--- VOSR stdout 尾部 ---\n%s\n--- VOSR stderr 尾部 ---\n%s"
+                "[BSAI-H3/VOSR] not enough output frames: %d/%d (returncode=%s)\n"
+                "--- VOSR stdout tail ---\n%s\n--- VOSR stderr tail ---\n%s"
                 % (len(out_files), b, proc.returncode,
                    (proc.stdout or "")[-1500:], (proc.stderr or "")[-1500:]))
         out_frames = []
@@ -2573,7 +2573,7 @@ def _vosr_upscale(frames, scale=4.0, cfg_scale=0.5, infer_steps=1):
                     img = cv2.resize(img, (tw, th), interpolation=cv2.INTER_LANCZOS4)
             out_frames.append(torch.from_numpy(img.astype(np.float32) / 255.0))
         dt = time.time() - t0
-        print(f"[BSAI-H3/VOSR] 完成 {b}帧 in {dt:.1f}s ({b/dt:.1f}fps)", flush=True)
+        print(f"[BSAI-H3/VOSR] done {b} frames in {dt:.1f}s ({b/dt:.1f}fps)", flush=True)
         return torch.stack(out_frames, dim=0)
     finally:
         shutil.rmtree(in_dir, ignore_errors=True)
@@ -2622,12 +2622,12 @@ def _apply_input_adaptive(input_adaptive, in_short, detail_amount, detail_mode, 
     if uhd is False:
         # <720p: 细节增强 1.2 倍(上限 0.6，防生成式引擎叠加 USM 过度锐化/伪影)
         detail_eff = min(float(detail_amount) * 1.2, 0.6)
-        return detail_eff, mode_eff, soft_eff, "HD 增强档"
+        return detail_eff, mode_eff, soft_eff, "HD Enhance"
     return detail_eff, mode_eff, soft_eff, "Off"
 
 
 def _auto_route(images, prefer="Quality", scale=4.0, user_face='Off',
-                user_detail=0.5, user_detail_mode='smart', user_adaptive='自动'):
+                user_detail=0.5, user_detail_mode='smart', user_adaptive='Auto'):
     """v2.7.0: 模型自动路由（对标 HitPaw VikPea 多模型选择器：General /
     Animation / Portrait / UltraHD / Generative 按需选型）。零新依赖——
     只探测插件已有权重文件 + 抽样人脸检测，返回 (显示名, 参数覆盖 dict, notes)。"""
@@ -2670,50 +2670,50 @@ def _auto_route(images, prefer="Quality", scale=4.0, user_face='Off',
         face_found = any(r.boxes is not None and len(r.boxes) for r in res)
     except Exception as e:
         print(f"[BSAI-H3] auto-route face probe skipped ({e})")
-    notes.append("内容: " + ("人脸" if face_found else "非人脸") +
-                 f", 输入 {int(W)}x{int(H)} ({'HD/UHD' if in_short >= 720 else 'SD'})")
+    notes.append("content: " + ("face" if face_found else "no-face") +
+                 f", input {int(W)}x{int(H)} ({'HD/UHD' if in_short >= 720 else 'SD'})")
     # ---- 偏好 → 引擎 ----
     over = {}
     if prefer == "Quality":
         if has_seed_fp8 and cuda:
-            engine = "SeedVR2 7B (扩散视频超分)"
-            notes.append("引擎: SeedVR2 fp8 (扩散, 精度最高)")
+            engine = "SeedVR2 7B (diffusion video SR)"
+            notes.append("engine: SeedVR2 fp8 (diffusion, best quality)")
         elif int8_name and cuda:
-            engine = "SeedVR2 7B INT8 (ComfyUI原生)"
-            notes.append("引擎: SeedVR2 INT8 (扩散, 量化加速)")
+            engine = "SeedVR2 7B INT8 (native ComfyUI)"
+            notes.append("engine: SeedVR2 INT8 (diffusion, quantized fast)")
         elif has_vosr and cuda:
-            engine = "VOSR 2.0 (CVPR2026生成式超分)"
-            notes.append("引擎: VOSR 2.0 (生成式)")
+            engine = "VOSR 2.0 (CVPR2026 generative SR)"
+            notes.append("engine: VOSR 2.0 (generative)")
         elif has_flash and cuda:
-            engine = "FlashVSR-v1.1 (扩散视频超分)"
-            notes.append("引擎: FlashVSR-v1.1 (扩散)")
+            engine = "FlashVSR-v1.1 (diffusion video SR)"
+            notes.append("engine: FlashVSR-v1.1 (diffusion)")
         else:
             engine = "realesr-general-x4v3.pth"
-            notes.append("引擎: Real-ESRGAN general (无扩散权重, 速度回退)")
+            notes.append("engine: Real-ESRGAN general (no diffusion weights, speed fallback)")
         # 质量优先选中 INT8 量化扩散时：采样增强补偿量化损失（fp8 走官方默认采样，无需覆盖）
-        if engine == "SeedVR2 7B INT8 (ComfyUI原生)":
+        if engine == "SeedVR2 7B INT8 (native ComfyUI)":
             over["sv2_steps"] = 16
             over["sv2_cfg"] = 1.5
-            notes.append("SeedVR2 INT8: 采样增强 16步/CFG1.5 (质量优先)")
+            notes.append("SeedVR2 INT8: sampling boosted to 16 steps/CFG1.5 (quality priority)")
     elif prefer == "Speed":
         engine = "realesr-general-x4v3.pth"
-        notes.append("引擎: Real-ESRGAN general (速度优先)")
+        notes.append("engine: Real-ESRGAN general (speed priority)")
     elif prefer == "Portrait":
         engine = "RealESRGAN_x4plus.pth" if has("upscale_models", "RealESRGAN_x4plus.pth") else "realesr-general-x4v3.pth"
-        notes.append("引擎: " + engine)
+        notes.append("engine: " + engine)
         over["face_restore"] = "CodeFormer"
         over["face_temporal"] = 0.5
-        notes.append("后处理: 强制 CodeFormer 人脸修复 + 时域稳定")
+        notes.append("post-process: forced CodeFormer face restore + temporal stabilization")
     elif prefer == "Anime":
         engine = anime if anime else "realesr-general-x4v3.pth"
-        notes.append("引擎: " + (anime or "general (无 anime 权重, 回退 general+smart)"))
+        notes.append("engine: " + (anime or "general (no anime weights, fallback general+smart)"))
         if not anime:
             over["detail_mode"] = "smart"
     else:  # UHD 优先
         engine = "realesr-general-x4v3.pth"
-        notes.append("引擎: Real-ESRGAN general")
+        notes.append("engine: Real-ESRGAN general")
         over["input_adaptive"] = "UHD Conservative"
-        notes.append("后处理: UHD 保守细节 (防过度锐化)")
+        notes.append("post-process: UHD conservative detail (anti over-sharpening)")
     # ---- 通用智能补强 ----
     if face_found and user_face == "Off" and prefer != "Portrait":
         over["face_restore"] = "CodeFormer"
@@ -2721,14 +2721,14 @@ def _auto_route(images, prefer="Quality", scale=4.0, user_face='Off',
         # 轻修复：CodeFormer 保真 0.45 + 融合 0.55 —— 只补细节、不改脸型，避免“塑料感”
         over["face_fidelity"] = 0.45
         over["face_blend"] = 0.55
-        notes.append("检测到人脸 → 自动开启 CodeFormer(轻修复 保真0.45/融合0.55) + 时域稳定")
+        notes.append("face detected -> auto CodeFormer restore (light: fidelity 0.45/blend 0.55) + temporal stabilization")
     if prefer == "Quality" and "input_adaptive" not in over:
         if in_short >= 720:
             over["input_adaptive"] = "UHD Conservative"
-            notes.append("高清输入 → UHD 保守细节")
+            notes.append("HD input -> UHD conservative detail")
         elif in_short < 540:
             over["input_adaptive"] = "HD Enhance"
-            notes.append("低清输入 → HD 增强细节 (生成式重建)")
+            notes.append("low-res input -> HD enhanced detail (generative rebuild)")
     return engine, over, notes
 
 
@@ -2753,6 +2753,7 @@ _LEGACY_ENGINE = {
     "Topaz 星光 2.6 (生成式完美档)": "Topaz Starlight 2.6 (generative)",
     "Topaz Astra (生成式)": "Topaz Astra (generative)",
     "Topaz Wonder 3.5 (生成式)": "Topaz Wonder 3.5 (generative)",
+    "NVIDIA RTX VSR - 去噪/去模糊 (VFX)": "NVIDIA RTX VSR - Denoise/Deblur (VFX)",
 }
 _LEGACY_TOPAZ_MODEL = {"星光 2.6": "Starlight 2.6"}
 
@@ -2768,7 +2769,7 @@ class BSAI_H3_Upscale4K:
         "SeedVR2 7B (diffusion video SR)": "seedvr2",
         "SeedVR2 7B INT8 (native ComfyUI)": "seedvr2_int8",
         "NVIDIA RTX Video Super Res": "rtx",
-"NVIDIA RTX VSR - 去噪/去模糊 (VFX)": "rtx_vfx",
+        "NVIDIA RTX VSR - Denoise/Deblur (VFX)": "rtx_vfx",
         "DLSS 5 (NVIDIA neural SR)": "dlss5",
         "VOSR 2.0 (CVPR2026 generative SR)": "vosr2",
         "VOSR 2.0 + DLSS 5 (dual-engine)": "vosr_dlss",
@@ -2867,7 +2868,7 @@ class BSAI_H3_Upscale4K:
                 # （nvvfx DENOISE_*/DEBLUR_* 档位，同分辨率清理）。
                 # op = 去噪(DENOISE)/去模糊(DEBLUR)；level = 档位强度；
                 # strength = 效果强度(0-1)；scale>1 时清理后自动 RTX ULTRA 放大。
-                "rtx_vfx_op": (["去噪", "去模糊"], {"default": "去噪"}),
+                "rtx_vfx_op": (["Denoise", "Deblur"], {"default": "Denoise"}),
                 "rtx_vfx_level": (["LOW", "MEDIUM", "HIGH", "ULTRA"], {"default": "ULTRA"}),
                 "rtx_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05}),
                 # VOSR 2.0 专属参数
@@ -2946,11 +2947,13 @@ class BSAI_H3_Upscale4K:
         input_adaptive = _LEGACY_INPUT_ADAPTIVE.get(input_adaptive, input_adaptive)
         auto_prefer = g("auto_prefer", 'Quality')
         auto_prefer = _LEGACY_AUTO_PREFER.get(auto_prefer, auto_prefer)
+        model_name = _LEGACY_ENGINE.get(model_name, model_name)
         dlss_style = g("dlss_style", 'Cinematic')
         dlss_intensity = g("dlss_intensity", 1.0)
         dlss_detail = g("dlss_detail", 1.0)
         dlss_motion = g("dlss_motion", True)
-        rtx_vfx_op = g("rtx_vfx_op", '去噪')
+        rtx_vfx_op = g("rtx_vfx_op", 'Denoise')
+        rtx_vfx_op = {"去噪": "Denoise", "去模糊": "Deblur"}.get(rtx_vfx_op, rtx_vfx_op)
         rtx_vfx_level = g("rtx_vfx_level", 'ULTRA')
         rtx_strength = g("rtx_strength", 1.0)
         flashvsr_anti_ghost = g("flashvsr_anti_ghost", 0.30)
@@ -3031,7 +3034,7 @@ class BSAI_H3_Upscale4K:
             try:
                 out = _rtx_upscale(images, scale)
             except Exception as _e:
-                print("[BSAI-H3-upscale-4K] RTX 超分不可用 (%s)，降级到 SeedVR2" % _e)
+                print("[BSAI-H3-upscale-4K] RTX VSR unavailable (%s), falling back to SeedVR2" % _e)
                 out = _seedvr2_native_upscale(
                     images, float(scale), seed=42,
                     steps=int(g("sv2_steps", 12)),
@@ -3054,7 +3057,7 @@ class BSAI_H3_Upscale4K:
                     strength=float(rtx_strength),
                 )
             except Exception as _e:
-                print("[BSAI-H3-upscale-4K] RTX VFX 去噪/去模糊不可用 (%s)，降级到 SeedVR2" % _e)
+                print("[BSAI-H3-upscale-4K] RTX VFX denoise/deblur unavailable (%s), falling back to SeedVR2" % _e)
                 out = _seedvr2_native_upscale(
                     images, float(scale), seed=42,
                     steps=int(g("sv2_steps", 12)),
@@ -3229,7 +3232,7 @@ class BSAI_H3_Upscale4K:
             f"device: {'cuda' if torch.cuda.is_available() else 'cpu'}"
         )
         if auto_notes:
-            info = info + " | auto路由: " + "; ".join(auto_notes)
+            info = info + " | auto-route: " + "; ".join(auto_notes)
         return (out, bw, bh, float(eff_scale), info)
 
 
@@ -3515,10 +3518,11 @@ class BSAI_H3_Upscale4K_Latent:
     FUNCTION = "upscale"
     CATEGORY = "BSAI/H3"
     DESCRIPTION = (
-        "H3 专属 latent 放大：自动 32 像素对齐，供 H3 第二遍采样补细节（保持人物一致性）。\n"
-        "learned-3d = 训练好的 3D 卷积 latent 超分网络（方法借鉴 Minimax_h3_latent_Upscaler，\n"
-        "需在 models/latent_upscale_models/ 放置 minimax_h3_latent_upscaler_3d_fp16.safetensors）；\n"
-        "其余为经典插值回退。\n"
+        "H3-specific latent upscale with automatic 32-px alignment, for H3 second-pass sampling\n"
+        "refinement (preserves subject consistency).\n"
+        "learned-3d = trained 3D-conv latent SR network (method borrowed from Minimax_h3_latent_Upscaler,\n"
+        "place minimax_h3_latent_upscaler_3d_fp16.safetensors in models/latent_upscale_models/);\n"
+        "other methods = classic interpolation fallback.\n"
         "H3-specific latent upscale with 32-px alignment: learned-3d = trained 3D-conv\n"
         "latent SR network (method borrowed, weight in models/latent_upscale_models/),\n"
         "other methods = classic interpolation fallback."
@@ -3555,8 +3559,8 @@ class BSAI_H3_Upscale4K_Latent:
         models = _scan_latent_models()
         if not models:
             raise FileNotFoundError(
-                "未找到学习型 latent 模型。请将 minimax_h3_latent_upscaler_3d_fp16.safetensors "
-                "放入 ComfyUI/models/latent_upscale_models/")
+                "learned latent model not found. Please place minimax_h3_latent_upscaler_3d_fp16.safetensors "
+                "into ComfyUI/models/latent_upscale_models/")
         name = model_name if (model_name in models) else _pick_default_latent_model(models)
         dt = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}[precision]
         dev = torch.device("cuda")
@@ -3773,8 +3777,8 @@ def _topaz_run(in_path, out_path, scale, frames, w, h, strength, max_gpu_mem, mo
     ASTRA_MODELS = ('astra', 'astrahq', 'astrasharp', 'astrafast')
     if model_id in ASTRA_MODELS and frames < 9:
         raise RuntimeError(
-            f'Astra 系列模型需要至少 9 帧输入 (当前 {frames} 帧), '
-            '两版引擎的短视频路径均存在缺陷。请用更长的视频。')
+            f'Astra-series models require at least 9 input frames (got {frames}); '
+            'the short-video paths of both engine builds are buggy. Use a longer clip.')
     eng = _topaz_engine_dir()
     ns = os.path.join(eng, "neuroserver171", "neuroserver.exe")
     if not os.path.exists(ns):
@@ -3802,7 +3806,7 @@ def _topaz_run(in_path, out_path, scale, frames, w, h, strength, max_gpu_mem, mo
                     % (cfg, cfg, cfg))
     filters += '}]'
     if torch_compile in ("inductor", "cudagraphs"):
-        print(f"[BSAI-H3/Topaz] torch_compile={torch_compile} 已透传 (首次运行含编译开销, 缓存热后生效)")
+        print(f"[BSAI-H3/Topaz] torch_compile={torch_compile} passed through (first run includes compile cost, kicks in after warmup)")
     ow = int(round(w * scale)); ow += ow % 2
     oh = int(round(h * scale)); oh += oh % 2
     NS_ENC = ('-c:v h264_nvenc -profile:v high -pix_fmt yuv420p -g 30 -preset p4 -tune hq '
@@ -3819,9 +3823,9 @@ def _topaz_run(in_path, out_path, scale, frames, w, h, strength, max_gpu_mem, mo
                '--output-width', str(ow), '--output-height', str(oh),
                '--upscale-factor', str(scale), '--ffmpeg-encoding', NS_ENC]
         if attempt == 0:
-            print(f"[BSAI-H3/Topaz] 星光引擎: {ns} | 模型: {model_id} | {frames}帧 {w}x{h} -> {ow}x{oh} (x{scale})")
+            print(f"[BSAI-H3/Topaz] Starlight engine: {ns} | model: {model_id} | {frames} frames {w}x{h} -> {ow}x{oh} (x{scale})")
         else:
-            print(f"[BSAI-H3/Topaz] 重试 {attempt}/{max_attempts-1} | max_gpu_mem={gpu_mem} | 模型: {model_id}")
+            print(f"[BSAI-H3/Topaz] retry {attempt}/{max_attempts-1} | max_gpu_mem={gpu_mem} | model: {model_id}")
         # clear torch CUDA cache before each neuroserver launch
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -3838,7 +3842,7 @@ def _topaz_run(in_path, out_path, scale, frames, w, h, strength, max_gpu_mem, mo
             if proc.returncode != 0:
                 last_err = RuntimeError(f'neuroserver failed (exit {proc.returncode})')
                 if attempt < max_attempts - 1:
-                    print(f"[BSAI-H3/Topaz] neuroserver 崩溃 (exit {proc.returncode}), 5秒后重试...")
+                    print(f"[BSAI-H3/Topaz] neuroserver crashed (exit {proc.returncode}), retrying in 5s...")
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
                     time.sleep(5)
@@ -3854,14 +3858,14 @@ def _topaz_run(in_path, out_path, scale, frames, w, h, strength, max_gpu_mem, mo
                     raise last_err
             # success
             if attempt > 0:
-                print(f"[BSAI-H3/Topaz] 重试成功 (attempt {attempt})")
+                print(f"[BSAI-H3/Topaz] retry succeeded (attempt {attempt})")
             return
         except RuntimeError:
             raise
         except Exception as e:
             last_err = e
             if attempt < max_attempts - 1:
-                print(f"[BSAI-H3/Topaz] 异常: {e}, 重试...")
+                print(f"[BSAI-H3/Topaz] error: {e}, retrying...")
                 time.sleep(5)
                 continue
             else:
@@ -3957,7 +3961,7 @@ def _topaz_run_image(in_path, out_path, scale, w, h, strength, max_gpu_mem):
             if proc.returncode != 0:
                 last_err = RuntimeError(f'neuroserver failed (exit {proc.returncode})')
                 if attempt < max_attempts - 1:
-                    print(f"[BSAI-H3/Topaz] neuroserver 崩溃 (exit {proc.returncode}), 5秒后重试...")
+                    print(f"[BSAI-H3/Topaz] neuroserver crashed (exit {proc.returncode}), retrying in 5s...")
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
                     time.sleep(5)
@@ -3977,7 +3981,7 @@ def _topaz_run_image(in_path, out_path, scale, w, h, strength, max_gpu_mem):
         except Exception as e:
             last_err = e
             if attempt < max_attempts - 1:
-                print(f"[BSAI-H3/Topaz] 异常: {e}, 重试...")
+                print(f"[BSAI-H3/Topaz] error: {e}, retrying...")
                 time.sleep(5)
                 continue
             else:
@@ -3998,8 +4002,8 @@ def _topaz_upscale_images(frames, scale, strength, max_gpu_mem):
     if b < 1:
         raise ValueError("empty frame input")
     if b > 1:
-        print(f"[BSAI-H3/Topaz] Wonder 3.5 为图像模型，视频按逐帧处理: {b} 帧，"
-              f"约需 {b} 次引擎调用（每帧独立加载模型，较慢）...")
+        print(f"[BSAI-H3/Topaz] Wonder 3.5 is an image model; processing video frame by frame: {b} frames, "
+              f"~{b} engine calls (model loads per frame, slower)...")
     tag = uuid.uuid4().hex[:10]
     work = os.path.join(tempfile.gettempdir(), f'topaz_wonder_{tag}')
     os.makedirs(work, exist_ok=True)
@@ -4019,7 +4023,7 @@ def _topaz_upscale_images(frames, scale, strength, max_gpu_mem):
             if p.returncode != 0:
                 raise RuntimeError(f'ffmpeg single-frame write failed: {p.stderr.decode(errors="replace")[:300]}')
             t0 = time.time()
-            print(f"[BSAI-H3/Topaz] Wonder 3.5 帧 {i + 1}/{b} ({w}x{h} -> {ow}x{oh}, x{scale}) ...")
+            print(f"[BSAI-H3/Topaz] Wonder 3.5 frame {i + 1}/{b} ({w}x{h} -> {ow}x{oh}, x{scale}) ...")
             _topaz_run_image(fin, fout, scale, w, h, strength, max_gpu_mem)
             pr = subprocess.run(
                 [ffmpeg, '-loglevel', 'error', '-i', fout,
@@ -4034,7 +4038,7 @@ def _topaz_upscale_images(frames, scale, strength, max_gpu_mem):
                     f'Wonder output size mismatch: expected {ow}x{oh}, got {raw.size // 3} pixels'
                     f'({raw.size // (oh * 3)}x{raw.size // (ow * 3)})')
             outs.append(raw.reshape(oh, ow, 3))
-            print(f"[BSAI-H3/Topaz] 帧 {i + 1}/{b} 完成 ({time.time() - t0:.1f}s)")
+            print(f"[BSAI-H3/Topaz] frame {i + 1}/{b} done ({time.time() - t0:.1f}s)")
         return np.stack(outs)
     finally:
         shutil.rmtree(work, ignore_errors=True)
@@ -4254,11 +4258,11 @@ class BSAI_H3_DLSS5:
     FUNCTION = "run"
     CATEGORY = "BSAI/H3"
     DESCRIPTION = (
-        "DLSS 5 视频超分独立节点：DLSS Super Resolution + Neural Rendering（NGX feature 18），\n"
-        "经 video2dlssnr.exe 原始 RGBA 管道驱动，RTX 显卡硬件加速。\n"
-        "• 纯超分：detail=0（只放大不加神经渲染）\n"
-        "• 完美档：detail=1 + Cinematic + motion（光流时序）\n"
-        "需 exe + nvngx_dlss.dll + nvngx_dlssnr.dll 就位（详见 README）。\n"
+        "DLSS 5 standalone video upscaler: DLSS Super Resolution + Neural Rendering (NGX feature 18),\n"
+        "driven by video2dlssnr.exe over a raw RGBA pipe, RTX hardware-accelerated.\n"
+        "• Pure SR: detail=0 (only upscale, no neural rendering)\n"
+        "• Best quality: detail=1 + Cinematic + motion (optical-flow temporal)\n"
+        "Requires exe + nvngx_dlss.dll + nvngx_dlssnr.dll in place (see README).\n"
         "DLSS 5 standalone video upscaler: DLSS SR + Neural Rendering via video2dlssnr.exe."
     )
 
@@ -4315,9 +4319,9 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "BSAI_H3_Upscale4K": "BSAI H3 upscale 4K / 视频超分",
-    "BSAI_H3_Upscale4K_Latent": "BSAI H3 upscale 4K Latent / H3潜空间放大",
-    "BSAI_H3_FaceRestore": "BSAI H3 Face Restore / 人脸修复",
+    "BSAI_H3_Upscale4K": "BSAI H3 upscale 4K",
+    "BSAI_H3_Upscale4K_Latent": "BSAI H3 upscale 4K Latent",
+    "BSAI_H3_FaceRestore": "BSAI H3 Face Restore",
     "BSAI Topaz Engine Face Restore": "BSAI Topaz Engine Face Restore",
-    "BSAI_H3_DLSS5": "BSAI H3 DLSS 5 Upscale / DLSS5神经超分",
+    "BSAI_H3_DLSS5": "BSAI H3 DLSS 5 Upscale",
 }

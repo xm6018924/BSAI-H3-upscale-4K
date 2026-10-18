@@ -185,6 +185,21 @@ def git_clone_with_retry(url, dest, max_retry=3, timeout=300, pin_commit=None):
                 )
                 if r.returncode == 0 and os.path.isdir(dest) and os.path.isdir(os.path.join(dest, ".git")):
                     if pin_commit:
+                        # A --depth-1 clone only holds the remote HEAD; if upstream has
+                        # moved past the pinned SHA, fetch that commit explicitly first
+                        # (GitHub allows fetching by SHA) so the checkout can never fail.
+                        fetch = subprocess.run(
+                            ["git", "-C", dest, "fetch", "--depth", "1", "origin", pin_commit],
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            encoding="utf-8", errors="replace", timeout=300,
+                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                            env=env,
+                        )
+                        if fetch.returncode != 0:
+                            last_err = (fetch.stdout or "").strip()[-300:]
+                            print(f"{TAG}     pin_commit fetch failed: {last_err[:120]}")
+                            shutil.rmtree(dest, ignore_errors=True)
+                            continue
                         chk = subprocess.run(
                             ["git", "-C", dest, "checkout", "--quiet", pin_commit],
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -194,7 +209,8 @@ def git_clone_with_retry(url, dest, max_retry=3, timeout=300, pin_commit=None):
                         if chk.returncode != 0:
                             last_err = (chk.stdout or "").strip()[-300:]
                             print(f"{TAG}     pin_commit checkout failed: {last_err[:120]}")
-                            return False, last_err
+                            shutil.rmtree(dest, ignore_errors=True)
+                            continue
                     rev = subprocess.run(
                         ["git", "-C", dest, "rev-parse", "HEAD"],
                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -385,10 +401,20 @@ def check_face(no_models):
 # ---------------------------------------------------------------------------
 # 6) 外部引擎插件（FlashVSR / SeedVR2 / RTX Nodes，git clone）
 # ---------------------------------------------------------------------------
+# External engine plugins are cloned DIRECTLY from their original upstream repos
+# (the previously listed personal forks have been deleted by their owners and are
+# unpinned). Every entry is pinned to an exact commit SHA for reproducible installs.
 ENGINE_PLUGINS = [
-    ("ComfyUI-FlashVSR_Ultra_Fast", "https://github.com/liusida/ComfyUI-FlashVSR_Ultra_Fast.git"),
-    ("ComfyUI-SeedVR2_VideoUpscaler", "https://github.com/abanob-magdy/ComfyUI-SeedVR2_VideoUpscaler.git"),
-    ("Nvidia_RTX_Nodes_ComfyUI", "https://github.com/WeiRongHuang/Nvidia_RTX_Nodes_ComfyUI.git"),
+    # (dest dir, upstream git URL, pinned commit SHA)
+    ("ComfyUI-FlashVSR_Ultra_Fast",
+     "https://github.com/lihaoyun6/ComfyUI-FlashVSR_Ultra_Fast.git",
+     "4820b3f02347bddcbbb9a5a85ab7638fe976366e"),
+    ("ComfyUI-SeedVR2_VideoUpscaler",
+     "https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler.git",
+     "4490bd1f482e026674543386bb2a4d176da245b9"),
+    ("Nvidia_RTX_Nodes_ComfyUI",
+     "https://github.com/Comfy-Org/ComfyUI_Nvidia_VFX_Nodes.git",
+     "38d790ded00650681fa3645362efe28c8560cf40"),
 ]
 
 
@@ -403,18 +429,18 @@ def check_engine_plugins(no_git):
         return True, True
     d = custom_nodes_dir()
     failed = []
-    for name, url in ENGINE_PLUGINS:
+    for name, url, pin_commit in ENGINE_PLUGINS:
         dest = os.path.join(d, name)
         if os.path.isdir(dest) and os.path.isdir(os.path.join(dest, ".git")):
             print(f"{TAG} [跳过] 已有插件 {name}")
             continue
-        print(f"{TAG} [clone] {name} ...")
-        ok, err = git_clone_with_retry(url, dest)
+        print(f"{TAG} [clone] {name} (pinned {pin_commit[:12]}) ...")
+        ok, err = git_clone_with_retry(url, dest, pin_commit=pin_commit)
         if ok:
             print(f"{TAG} [完成] {name} -> {dest}")
         else:
             print(f"{TAG} [失败] clone {name}（所有镜像均失败），可手动:\n"
-                  f"         git clone --depth 1 {url} {dest}")
+                  f"         git clone --depth 1 {url} {dest} && git -C {dest} checkout {pin_commit}")
             failed.append(name)
     if failed:
         print(f"{TAG} [警告] 以下可选引擎插件未安装（不影响 Real-ESRGAN 核心功能）: {', '.join(failed)}")
@@ -606,6 +632,7 @@ def check_topaz():
 # 9) VOSR 2.0 (CVPR 2026) 自动安装
 # ---------------------------------------------------------------------------
 VOSR_REPO_URL = "https://github.com/cswry/VOSR.git"
+VOSR_PIN_COMMIT = "516f292b99cf23c76fdc33351e86dc4f97711fe8"  # upstream main HEAD, pinned for reproducible install
 VOSR_HOME_DEFAULT = r"C:\BSAI\VOSR"
 
 # ModelScope 模型仓库ID（优先，国内直连）
@@ -646,8 +673,8 @@ def check_vosr(no_git):
             print(f"{TAG} [跳过] 未找到 git，无法自动克隆VOSR仓库")
             print(f"{TAG}         手动: git clone --depth 1 {VOSR_REPO_URL} {vosr_home}")
             return False, True
-        print(f"{TAG} [clone] VOSR仓库 -> {vosr_home} ...")
-        ok, err = git_clone_with_retry(VOSR_REPO_URL, vosr_home)
+        print(f"{TAG} [clone] VOSR仓库 -> {vosr_home} (pinned {VOSR_PIN_COMMIT[:12]}) ...")
+        ok, err = git_clone_with_retry(VOSR_REPO_URL, vosr_home, pin_commit=VOSR_PIN_COMMIT)
         if not ok:
             print(f"{TAG} [失败] VOSR仓库克隆失败: {err}")
             print(f"{TAG}         手动: git clone --depth 1 {VOSR_REPO_URL} {vosr_home}")

@@ -2740,7 +2740,12 @@ _LEGACY_INPUT_ADAPTIVE = {"自动": "Auto", "关": "Off", "UHD 保守档": "UHD 
                           "HD 增强档": "HD Enhance"}
 _LEGACY_DET_BACKEND = {"自动(Auto)": "Auto", "NPU 卸载": "NPU Offload",
                        "GPU1 (YOLOv8)": "GPU1 (YOLOv8)"}
-_LEGACY_FACE_RESTORE = {"Small-Face (CodeFormer)": "Small-Face (CodeFormer)"}
+# 旧版标签 -> 英文规范值:
+# "小脸增强(CodeFormer)" = 本插件 i18n 前旧中文标签;
+# "SmallFace Enhance (CodeFormer)" = BSAI_Premiere_Pro 节点的英文标签(经其
+# render/server 路由传入本节点 face_restore, 须同样落入小脸预设分支)
+_LEGACY_FACE_RESTORE = {"小脸增强(CodeFormer)": "Small-Face (CodeFormer)",
+                        "SmallFace Enhance (CodeFormer)": "Small-Face (CodeFormer)"}
 _LEGACY_ENGINE = {
     "自动路由 (按内容/输入推荐)": "Auto Route (content-based)",
     "FlashVSR-v1.1 (扩散视频超分)": "FlashVSR-v1.1 (diffusion video SR)",
@@ -2788,13 +2793,18 @@ class BSAI_H3_Upscale4K:
 
     @classmethod
     def INPUT_TYPES(cls):
-        models = list(cls.ENGINE_OPTIONS.keys()) + list(cls.TOPAZ_OPTIONS.keys()) + list_available_models()
+        # 末尾追加旧版中文引擎标签：兼容老工作流 JSON 保存值（入口经 _LEGACY_ENGINE 归一化）
+        models = (list(cls.ENGINE_OPTIONS.keys()) + list(cls.TOPAZ_OPTIONS.keys())
+                  + list_available_models() + list(_LEGACY_ENGINE.keys()))
         return {
             "required": {
                 "images": ("IMAGE",),
                 # v2.8.1 自动路由偏好（仅当 model_name = 自动路由 时生效）：置于模型选择之上，
                 # 先选偏好档位再看引擎，符合“按内容/输入推荐”的操作直觉。
-                "auto_prefer": (["Quality", "Speed", "Portrait", "Anime", "UHD"], {"default": "Quality"}),
+                # 后 5 项为旧版标签：兼容老工作流 JSON 保存值
+                "auto_prefer": (["Quality", "Speed", "Portrait", "Anime", "UHD",
+                                 "质量优先", "速度优先", "人像优先", "动漫优先", "UHD优先"],
+                                {"default": "Quality"}),
                 # general-x4v3 default: ~8x faster than x4plus with nearly identical
                 # quality (PSNR ~39 dB on test frames). x4plus = max quality, slowest.
                 "model_name": (models, {"default": "realesr-general-x4v3.pth"}),
@@ -2827,10 +2837,14 @@ class BSAI_H3_Upscale4K:
                 # (ONNX, GPU). v2.2.0: small faces get STRONGER restoration
                 # (inverted adaptive strength + 2x pre-upscale + lower fidelity),
                 # fixing H3's distant small-face blur / deformation.
-                "face_restore": (["Off", "GFPGANv1.4", "CodeFormer", "Small-Face (CodeFormer)"], {"default": "Off"}),
+                # 后 1 项为旧版标签：兼容老工作流 JSON 保存值
+                "face_restore": (["Off", "GFPGANv1.4", "CodeFormer", "Small-Face (CodeFormer)",
+                                  "小脸增强(CodeFormer)"], {"default": "Off"}),
                 # v2.9.0 人脸检测后端选择：利用 NPU/XPU 减轻 GPU1 负担
                 # auto = 优先 NPU，不可用回退 GPU1；NPU = 强制 NPU；GPU1 = 强制 GPU1 YOLOv8
-                "face_det_backend": (["Auto", "NPU Offload", "GPU1 (YOLOv8)"], {"default": "Auto"}),
+                # 后 2 项为旧版标签：兼容老工作流 JSON 保存值
+                "face_det_backend": (["Auto", "NPU Offload", "GPU1 (YOLOv8)",
+                                      "自动(Auto)", "NPU 卸载"], {"default": "Auto"}),
                 # Face detector confidence threshold (lower = more detections,
                 # including tiny distant faces; may add false positives).
                 # v2.2.0 default 0.15 + multi-scale 1920 re-scan catches small faces.
@@ -2850,7 +2864,9 @@ class BSAI_H3_Upscale4K:
                 "detail_mode": (["classic", "smart"], {"default": "smart"}),
                 # v2.7.0 输入自适应（对标 HitPaw Ultra HD：高清输入保守细节防过锐，
                 # 低清输入激进重建）。对全部像素路径生效。
-                "input_adaptive": (["Auto", "Off", "UHD Conservative", "HD Enhance"], {"default": "Auto"}),
+                # 后 4 项为旧版标签：兼容老工作流 JSON 保存值
+                "input_adaptive": (["Auto", "Off", "UHD Conservative", "HD Enhance",
+                                    "自动", "关", "UHD 保守档", "HD 增强档"], {"default": "Auto"}),
                 # v2.7.0 人脸时域稳定（对标 HitPaw portrait_restore 时空对齐）：
                 # 跨帧跟踪 + 修复强度参数 EMA，消除“框抖动→强度跳变”闪烁。
                 # 0=关(等同 v2.6 行为)；0.5=推荐；1.0=完全跟随历史轨迹。
@@ -2868,7 +2884,8 @@ class BSAI_H3_Upscale4K:
                 # （nvvfx DENOISE_*/DEBLUR_* 档位，同分辨率清理）。
                 # op = 去噪(DENOISE)/去模糊(DEBLUR)；level = 档位强度；
                 # strength = 效果强度(0-1)；scale>1 时清理后自动 RTX ULTRA 放大。
-                "rtx_vfx_op": (["Denoise", "Deblur"], {"default": "Denoise"}),
+                # 后 2 项为旧版标签：兼容老工作流 JSON 保存值
+                "rtx_vfx_op": (["Denoise", "Deblur", "去噪", "去模糊"], {"default": "Denoise"}),
                 "rtx_vfx_level": (["LOW", "MEDIUM", "HIGH", "ULTRA"], {"default": "ULTRA"}),
                 "rtx_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05}),
                 # VOSR 2.0 专属参数
@@ -3642,8 +3659,12 @@ class BSAI_H3_FaceRestore:
         return {
             "required": {
                 "images": ("IMAGE",),
-                "face_restore": (["Off", "GFPGANv1.4", "CodeFormer", "Small-Face (CodeFormer)"], {"default": "CodeFormer"}),
-                "face_det_backend": (["Auto", "NPU Offload", "GPU1 (YOLOv8)"], {"default": "Auto"}),
+                # 后 1 项为旧版标签：兼容老工作流 JSON 保存值
+                "face_restore": (["Off", "GFPGANv1.4", "CodeFormer", "Small-Face (CodeFormer)",
+                                  "小脸增强(CodeFormer)"], {"default": "CodeFormer"}),
+                # 后 2 项为旧版标签：兼容老工作流 JSON 保存值
+                "face_det_backend": (["Auto", "NPU Offload", "GPU1 (YOLOv8)",
+                                      "自动(Auto)", "NPU 卸载"], {"default": "Auto"}),
                 "face_det_conf": ("FLOAT", {"default": 0.15, "min": 0.05, "max": 0.95, "step": 0.05}),
                 "face_blend": ("FLOAT", {"default": 0.70, "min": 0.1, "max": 1.0, "step": 0.05}),
                 "face_fidelity": ("FLOAT", {"default": 0.60, "min": 0.0, "max": 1.0, "step": 0.05}),
@@ -4077,7 +4098,9 @@ class BSAI_TopazEngine_FaceRestore:
     与修复脸部细节」。
     """
 
-    TOPAZ_MODELS = ["Starlight 2.6", "Astra", "Astra HQ", "Astra Sharp", "Astra Fast", "Wonder 3.5"]
+    # 末尾 1 项为旧版标签：兼容老工作流 JSON 保存值（入口经 _LEGACY_TOPAZ_MODEL 归一化）
+    TOPAZ_MODELS = ["Starlight 2.6", "Astra", "Astra HQ", "Astra Sharp", "Astra Fast", "Wonder 3.5",
+                    "星光 2.6"]
     TOPAZ_MODEL_IDS = {"Starlight 2.6": "slp-26", "Astra": "astra", "Astra HQ": "astrahq",
                        "Astra Sharp": "astrasharp", "Astra Fast": "astrafast",
                        "Wonder 3.5": "wonder-3.5"}
@@ -4100,8 +4123,12 @@ class BSAI_TopazEngine_FaceRestore:
                 "fps": ("INT", {"default": 24, "min": 1, "max": 120}),
                 "qp": ("INT", {"default": 14, "min": 0, "max": 40,
                                          "tooltip": "Input encode quality, lower = more lossless"}),
-                "face_restore": (["Off", "GFPGANv1.4", "CodeFormer", "Small-Face (CodeFormer)"], {"default": "Off"}),
-                "face_det_backend": (["Auto", "NPU Offload", "GPU1 (YOLOv8)"], {"default": "Auto"}),
+                # 后 1 项为旧版标签：兼容老工作流 JSON 保存值
+                "face_restore": (["Off", "GFPGANv1.4", "CodeFormer", "Small-Face (CodeFormer)",
+                                  "小脸增强(CodeFormer)"], {"default": "Off"}),
+                # 后 2 项为旧版标签：兼容老工作流 JSON 保存值
+                "face_det_backend": (["Auto", "NPU Offload", "GPU1 (YOLOv8)",
+                                      "自动(Auto)", "NPU 卸载"], {"default": "Auto"}),
                 "face_det_conf": ("FLOAT", {"default": 0.15, "min": 0.05, "max": 0.95, "step": 0.05}),
                 "face_blend": ("FLOAT", {"default": 0.70, "min": 0.1, "max": 1.0, "step": 0.05}),
                 "face_fidelity": ("FLOAT", {"default": 0.60, "min": 0.0, "max": 1.0, "step": 0.05}),

@@ -2763,6 +2763,29 @@ _LEGACY_ENGINE = {
 _LEGACY_TOPAZ_MODEL = {"星光 2.6": "Starlight 2.6"}
 
 
+def _validate_bsai_legacy(input_types):
+    """Accept legacy (pre-i18n) Chinese combo labels so old workflows still load.
+
+    The dropdown lists are English-only; values saved before the UI localization
+    are passed through here and normalized to English at runtime by the _LEGACY_*
+    maps. Unlisted inputs keep ComfyUI's default validation.
+    """
+    legacy_map = {
+        "auto_prefer": _LEGACY_AUTO_PREFER,
+        "input_adaptive": _LEGACY_INPUT_ADAPTIVE,
+        "face_det_backend": _LEGACY_DET_BACKEND,
+        "face_restore": _LEGACY_FACE_RESTORE,
+        "model_name": _LEGACY_ENGINE,
+        "model": _LEGACY_TOPAZ_MODEL,
+    }
+    out = {}
+    for key, m in legacy_map.items():
+        v = input_types.get(key)
+        if isinstance(v, str) and v in m:
+            out[key] = True
+    return out if out else True
+
+
 class BSAI_H3_Upscale4K:
     """Video frame AI super-resolution for MiniMax H3 (pixel domain, extremely fast)."""
 
@@ -2793,17 +2816,16 @@ class BSAI_H3_Upscale4K:
 
     @classmethod
     def INPUT_TYPES(cls):
-        # 末尾追加旧版中文引擎标签：兼容老工作流 JSON 保存值（入口经 _LEGACY_ENGINE 归一化）
+        # English-only engine options; legacy Chinese labels accepted via
+        # VALIDATE_INPUTS and normalized at runtime by _LEGACY_ENGINE.
         models = (list(cls.ENGINE_OPTIONS.keys()) + list(cls.TOPAZ_OPTIONS.keys())
-                  + list_available_models() + list(_LEGACY_ENGINE.keys()))
+                  + list_available_models())
         return {
             "required": {
                 "images": ("IMAGE",),
-                # v2.8.1 自动路由偏好（仅当 model_name = 自动路由 时生效）：置于模型选择之上，
-                # 先选偏好档位再看引擎，符合“按内容/输入推荐”的操作直觉。
-                # 后 5 项为旧版标签：兼容老工作流 JSON 保存值
-                "auto_prefer": (["Quality", "Speed", "Portrait", "Anime", "UHD",
-                                 "质量优先", "速度优先", "人像优先", "动漫优先", "UHD优先"],
+                # v2.8.1 auto-route preference (only when model_name = auto route).
+                # Legacy Chinese labels accepted via VALIDATE_INPUTS and mapped by _LEGACY_AUTO_PREFER.
+                "auto_prefer": (["Quality", "Speed", "Portrait", "Anime", "UHD"],
                                 {"default": "Quality"}),
                 # general-x4v3 default: ~8x faster than x4plus with nearly identical
                 # quality (PSNR ~39 dB on test frames). x4plus = max quality, slowest.
@@ -2837,14 +2859,13 @@ class BSAI_H3_Upscale4K:
                 # (ONNX, GPU). v2.2.0: small faces get STRONGER restoration
                 # (inverted adaptive strength + 2x pre-upscale + lower fidelity),
                 # fixing H3's distant small-face blur / deformation.
-                # 后 1 项为旧版标签：兼容老工作流 JSON 保存值
-                "face_restore": (["Off", "GFPGANv1.4", "CodeFormer", "Small-Face (CodeFormer)",
-                                  "小脸增强(CodeFormer)"], {"default": "Off"}),
-                # v2.9.0 人脸检测后端选择：利用 NPU/XPU 减轻 GPU1 负担
-                # auto = 优先 NPU，不可用回退 GPU1；NPU = 强制 NPU；GPU1 = 强制 GPU1 YOLOv8
-                # 后 2 项为旧版标签：兼容老工作流 JSON 保存值
-                "face_det_backend": (["Auto", "NPU Offload", "GPU1 (YOLOv8)",
-                                      "自动(Auto)", "NPU 卸载"], {"default": "Auto"}),
+                # Legacy Chinese label accepted via VALIDATE_INPUTS and mapped by _LEGACY_FACE_RESTORE.
+                "face_restore": (["Off", "GFPGANv1.4", "CodeFormer", "Small-Face (CodeFormer)"],
+                                 {"default": "Off"}),
+                # v2.9.0 face-detection backend: NPU/XPU offload to relieve GPU1.
+                # Legacy Chinese labels accepted via VALIDATE_INPUTS and mapped by _LEGACY_DET_BACKEND.
+                "face_det_backend": (["Auto", "NPU Offload", "GPU1 (YOLOv8)"],
+                                     {"default": "Auto"}),
                 # Face detector confidence threshold (lower = more detections,
                 # including tiny distant faces; may add false positives).
                 # v2.2.0 default 0.15 + multi-scale 1920 re-scan catches small faces.
@@ -2862,11 +2883,11 @@ class BSAI_H3_Upscale4K:
                 # texture, gated to avoid halos) — reads closer to Topaz /
                 # FlashVSR's reconstructed texture.
                 "detail_mode": (["classic", "smart"], {"default": "smart"}),
-                # v2.7.0 输入自适应（对标 HitPaw Ultra HD：高清输入保守细节防过锐，
-                # 低清输入激进重建）。对全部像素路径生效。
-                # 后 4 项为旧版标签：兼容老工作流 JSON 保存值
-                "input_adaptive": (["Auto", "Off", "UHD Conservative", "HD Enhance",
-                                    "自动", "关", "UHD 保守档", "HD 增强档"], {"default": "Auto"}),
+                # v2.7.0 input adaptive (HitPaw Ultra HD-style: conservative detail
+                # on high-res input, aggressive rebuild on low-res). Legacy Chinese
+                # labels accepted via VALIDATE_INPUTS and mapped by _LEGACY_INPUT_ADAPTIVE.
+                "input_adaptive": (["Auto", "Off", "UHD Conservative", "HD Enhance"],
+                                   {"default": "Auto"}),
                 # v2.7.0 人脸时域稳定（对标 HitPaw portrait_restore 时空对齐）：
                 # 跨帧跟踪 + 修复强度参数 EMA，消除“框抖动→强度跳变”闪烁。
                 # 0=关(等同 v2.6 行为)；0.5=推荐；1.0=完全跟随历史轨迹。
@@ -2912,6 +2933,10 @@ class BSAI_H3_Upscale4K:
                 "flashvsr_anti_ghost": ("FLOAT", {"default": 0.40, "min": 0.0, "max": 1.0, "step": 0.05}),
             },
         }
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, input_types):
+        return _validate_bsai_legacy(input_types)
 
     RETURN_TYPES = ("IMAGE", "INT", "INT", "FLOAT", "STRING")
     RETURN_NAMES = ("IMAGE", "width", "height", "scale_used", "info")
@@ -3658,18 +3683,22 @@ class BSAI_H3_FaceRestore:
         return {
             "required": {
                 "images": ("IMAGE",),
-                # 后 1 项为旧版标签：兼容老工作流 JSON 保存值
-                "face_restore": (["Off", "GFPGANv1.4", "CodeFormer", "Small-Face (CodeFormer)",
-                                  "小脸增强(CodeFormer)"], {"default": "CodeFormer"}),
-                # 后 2 项为旧版标签：兼容老工作流 JSON 保存值
-                "face_det_backend": (["Auto", "NPU Offload", "GPU1 (YOLOv8)",
-                                      "自动(Auto)", "NPU 卸载"], {"default": "Auto"}),
+                # Legacy Chinese labels accepted via VALIDATE_INPUTS and mapped by _LEGACY_FACE_RESTORE.
+                "face_restore": (["Off", "GFPGANv1.4", "CodeFormer", "Small-Face (CodeFormer)"],
+                                 {"default": "CodeFormer"}),
+                # Legacy Chinese labels accepted via VALIDATE_INPUTS and mapped by _LEGACY_DET_BACKEND.
+                "face_det_backend": (["Auto", "NPU Offload", "GPU1 (YOLOv8)"],
+                                     {"default": "Auto"}),
                 "face_det_conf": ("FLOAT", {"default": 0.15, "min": 0.05, "max": 0.95, "step": 0.05}),
                 "face_blend": ("FLOAT", {"default": 0.70, "min": 0.1, "max": 1.0, "step": 0.05}),
                 "face_fidelity": ("FLOAT", {"default": 0.60, "min": 0.0, "max": 1.0, "step": 0.05}),
                 "face_temporal": ("FLOAT", {"default": 0.50, "min": 0.0, "max": 1.0, "step": 0.05}),
             },
         }
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, input_types):
+        return _validate_bsai_legacy(input_types)
 
     RETURN_TYPES = ("IMAGE", "INT", "STRING")
     RETURN_NAMES = ("IMAGE", "faces_detected", "info")
@@ -4089,17 +4118,16 @@ def _topaz_upscale(frames, fps, scale, strength, max_gpu_mem, qp=14, model_id="s
 
 
 class BSAI_TopazEngine_FaceRestore:
-    """Topaz Engine (星光/Astra 神经引擎) 放大 + 人脸修复叠加。
+    """Topaz Engine (Starlight/Astra neural engine) upscale + face restoration.
 
-    底座=Topaz 神经引擎（默认 ComfyUI/models/Topaz_Engine，兼容旧 topaz_engine）。
-    可选模型：星光 2.6 / Astra 家族（自由选择）。在引擎输出上继续叠加本插件
-    优化：人脸修复（保真模式）+ 细节增强，实现「在其基础上继续优化高清放大
-    与修复脸部细节」。
+    Base = Topaz neural engine (default ComfyUI/models/Topaz_Engine, legacy
+    topaz_engine also accepted). Models: Starlight 2.6 / Astra family.
+    Stacks this plugin's face restoration (fidelity mode) + detail enhancement
+    on top of the engine output.
     """
 
-    # 末尾 1 项为旧版标签：兼容老工作流 JSON 保存值（入口经 _LEGACY_TOPAZ_MODEL 归一化）
-    TOPAZ_MODELS = ["Starlight 2.6", "Astra", "Astra HQ", "Astra Sharp", "Astra Fast", "Wonder 3.5",
-                    "星光 2.6"]
+    # Legacy Chinese label accepted via VALIDATE_INPUTS and mapped by _LEGACY_TOPAZ_MODEL.
+    TOPAZ_MODELS = ["Starlight 2.6", "Astra", "Astra HQ", "Astra Sharp", "Astra Fast", "Wonder 3.5"]
     TOPAZ_MODEL_IDS = {"Starlight 2.6": "slp-26", "Astra": "astra", "Astra HQ": "astrahq",
                        "Astra Sharp": "astrasharp", "Astra Fast": "astrafast",
                        "Wonder 3.5": "wonder-3.5"}
@@ -4122,12 +4150,12 @@ class BSAI_TopazEngine_FaceRestore:
                 "fps": ("INT", {"default": 24, "min": 1, "max": 120}),
                 "qp": ("INT", {"default": 14, "min": 0, "max": 40,
                                          "tooltip": "Input encode quality, lower = more lossless"}),
-                # 后 1 项为旧版标签：兼容老工作流 JSON 保存值
-                "face_restore": (["Off", "GFPGANv1.4", "CodeFormer", "Small-Face (CodeFormer)",
-                                  "小脸增强(CodeFormer)"], {"default": "Off"}),
-                # 后 2 项为旧版标签：兼容老工作流 JSON 保存值
-                "face_det_backend": (["Auto", "NPU Offload", "GPU1 (YOLOv8)",
-                                      "自动(Auto)", "NPU 卸载"], {"default": "Auto"}),
+                # Legacy Chinese labels accepted via VALIDATE_INPUTS and mapped by _LEGACY_FACE_RESTORE.
+                "face_restore": (["Off", "GFPGANv1.4", "CodeFormer", "Small-Face (CodeFormer)"],
+                                 {"default": "Off"}),
+                # Legacy Chinese labels accepted via VALIDATE_INPUTS and mapped by _LEGACY_DET_BACKEND.
+                "face_det_backend": (["Auto", "NPU Offload", "GPU1 (YOLOv8)"],
+                                     {"default": "Auto"}),
                 "face_det_conf": ("FLOAT", {"default": 0.15, "min": 0.05, "max": 0.95, "step": 0.05}),
                 "face_blend": ("FLOAT", {"default": 0.70, "min": 0.1, "max": 1.0, "step": 0.05}),
                 "face_fidelity": ("FLOAT", {"default": 0.60, "min": 0.0, "max": 1.0, "step": 0.05}),
@@ -4138,6 +4166,10 @@ class BSAI_TopazEngine_FaceRestore:
                 "detail_mode": (["classic", "smart"], {"default": "smart"}),
             },
         }
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, input_types):
+        return _validate_bsai_legacy(input_types)
 
     RETURN_TYPES = ("IMAGE", "INT", "INT", "FLOAT", "STRING")
     RETURN_NAMES = ("IMAGE", "width", "height", "scale_used", "info")

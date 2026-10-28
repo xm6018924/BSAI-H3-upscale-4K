@@ -2884,8 +2884,7 @@ class BSAI_H3_Upscale4K:
                 # （nvvfx DENOISE_*/DEBLUR_* 档位，同分辨率清理）。
                 # op = 去噪(DENOISE)/去模糊(DEBLUR)；level = 档位强度；
                 # strength = 效果强度(0-1)；scale>1 时清理后自动 RTX ULTRA 放大。
-                # 后 2 项为旧版标签：兼容老工作流 JSON 保存值
-                "rtx_vfx_op": (["Denoise", "Deblur", "去噪", "去模糊"], {"default": "Denoise"}),
+                "rtx_vfx_op": (["Denoise", "Deblur"], {"default": "Denoise"}),
                 "rtx_vfx_level": (["LOW", "MEDIUM", "HIGH", "ULTRA"], {"default": "ULTRA"}),
                 "rtx_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05}),
                 # VOSR 2.0 专属参数

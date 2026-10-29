@@ -46,6 +46,8 @@ One-click upscale of H3 720P videos / low-res images to 4K, with **Real-ESRGAN /
 
 Full model list with download URLs (core + optional engines), legacy-download tips and directory quick-check — see the Chinese tables below. Mirror tip: replace `huggingface.co` with `hf-mirror.com` in China.
 
+> **Official-native compatible (PR #17412)**: the H3 latent upscaler weights in `models/latent_upscale_models/` are fully interchangeable with the official `MiniMaxH3LatentUpscaleWithModel` / `LatentUpscaleModelLoader` nodes (ComfyUI ≥ v0.43.0) — same files, both loaders work, no re-download. This plugin adds the multi-hardware (GPU0/GPU1/NPU) and long-video chunking enhancements on top; both paths coexist.
+
 ## License
 
 Apache-2.0.
@@ -119,6 +121,12 @@ ComfyUI/models/
 ├── VOSR/                      inference_vosr_onestep.py + preset/ckpts/（VOSR2 / Qwen VAE / SD2.1 VAE / torch_cache）
 └── Topaz_Engine/              neuroserver171/neuroserver.exe + models/
 ```
+
+> **与官方 ComfyUI 原生节点通用（PR #17412）**：ComfyUI ≥ v0.43.0 起，`latent_upscale_models/` 下
+> 的 H3 latent 超分权重（`minimax_h3_latent_upscaler_3d_fp16.safetensors` / `.pth`）与官方
+> `MiniMaxH3LatentUpscaleWithModel` + `LatentUpscaleModelLoader` **完全通用**——同一份文件，
+> 本插件与官方节点均可直接加载，无需重复下载。本插件的 `BSAI_H3_Upscale4K_Latent` 提供官方没有的
+> 多硬件（GPU0/GPU1/NPU）协同与长视频时间分块增强，两条路径并存可选。
 
 ---
 

@@ -3410,6 +3410,9 @@ class _LatentResizer3D(nn.Module):
         self.conv_out = nn.Conv3d(channels, in_channels, 3, padding=1)
 
     def forward(self, x, scale=None, target_size=None):
+        # v1.1: follow the weight dtype; callers may feed bf16/fp16 latents
+        # while the checkpoint was loaded in fp32.
+        x = x.to(self.conv_in.weight.dtype)
         if target_size is not None:
             size = target_size
         elif scale is not None:
@@ -3438,6 +3441,57 @@ class _LatentResizer3D(nn.Module):
 
 
 _LATENT_MODEL_CACHE = {}
+_H3_DISPATCH = None
+
+
+def _h3_upscaler_dispatch():
+    """找到共享的 checkpoint 架构分派模块 (找不到返回 None)。"""
+    global _H3_DISPATCH
+    if _H3_DISPATCH is not None:
+        return _H3_DISPATCH
+    try:
+        import importlib.util as _ilu
+        bases = []
+        try:
+            bases.extend(str(p) for p in folder_paths.get_folder_paths("custom_nodes"))
+        except Exception:
+            pass
+        try:
+            bases.append(os.path.join(folder_paths.base_path, "custom_nodes"))
+        except Exception:
+            pass
+        for base in bases:
+            p = os.path.join(base, "Comfyui_Minimax_h3_latent_Upscaler", "nodes",
+                             "h3_upscaler_dispatch.py")
+            if os.path.isfile(p):
+                spec = _ilu.spec_from_file_location("h3_upscaler_dispatch_up4k", p)
+                mod = _ilu.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+                _H3_DISPATCH = mod
+                break
+    except Exception:
+        _H3_DISPATCH = None
+    return _H3_DISPATCH
+
+
+def _filter_supported_latent_models(names, dirs):
+    """剔除本节点加载不了的权重 (架构不匹配); 失败时原样返回。"""
+    module = _h3_upscaler_dispatch()
+    if module is None:
+        return names
+    try:
+        kept = []
+        for name in names:
+            path = next((os.path.join(d, name) for d in dirs
+                         if os.path.isfile(os.path.join(d, name))), None)
+            if path is None:
+                continue
+            arch, _detail = module.classify_checkpoint(path)
+            if arch in module.SUPPORTED_ARCHS:
+                kept.append(name)
+        return kept or names
+    except Exception:
+        return names
 
 
 def _scan_latent_models():
@@ -3449,7 +3503,10 @@ def _scan_latent_models():
     for d in dirs:
         for ext in ("*.safetensors", "*.pth"):
             out.extend(glob.glob(os.path.join(d, ext)))
-    return sorted(os.path.basename(f) for f in out)
+    names = sorted(os.path.basename(f) for f in out)
+    # v1.1: 只列加载器真正支持的权重 —— models/latent_upscale_models/ 同时
+    # 放着 pure-3D 卷积、clean 因子化注意力和 LTX-2.5 三种互不兼容的架构。
+    return _filter_supported_latent_models(names, dirs)
 
 
 def _pick_default_latent_model(models):
@@ -3471,6 +3528,21 @@ def _load_latent_3d_model(name, device, precision):
     path = next((os.path.join(d, name) for d in dirs if os.path.exists(os.path.join(d, name))), None)
     if path is None:
         raise FileNotFoundError(f"latent upscaler model not found: {name} in {dirs}")
+    # v1.1: 先辨认架构再决定用哪个实现 —— 该目录混着 pure-3D 卷积、clean
+    # 因子化注意力和 LTX-2.5 三种互不兼容的权重, 选错会在 load_state_dict
+    # 里炸出几百行 missing key。
+    module = _h3_upscaler_dispatch()
+    if module is not None:
+        arch, detail = module.classify_checkpoint(path)
+        if arch == module.ARCH_CLEAN_V3:
+            model = module.load_clean_model(path, device, precision)
+            _LATENT_MODEL_CACHE[key] = model
+            print(f"[BSAI-H3] loaded clean latent upscaler: {name} (FP32, native 2x)")
+            return model
+        if arch != module.ARCH_PLAIN_3D:
+            raise ValueError(
+                f"'{name}' is not an H3 3D latent upscaler checkpoint ({detail}); "
+                f"models/{_LATENT_UPSCALE_FOLDER}/ must only hold H3 upscaler weights.")
     if path.endswith(".safetensors"):
         from safetensors.torch import load_file
         sd = load_file(path, device="cpu")

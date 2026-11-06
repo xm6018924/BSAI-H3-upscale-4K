@@ -12,6 +12,8 @@ A dedicated video super-resolution / upscaling plugin for MiniMax H3.
   - 模型进程级 LRU 缓存（重复调用秒出）
   - H3 专属 latent 二次采样放大（32 像素对齐，供 H3 第二遍采样补细节）
   - DLSS 5（NVIDIA 神经渲染超分）—— DLSS SR + Neural Rendering，经 video2dlssnr 管道驱动
+  - RelayVSR（一步蒸馏 Wan 视频超分）—— Wan 关键帧主干 + Flash 逐帧解码，
+    走 ComfyUI 原生链路（comfy.ldm.wan.model_vsr），不依赖外部 RelayVSR 节点包
 
 节点列表 / Node list:
   - BSAI H3 upscale 4K            : 视频帧 -> AI 超分高清视频帧 (pixel-domain upscale)
@@ -1959,6 +1961,168 @@ def _seedvr2_native_upscale(frames, scale, seed=42, steps=8, cfg=1.0,
     return out
 
 
+# --------------------------------------------------------------------------
+# RelayVSR (one-step Wan video SR) —— 移植自 RelayVSR / LightX2V RelayVSR_X2，
+# 走 ComfyUI 原生链路（comfy.ldm.wan.model_vsr），不再依赖外部 RelayVSR 节点包：
+#   Wan 主干（关键帧，每 15 帧一张）+ KSampler 1 步 euler/simple 出关键帧 latent
+#   → RelayVSR Flash 解码器（在 ComfyUI 里注册成 VAE）逐帧还原全部帧像素。
+# 权重按倍率配对，靠 safetensors metadata 的 format 字段识别（与文件名无关）：
+#   wan   x2: relayvsr-wan-x2-v1   x4: refvsr-wan-v1
+#   flash x2: relayvsr-flash-x2-v1 x4: refvsr-flash-v1
+# 默认目录（folder_paths 自动发现，加新权重后重启 ComfyUI 即可）：
+#   models/diffusion_models/RelayVSR/relayvsr_x4_int8_convrot.safetensors
+#   models/diffusion_models/RelayVSR/relayvsr_x2_lightx2v_int8_convrot.safetensors
+#   models/vae/relayvsr VAE/relayvsr_flash_vae_x4_fp32.safetensors
+#   models/vae/relayvsr VAE/relayvsr_flash_vae_x2_fp32.safetensors
+_RELAY_WAN_FORMATS = {"relayvsr-wan-x2-v1": 2, "refvsr-wan-v1": 4}
+_RELAY_FLASH_FORMATS = {"relayvsr-flash-x2-v1": 2, "refvsr-flash-v1": 4}
+_relay_scan_cache = {}
+_relay_model_cache = {}
+_relay_vae_cache = {}
+
+
+def _relay_meta(path):
+    """只读 safetensors header 的 metadata（不加载权重，毫秒级）。"""
+    try:
+        from safetensors import safe_open
+        with safe_open(str(path), framework="pt", device="cpu") as handle:
+            return dict(handle.metadata() or {})
+    except Exception:
+        return {}
+
+
+def _relay_scan_weights():
+    """扫描 diffusion_models / vae 下的 RelayVSR 权重，按原生倍率归类。"""
+    if _relay_scan_cache:
+        return _relay_scan_cache
+    found = {"wan": {}, "flash": {}}
+    for kind, folder in (("wan", "diffusion_models"), ("flash", "vae")):
+        try:
+            names = folder_paths.get_filename_list(folder)
+        except Exception:
+            names = []
+        table = _RELAY_WAN_FORMATS if kind == "wan" else _RELAY_FLASH_FORMATS
+        for name in names:
+            low = name.lower()
+            if "relayvsr" not in low and "refvsr" not in low:
+                continue
+            path = folder_paths.get_full_path(folder, name)
+            if not path or not os.path.isfile(path):
+                continue
+            scale = table.get(_relay_meta(path).get("format"))
+            if scale is None:
+                continue
+            found[kind].setdefault(scale, path)
+    _relay_scan_cache.update(found)
+    return _relay_scan_cache
+
+
+def _relay_pick_weights(scale, prefer="Auto (by scale)"):
+    """按请求倍率/手动偏好挑一组已配对的 (Wan 主干, Flash 解码器, 原生倍率)。"""
+    pool = _relay_scan_weights()
+    prefer_low = str(prefer or "").strip().lower()
+    if prefer_low.startswith("x2"):
+        order = [2, 4]
+    elif prefer_low.startswith("x4"):
+        order = [4, 2]
+    else:
+        order = [4, 2] if float(scale) >= 3.0 else [2, 4]
+    for candidate in order:
+        wan = pool["wan"].get(candidate)
+        flash = pool["flash"].get(candidate)
+        if wan and flash:
+            return wan, flash, candidate
+    raise RuntimeError(
+        "RelayVSR 权重缺失：Wan 主干放 models/diffusion_models/RelayVSR/，"
+        "Flash 解码器放 models/vae/。x2 需要 relayvsr-wan-x2-v1 + relayvsr-flash-x2-v1，"
+        "x4 需要 refvsr-wan-v1 + refvsr-flash-v1。"
+    )
+
+
+def _relay_load_model(wan_path):
+    """加载 RelayVSR Wan 主干（int8 convrot 量化由 ComfyUI 原生 ops 自动接管）。"""
+    key = (wan_path, os.path.getmtime(wan_path))
+    cached = _relay_model_cache.get("entry")
+    if cached and cached[0] == key:
+        return cached[1]
+    import comfy.sd
+    print(f"[BSAI-H3-upscale] RelayVSR: loading Wan trunk {os.path.basename(wan_path)}", flush=True)
+    model = comfy.sd.load_diffusion_model(wan_path)
+    _relay_model_cache["entry"] = (key, model)
+    return model
+
+
+def _relay_load_vae(flash_path):
+    """加载 RelayVSR Flash 解码器（在 ComfyUI 里以 VAE 形式注册）。"""
+    key = (flash_path, os.path.getmtime(flash_path))
+    cached = _relay_vae_cache.get("entry")
+    if cached and cached[0] == key:
+        return cached[1]
+    import comfy.sd
+    import comfy.utils
+    print(f"[BSAI-H3-upscale] RelayVSR: loading Flash decoder {os.path.basename(flash_path)}", flush=True)
+    sd, metadata = comfy.utils.load_torch_file(flash_path, return_metadata=True)
+    vae = comfy.sd.VAE(sd=sd, metadata=metadata)
+    vae.throw_exception_if_invalid()
+    _relay_vae_cache["entry"] = (key, vae)
+    return vae
+
+
+def _relayvsr_upscale(frames, scale, weights="Auto (by scale)", detail=1.0):
+    """RelayVSR 一步蒸馏 Wan VSR：关键帧主干 + Flash 逐帧解码（像素进、像素出）。
+
+    frames : IMAGE [B,H,W,3] float32 0..1（ComfyUI 原生 IMAGE）
+    scale  : 目标倍率；权重原生倍率与之不同时，解码后 bicubic 精确缩放
+    detail : Flash 解码器细节强度（0..1，1 = 完整模型输出，对标官方 VSR Decode）
+    返回   : IMAGE [B,H*scale,W*scale,3]，本插件的时域/细节后处理照常叠加
+    """
+    if frames is None or frames.shape[0] < 1:
+        raise ValueError("RelayVSR 输入为空")
+    wan_path, flash_path, native = _relay_pick_weights(scale, weights)
+    model = _relay_load_model(wan_path)
+    vae = _relay_load_vae(flash_path)
+
+    import comfy.ldm.wan.model_vsr as _vsr
+    import comfy.sample as _sample
+
+    diffusion = model.model.diffusion_model
+    height, width = int(frames.shape[1]), int(frames.shape[2])
+    frames_n = int(frames.shape[0])
+    # 只有关键帧（每 15 帧 + 末帧）走 Wan 主干，其余帧全部由 Flash 解码器还原
+    keyframes = _vsr.relay_keyframes(frames_n)
+    positive = [[diffusion.positive_conditioning.unsqueeze(0).clone(), {"lq_images": frames[keyframes]}]]
+    latent_size = _vsr.relay_latent_size(height, width, diffusion.latent_stride)
+    latent = torch.zeros(
+        [1, model.model.latent_format.latent_channels, len(keyframes), *latent_size],
+        device=model_management.intermediate_device(),
+    )
+    print(f"[BSAI-H3-upscale] RelayVSR x{native}: {frames_n}f {width}x{height} | keyframes={len(keyframes)} | "
+          f"wan={os.path.basename(wan_path)} | flash={os.path.basename(flash_path)}", flush=True)
+    t0 = time.time()
+    # 官方配方：1 步、cfg 1、euler + simple、denoise 1（蒸馏模型，无 CFG、无 prompt）
+    latent_image = _sample.fix_empty_latent_channels(model, latent)
+    noise = _sample.prepare_noise(latent_image, 0, None)
+    with torch.no_grad():
+        sampled = _sample.sample(
+            model, noise, 1, 1.0, "euler", "simple", positive, positive, latent_image,
+            denoise=1.0, disable_pbar=True, seed=0,
+        )
+        print(f"[BSAI-H3-upscale] RelayVSR keyframe pass done in {time.time() - t0:.1f}s", flush=True)
+        t1 = time.time()
+        decoded = vae.decode(sampled, vae_options={"lq_images": frames, "detail": float(detail)})
+    out = decoded.reshape(-1, *decoded.shape[-3:]).detach().float().cpu()
+    print(f"[BSAI-H3-upscale] RelayVSR flash decode done in {time.time() - t1:.1f}s -> {out.shape[2]}x{out.shape[1]}", flush=True)
+
+    target_scale = float(scale)
+    if abs(target_scale - float(native)) > 1e-3:
+        th = int(round(height * target_scale)); tw = int(round(width * target_scale))
+        th += th % 2; tw += tw % 2
+        out = F.interpolate(out.permute(0, 3, 1, 2), size=(th, tw), mode="bicubic", align_corners=False)
+        out = out.permute(0, 2, 3, 1).contiguous()
+        print(f"[BSAI-H3-upscale] RelayVSR resized x{native} -> x{target_scale:.2f} ({tw}x{th})", flush=True)
+    return out
+
+
 def _rtx_upscale(frames, scale, quality="Ultra"):
     """NVIDIA RTX Video Super Resolution (nvidia-vfx, no model files).
     直接内联 nvvfx 调用，不再依赖 ComfyUI-Yuan-Tool 插件。"""
@@ -2749,6 +2913,8 @@ _LEGACY_FACE_RESTORE = {"小脸增强(CodeFormer)": "Small-Face (CodeFormer)",
 _LEGACY_ENGINE = {
     "自动路由 (按内容/输入推荐)": "Auto Route (content-based)",
     "FlashVSR-v1.1 (扩散视频超分)": "FlashVSR-v1.1 (diffusion video SR)",
+    "RelayVSR 4倍 (Wan一步超分)": "RelayVSR (one-step Wan VSR)",
+    "RelayVSR (Wan一步超分)": "RelayVSR (one-step Wan VSR)",
     "SeedVR2 7B (扩散视频超分)": "SeedVR2 7B (diffusion video SR)",
     "SeedVR2 7B INT8 (ComfyUI原生)": "SeedVR2 7B INT8 (native ComfyUI)",
     "DLSS 5 (NVIDIA 神经渲染超分)": "DLSS 5 (NVIDIA neural SR)",
@@ -2794,6 +2960,7 @@ class BSAI_H3_Upscale4K:
     ENGINE_OPTIONS = {
         "Auto Route (content-based)": "auto",
         "FlashVSR-v1.1 (diffusion video SR)": "flashvsr",
+        "RelayVSR (one-step Wan VSR)": "relayvsr",
         "SeedVR2 7B (diffusion video SR)": "seedvr2",
         "SeedVR2 7B INT8 (native ComfyUI)": "seedvr2_int8",
         "NVIDIA RTX Video Super Res": "rtx",
@@ -2931,6 +3098,12 @@ class BSAI_H3_Upscale4K:
                 # 鬼影，纹理层（细节/肌理）轻度混合以保留 FlashVSR 细节。
                 # 值越高鬼影越少，细节相应减少。0=纯FlashVSR，0.4=推荐。
                 "flashvsr_anti_ghost": ("FLOAT", {"default": 0.40, "min": 0.0, "max": 1.0, "step": 0.05}),
+                # RelayVSR 专属参数（仅当 model_name 选择 RelayVSR 时生效）：
+                # Wan 主干 + Flash 解码器按倍率配对，权重目录见 _relayvsr_upscale 注释。
+                # weights: Auto 按 scale 自动选档（>=3 用 x4，否则 x2），可手动锁定 x2/x4；
+                # detail : Flash 解码器细节强度，1.0 = 完整模型输出（对标官方 VSR Decode）。
+                "relay_weights": (["Auto (by scale)", "x2 (LightX2V)", "x4"], {"default": "Auto (by scale)"}),
+                "relay_detail": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
             },
         }
 
@@ -2946,6 +3119,9 @@ class BSAI_H3_Upscale4K:
         "AI video super-resolution (pixel domain) for H3: a unified multi-engine node.\n"
         "  • Real-ESRGAN fast tier: general-x4v3 / x4plus, optical-flow temporal + multi-scale detail + face restore\n"
         "  • FlashVSR-v1.1 / SeedVR2 7B: diffusion video SR (own weight paths unchanged)\n"
+        "  • RelayVSR (one-step Wan VSR, RelayVSR + LightX2V x2 weights): Wan keyframe trunk + Flash\n"
+        "    per-frame decoder on ComfyUI's native chain (models/diffusion_models/RelayVSR + models/vae),\n"
+        "    no external RelayVSR node pack needed; x2/x4 auto-paired by safetensors metadata\n"
         "  • NVIDIA RTX Video Super Res: nvidia-vfx GPU SR (no model files)\n"
         "  • DLSS 5 (NVIDIA neural-render SR): DLSS SR + Neural Rendering, RTX hardware SR,\n"
         "    driven by the video2dlssnr pipeline (needs exe + nvngx_dlss.dll + nvngx_dlssnr.dll)\n"
@@ -2957,8 +3133,9 @@ class BSAI_H3_Upscale4K:
         "    Wonder 3.5 = Topaz Photo image model (neuroserver/ engine, weights in Topaz Labs LLC/.../models/neuroserver/wonder-all),\n"
         "    video input is processed frame by frame (slower, ~1 min/frame @512px).\n"
         "Unified multi-engine video super-resolution node: Real-ESRGAN fast tier, "
-        "FlashVSR / SeedVR2 diffusion tiers (own weight paths), NVIDIA RTX VSR, "
-        "and Topaz generative tier (Starlight 2.6 / Astra / Wonder 3.5), all with our post-processing on top."
+        "FlashVSR / SeedVR2 / RelayVSR (one-step Wan VSR) diffusion tiers (own weight paths), "
+        "NVIDIA RTX VSR, and Topaz generative tier (Starlight 2.6 / Astra / Wonder 3.5), "
+        "all with our post-processing on top."
     )
     @_cudnn_fast
     def upscale(self, **kw):
@@ -3042,6 +3219,18 @@ class BSAI_H3_Upscale4K:
             out = _flashvsr_upscale(images, scale, anti_ghost=float(flashvsr_anti_ghost))
             eff_scale = float(out.shape[1] / float(images.shape[1]))
             temporal_strength = 0.0  # engine handles temporal consistency
+            lr_np = None
+        elif _engine == "relayvsr":
+            # --- RelayVSR 一步蒸馏 Wan VSR（关键帧主干 + Flash 逐帧解码）---------
+            # 引擎自带时序一致性与细节重建，本插件的光流时序 pass 跳过；
+            # detail / softness / face_restore 仍可叠加微调。
+            relay_weights = g("relay_weights", "Auto (by scale)")
+            relay_detail = g("relay_detail", 1.0)
+            out = _relayvsr_upscale(
+                images, float(scale), weights=relay_weights, detail=float(relay_detail),
+            )
+            eff_scale = float(out.shape[1] / float(images.shape[1]))
+            temporal_strength = 0.0
             lr_np = None
         elif _engine == "seedvr2":
             # --- SeedVR2 7B diffusion path ----------------------------------

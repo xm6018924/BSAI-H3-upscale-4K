@@ -89,6 +89,10 @@ MiniMax H3 视频/图片 **AI 超分 4K 插件**（ComfyUI 像素域 + 潜空间
 | SeedVR2 7B (INT8, ComfyUI 原生) | `diffusion_models/seedvr2_7b_int8_convrot.safetensors`（新引擎「SeedVR2 7B INT8」自动查找，优先于此文件，其次 `diffusion_models/` 其它 seedvr2、最后 `SEEDVR2/`） | 7.9 GB | Comfy-Org 转换包：https://huggingface.co/Comfy-Org/SeedVR2_comfyui_repackaged （ComfyUI 原生量化格式，插件走原生 NaDiT 链加载） |
 | SeedVR2 VAE | `SEEDVR2/ema_vae_fp16.safetensors`（原生引擎自动查找：`SEEDVR2/` → `vae/seedvr2_ema_vae_fp16.safetensors` → `vae/ema_vae_fp16.safetensors`；三者哈希相同） | 478 MB | https://huggingface.co/numz/SeedVR2_comfyUI |
 | SeedVR2 文本嵌入 | 插件仓库内 `pos_emb.pt` + `neg_emb.pt`（随 git clone 自带） | 1.3 MB | ✅ git clone 自带 |
+| **RelayVSR x4（Wan 主干）** | `diffusion_models/RelayVSR/relayvsr_x4_int8_convrot.safetensors`（int8 量化，ComfyUI 原生链路加载；同放 `diffusion_models/` 根目录也可） | 5.2 GB | RelayVSR x4 官方权重（int8 convrot 转档） |
+| **RelayVSR x2（LightX2V 主干）** | `diffusion_models/RelayVSR/relayvsr_x2_lightx2v_int8_convrot.safetensors` | 5.2 GB | LightX2V RelayVSR_X2（int8 convrot 转档） |
+| **RelayVSR Flash 解码器（x4）** | `vae/relayvsr VAE/relayvsr_flash_vae_x4_fp32.safetensors`（在 ComfyUI 里注册为 VAE） | 127 MB | RelayVSR Flash VAE x4 |
+| **RelayVSR Flash 解码器（x2）** | `vae/relayvsr VAE/relayvsr_flash_vae_x2_fp32.safetensors` | 127 MB | RelayVSR Flash VAE x2 |
 | **DLSS 5 运行时** | `DLSS5/video2dlssnr.exe` | 429 KB | https://github.com/DaniilSokolyuk/video2dlssnr/releases/download/v1.2/video2dlssnr_release_light.zip （仅 exe） |
 | DLSS 5 NVIDIA DLL | `DLSS5/nvngx_dlss.dll` + `nvngx_dlssnr.dll` + `nvngx.dll_dlssnr.dll` | 227 MB | NVIDIA 专有运行时，来自本地 DLSS5 整合包 / NVIDIA 官方；或用全量包：https://github.com/DaniilSokolyuk/video2dlssnr/releases/download/v1.2/video2dlssnr_release.zip （含 DLL，约 247 MB） |
 | **VOSR 2.0** | `VOSR/` 整个仓库（含 `preset/ckpts/VOSR2/`、`Qwen-Image-vae-2d/`、`stable-diffusion-2-1-base/`、`torch_cache/` DINOv2） | ~7.5 GB | https://modelscope.cn/models/cswry/VOSR （国内直连优先）或 https://huggingface.co/cswry/VOSR ；仓库源码：https://github.com/cswry/VOSR |
@@ -116,7 +120,9 @@ ComfyUI/models/
 ├── FlashVSR-v1.1/             LQ_proj_in.ckpt / TCDecoder.ckpt / DMD safetensors / Wan2.1_VAE.pth
 ├── SEEDVR2/                   seedvr2_ema_7b_fp8_...safetensors / ema_vae_fp16.safetensors
 ├── diffusion_models/          seedvr2_7b_int8_convrot.safetensors（INT8 原生引擎用）
+├── diffusion_models/RelayVSR/ relayvsr_x4_int8_convrot.safetensors / relayvsr_x2_lightx2v_int8_convrot.safetensors（RelayVSR 引擎用）
 ├── vae/                       seedvr2_ema_vae_fp16.safetensors（与 SEEDVR2 内同文件）
+├── vae/relayvsr VAE/          relayvsr_flash_vae_x4_fp32.safetensors / relayvsr_flash_vae_x2_fp32.safetensors（RelayVSR Flash 解码器）
 ├── DLSS5/                     video2dlssnr.exe / nvngx_dlss.dll / nvngx_dlssnr.dll / nvngx.dll_dlssnr.dll
 ├── VOSR/                      inference_vosr_onestep.py + preset/ckpts/（VOSR2 / Qwen VAE / SD2.1 VAE / torch_cache）
 └── Topaz_Engine/              neuroserver171/neuroserver.exe + models/
@@ -215,6 +221,16 @@ The search area is now derived from the live install path: sibling ComfyUI packs
 ---
 
 ## 📝 更新日志
+
+### v2.10.0 — 新增「RelayVSR (one-step Wan VSR)」引擎（移植 RelayVSR / LightX2V x2，不装外部节点包）
+- **新增档位**：模型下拉新增 `RelayVSR (one-step Wan VSR)`，一步蒸馏 Wan 视频超分（RelayVSR + LightX2V RelayVSR_X2 同源）。
+- **实现方式（移植而非安装）**：直接走 ComfyUI 原生链路 `comfy.ldm.wan.model_vsr` —— Wan 关键帧主干（每 15 帧 + 末帧）经 1 步 `euler + simple`、cfg 1 采样出关键帧 latent，再由 RelayVSR **Flash 解码器**（在 ComfyUI 里注册为 VAE）逐帧还原全部帧像素。**不再需要 ComfyUI-Relay-VSR 节点包**（本插件内自实现，删掉外部插件不影响）。
+- **权重自动配对**：按 safetensors metadata 的 `format` 字段识别倍率并成对匹配，与文件名无关 ——
+  Wan `relayvsr-wan-x2-v1`(x2) / `refvsr-wan-v1`(x4)，Flash `relayvsr-flash-x2-v1`(x2) / `refvsr-flash-v1`(x4)。
+  目录：`models/diffusion_models/RelayVSR/`（主干）+ `models/vae/`（Flash 解码器），本整合包已按此归位。
+- **专属参数**：`relay_weights`（Auto 按 scale 自动选档，>=3 用 x4、否则 x2；也可手动锁 x2/x4）、`relay_detail`（Flash 解码细节强度 0~1，默认 1.0）。
+- **后处理**：本插件的光流时域 pass 对该引擎自动跳过（模型自带时序一致性）；`detail / softness / face_restore` 仍可叠加。
+- **倍率换算**：权重原生倍率与 `scale` 不一致时（如只有 x4 权重但要 2 倍），解码后 bicubic 精确缩放到目标尺寸，不重复推理。
 
 ### v2.9.4 — 并入官方 NVIDIA RTX VFX 去噪/去模糊档位 / Official RTX VFX DENOISE_*/DEBLUR_* tiers merged
 - **新增引擎**「NVIDIA RTX VSR - 去噪/去模糊 (VFX)」：与官方 ComfyUI_Nvidia_VFX_Nodes 的 RTXVideoSuperResolution 同源（nvvfx `DENOISE_LOW~ULTRA` / `DEBLUR_LOW~ULTRA`，同分辨率处理，无需模型文件）。专属参数 `rtx_vfx_op`（去噪/去模糊）、`rtx_vfx_level`（LOW/MEDIUM/HIGH/ULTRA）、`rtx_strength`（0-1）；`scale>1` 时先同分辨率清理，再自动接 RTX ULTRA 放大到目标倍率（先清理后放大）。引擎不可用时自动降级 SeedVR2，workflow 不中断。

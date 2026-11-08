@@ -2065,9 +2065,9 @@ def _relay_pick_weights(scale, prefer="Auto (by scale)"):
         if wan and flash:
             return wan, flash, candidate
     raise RuntimeError(
-        "RelayVSR 权重缺失：Wan 主干放 models/diffusion_models/RelayVSR/，"
-        "Flash 解码器放 models/vae/。x2 需要 relayvsr-wan-x2-v1 + relayvsr-flash-x2-v1，"
-        "x4 需要 refvsr-wan-v1 + refvsr-flash-v1。"
+        "RelayVSR weights are missing: put the Wan trunk in models/diffusion_models/RelayVSR/ "
+        "and the Flash decoder in models/vae/. x2 needs relayvsr-wan-x2-v1 + relayvsr-flash-x2-v1, "
+        "x4 needs refvsr-wan-v1 + refvsr-flash-v1."
     )
 
 
@@ -2109,7 +2109,7 @@ def _relayvsr_upscale(frames, scale, weights="Auto (by scale)", detail=1.0):
     返回   : IMAGE [B,H*scale,W*scale,3]，本插件的时域/细节后处理照常叠加
     """
     if frames is None or frames.shape[0] < 1:
-        raise ValueError("RelayVSR 输入为空")
+        raise ValueError("RelayVSR input is empty")
     wan_path, flash_path, native = _relay_pick_weights(scale, weights)
     model = _relay_load_model(wan_path)
     vae = _relay_load_vae(flash_path)

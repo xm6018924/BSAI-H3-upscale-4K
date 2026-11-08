@@ -1026,6 +1026,38 @@ def _soften_gpu(frames, softness, radius=1.2):
     return out if is_chw else out.permute(0, 2, 3, 1)
 
 
+def _soften_chunked(frames, softness, radius=1.2, gpu_budget=768 << 20):
+    """Memory-bounded softness blend for long 4K sequences; blends in place.
+
+    _soften_gpu needs several full-size copies (contiguous permute + blur
+    buffers), which is 30GB+ for 294 frames of 3840x2176. Blend a chunk at a
+    time instead, keeping GPU upload and CPU temporaries proportional to the
+    chunk. Falls back to CPU per chunk if the GPU pass still runs out.
+    """
+    if softness <= 0:
+        return frames
+    is_chw = (frames.ndim == 4 and frames.shape[1] == 3 and frames.shape[3] != 3)
+    n, C, H, W = (frames.shape if is_chw else
+                  (frames.shape[0], frames.shape[3], frames.shape[1], frames.shape[2]))
+    per_frame = C * H * W * frames.element_size()
+    chunk = max(1, min(n, int(gpu_budget // per_frame)))
+    gpu = torch.cuda.is_available()
+    for s in range(0, n, chunk):
+        e = min(n, s + chunk)
+        part = (frames[s:e] if is_chw else frames[s:e].permute(0, 3, 1, 2)).contiguous()
+        blended = None
+        if gpu:
+            try:
+                blended = _soften_gpu(part.to(torch.cuda.current_device()), softness, radius).cpu()
+            except torch.cuda.OutOfMemoryError:
+                print(f"[BSAI-H3-Upscale] GPU OOM in softness pass (chunk={e - s}), using CPU")
+                torch.cuda.empty_cache()
+        if blended is None:
+            blended = _soften_gpu(part, softness, radius)
+        frames[s:e] = blended if is_chw else blended.permute(0, 2, 3, 1)
+    return frames
+
+
 def _video_temporal_detail(sr_cpu, lr_np, temporal_strength, detail_amount, detail_radius, scale, detail_mode="classic"):
     """
     sr_cpu: [B,H,W,3] float32 CPU 0-1 (already upscaled).
@@ -3412,16 +3444,10 @@ class BSAI_H3_Upscale4K:
         td_elapsed = time.time() - t_td
         print(f"[BSAI-H3-upscale] detail+temporal done in {td_elapsed:.1f}s")
 
-        # Softness (Topaz-style) — GPU, then back to CPU.
-        # OOM fallback: if GPU runs out (e.g. 4K 56-frame batch), process on CPU.
+        # Softness (Topaz-style) — GPU, chunked so a 4K/long batch never stages
+        # the whole sequence on the GPU (or copies it whole on CPU) at once.
         if soft_eff > 0 and torch.cuda.is_available():
-            dev = torch.cuda.current_device()
-            try:
-                out = _soften_gpu(out.to(dev), soft_eff).cpu()
-            except torch.cuda.OutOfMemoryError:
-                print(f"[BSAI-H3-Upscale] GPU OOM in softness pass, falling back to CPU (frames={out.shape[0]}, size={out.shape[2]}x{out.shape[3]})")
-                torch.cuda.empty_cache()
-                out = _soften_gpu(out, soft_eff)
+            out = _soften_chunked(out, soft_eff)
 
         # Face restoration (small / distant broken faces) - optional, on the SR frames
         t_fr = time.time()

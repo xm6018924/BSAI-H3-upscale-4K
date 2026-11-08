@@ -2297,7 +2297,10 @@ def _dlssnr_sibling_candidates():
     here = os.path.dirname(os.path.abspath(__file__))
     cf_root = os.path.dirname(os.path.dirname(here))        # .../<pack>/ComfyUI
     pack = os.path.dirname(cf_root)                          # .../<pack>
-    bases = [os.path.dirname(pack), r"C:\BSAI"]
+    # Only the install's own neighbourhood is searched: a fixed absolute path
+    # (or any folder beside the ComfyUI install) would let an unrelated local
+    # tree supply the executable that is about to be run.
+    bases = [os.path.dirname(pack)]
     rel_layouts = (
         (os.path.join("ComfyUI", "models", "DLSS5"),),
         (os.path.join("models", "DLSS5"),),
@@ -2361,7 +2364,6 @@ def _dlssnr_pack_candidates():
     env = os.environ.get("VIDEO2DLSSNR_PACK_DIR", "").strip().strip('"')
     if env:
         roots.append(env)
-    roots.append(r"C:\BSAI\DLSS5")
     for root in roots:
         if not os.path.isdir(root):
             continue
@@ -2647,8 +2649,7 @@ def _vosr_home():
     cands = []
     if base:
         cands.append(os.path.join(base, "VOSR"))  # ComfyUI/models/VOSR (仓库副本)
-    cands += [r"C:\BSAI\VOSR",
-              os.path.join(os.path.dirname(os.path.abspath(__file__)), "bin", "VOSR")]
+    cands.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "bin", "VOSR"))
     for c2 in cands:
         if os.path.isdir(c2):
             return c2

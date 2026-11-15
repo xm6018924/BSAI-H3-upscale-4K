@@ -3269,6 +3269,12 @@ class BSAI_H3_Upscale4K:
         _engine = self.ENGINE_OPTIONS.get(model_name)
         _is_topaz = model_name in self.TOPAZ_OPTIONS
 
+        # 这两个变量只有 Real-ESRGAN 分支会自己赋值，其它引擎分支（RelayVSR /
+        # FlashVSR / SeedVR2 / RTX / DLSS5 / VOSR / Topaz）走完整个 if-elif 链后
+        # 后面的时域 pass 仍要读它们，必须先兜底初始化，否则 UnboundLocalError。
+        lr_np = None
+        pre_flows = None
+
         if _engine == "flashvsr":
             # --- FlashVSR-v1.1 diffusion path -------------------------------
             out = _flashvsr_upscale(images, scale, anti_ghost=float(flashvsr_anti_ghost))

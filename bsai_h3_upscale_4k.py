@@ -1058,10 +1058,11 @@ def _soften_chunked(frames, softness, radius=1.2, gpu_budget=768 << 20):
     return frames
 
 
-def _video_temporal_detail(sr_cpu, lr_np, temporal_strength, detail_amount, detail_radius, scale, detail_mode="classic"):
+def _video_temporal_detail(sr_cpu, lr_np, temporal_strength, detail_amount, detail_radius, scale, detail_mode="classic", flows=None):
     """
     sr_cpu: [B,H,W,3] float32 CPU 0-1 (already upscaled).
     lr_np:  [B,h,w,3] float32 0-1 numpy (original LR frames, for optical flow).
+    flows: 可选，预先算好的光流对列表；传入时 lr_np 可以留空（省掉 ~9 GB 的原始帧缓存）。
     Returns fused + enhanced frames [B,H,W,3] CPU float32.
 
     Fast path: frames are staged to GPU in windows (with neighbours) in ONE
@@ -1071,9 +1072,13 @@ def _video_temporal_detail(sr_cpu, lr_np, temporal_strength, detail_amount, deta
     if (temporal_strength <= 0 and detail_amount <= 0) or B < 1:
         return sr_cpu
     # 单帧 / 无光流输入（如单图超分）时，时域一致性无意义，跳过 flow 计算
-    if lr_np is None or lr_np.shape[0] < 2:
-        temporal_strength = 0.0
-    flows = _compute_flow_pairs(lr_np) if temporal_strength > 0 else None
+    if flows is None:
+        if lr_np is None or lr_np.shape[0] < 2:
+            temporal_strength = 0.0
+        elif temporal_strength > 0:
+            flows = _compute_flow_pairs(lr_np)
+    elif temporal_strength <= 0:
+        flows = None
     H, W = sr_cpu.shape[1], sr_cpu.shape[2]
     use_gpu = torch.cuda.is_available()
     dev = torch.cuda.current_device() if use_gpu else torch.device("cpu")
@@ -1081,15 +1086,26 @@ def _video_temporal_detail(sr_cpu, lr_np, temporal_strength, detail_amount, deta
     pix = H * W
     window = 8 if pix > 10_000_000 else 16
     grid = _sr_grid(H, W, dev) if flows is not None else None
-    out_chunks = []
+    # 结果直接写回 sr_cpu 的切片：4K 长片时 [B,H,W,3] 本身就有 30+ GB，
+    # 旧实现先收集 out_chunks 再 torch.cat 会额外再要一份等量内存
+    # （36 GB 的片子要 36 + 36 GB），63 GB 机器直接 DefaultCPUAllocator 失败。
+    # 就地写回会覆盖「上一窗口的末帧/下一窗口的首帧」这两个邻帧，所以：
+    #   * 上一窗口已经写掉的末帧，先把原图存进 prev_orig；
+    #   * 下一窗口要用的首帧（e）此刻还没写，仍是原图。
+    prev_orig = None
     for s in range(0, B, window):
         e = min(B, s + window)
         lo = max(0, s - 1)
         hi = min(B, e + 1)
-        buf = sr_cpu[lo:hi].to(dev).permute(0, 3, 1, 2)  # [m,3,H,W] one transfer
+        seg = [prev_orig] if lo < s else []
+        seg += [sr_cpu[i] for i in range(s, hi)]
+        buf = torch.stack(seg, dim=0).to(dev).permute(0, 3, 1, 2)  # [m,3,H,W] one transfer
         if half:
             buf = buf.half()
-        rel = {i: i - lo for i in range(lo, hi)}
+        base = 1 if lo < s else 0
+        rel = {i: base + (i - s) for i in range(s, hi)}
+        if lo < s:
+            rel[lo] = 0
         chunk = buf[rel[s]:rel[e - 1] + 1].clone()
         if flows is not None:
             n = chunk.shape[0]
@@ -1122,8 +1138,14 @@ def _video_temporal_detail(sr_cpu, lr_np, temporal_strength, detail_amount, deta
             chunk = fused
         if detail_amount > 0:
             chunk = _detail_enhance_gpu(chunk, detail_amount, detail_radius, detail_mode)
-        out_chunks.append(chunk.float().permute(0, 2, 3, 1).cpu())
-    return torch.cat(out_chunks, dim=0)
+        # 就地写回本次窗口（buf 已是独立拷贝，不会读到被覆盖的邻帧）
+        if e < B:
+            nxt_prev = sr_cpu[e - 1].clone()  # 下一窗口要当 lo 邻帧用的原图
+        else:
+            nxt_prev = None
+        sr_cpu[s:e] = chunk.float().permute(0, 2, 3, 1)
+        prev_orig = nxt_prev
+    return sr_cpu
 
 
 # ---------------------------------------------------------------------------
@@ -3403,8 +3425,13 @@ class BSAI_H3_Upscale4K:
 
             # keep the original LR frames around (needed by the temporal pass for flow)
             lr_np = None
+            pre_flows = None
             if temporal_strength > 0 and _HAS_CV2 and images.shape[0] > 1:
                 lr_np = np.ascontiguousarray(images.float().numpy(), dtype=np.float32)
+                # 光流一次算好就把原图缓存释放：4K 长片这份原图约 9 GB，
+                # 会和 30+ GB 的超分结果同时占内存，63 GB 机器撑不住。
+                pre_flows = _compute_flow_pairs(lr_np)
+                lr_np = None
             else:
                 temporal_strength = 0.0  # 单帧（或无 cv2）无光流可用，时域一致性跳过
 
@@ -3441,7 +3468,8 @@ class BSAI_H3_Upscale4K:
         t_td = time.time()
         print(f"[BSAI-H3-upscale] post-processing: detail={detail_eff:.2f}, soft={soft_eff:.2f}, temporal={temporal_strength:.2f}...")
         out = _video_temporal_detail(out, lr_np, temporal_strength, detail_eff,
-                                     detail_radius, eff_scale, mode_eff)
+                                     detail_radius, eff_scale, mode_eff,
+                                     flows=pre_flows)
         td_elapsed = time.time() - t_td
         print(f"[BSAI-H3-upscale] detail+temporal done in {td_elapsed:.1f}s")
 

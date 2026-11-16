@@ -3007,6 +3007,47 @@ def _validate_bsai_legacy(input_types):
     return out if out else True
 
 
+def _normalize_image_input(value):
+    """把上游送来的输入归一成 IMAGE 张量 [B,H,W,3]。
+
+    本地实测：索引开关（easy anythingIndexSwitch）后面若挂着被 bypass 的节点，
+    ComfyUI 的旁路透传会把它第一个类型匹配（"*"）的输入端原样送出，于是本节点
+    收到的是 LATENT dict（{"samples": ...}）而不是图像，以前会在深处炸成
+    "'dict' object has no attribute 'shape'"。这里提前解包，并给出可操作的报错。
+    """
+    if value is None:
+        raise ValueError(
+            "BSAI_H3_Upscale4K: images 输入为空。请检查索引开关指向的分支是否已接入。")
+    if isinstance(value, torch.Tensor):
+        return value
+    if isinstance(value, dict):
+        for key in ("images", "image", "frames", "pixels", "video"):
+            probe = value.get(key)
+            if isinstance(probe, torch.Tensor):
+                return probe
+        if any(k in value for k in ("samples", "latent")):
+            raise ValueError(
+                "BSAI_H3_Upscale4K: 收到的是潜空间(LATENT)而不是图像——"
+                "上游「索引开关」当前指向的分支处于 bypass/未启用状态，"
+                "旁路透传把该分支的首个 '*' 输入（潜空间）送了过来。"
+                "请把开关索引改指向已启用（mode=0）的「二采·视频图像」分支。")
+        keys = ", ".join(map(str, list(value.keys())[:6]))
+        raise ValueError(
+            "BSAI_H3_Upscale4K: 无法从 dict 输入中取出图像（键: %s）。请把上游改为输出 IMAGE 的节点。" % keys)
+    if isinstance(value, (list, tuple)):
+        frames = []
+        for item in value:
+            if not isinstance(item, torch.Tensor):
+                raise ValueError(
+                    "BSAI_H3_Upscale4K: 图像列表中存在非张量元素（%s）。" % type(item).__name__)
+            frames.append(item.unsqueeze(0) if item.dim() == 3 else item)
+        if not frames:
+            raise ValueError("BSAI_H3_Upscale4K: 图像列表为空。")
+        return torch.cat(frames, dim=0) if len(frames) > 1 else frames[0]
+    raise ValueError(
+        "BSAI_H3_Upscale4K: images 期望 IMAGE 张量，实际收到 %s。" % type(value).__name__)
+
+
 class BSAI_H3_Upscale4K:
     """Video frame AI super-resolution for MiniMax H3 (pixel domain, extremely fast)."""
 
@@ -3195,7 +3236,7 @@ class BSAI_H3_Upscale4K:
     @_cudnn_fast
     def upscale(self, **kw):
         g = kw.get
-        images = g("images")
+        images = _normalize_image_input(g("images"))
         model_name = g("model_name")
         scale = g("scale", 4.0)
         tile_size = g("tile_size", 0)

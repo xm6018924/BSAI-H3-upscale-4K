@@ -89,14 +89,40 @@ MiniMax H3 视频/图片 **AI 超分 4K 插件**（ComfyUI 像素域 + 潜空间
 | SeedVR2 7B (INT8, ComfyUI 原生) | `diffusion_models/seedvr2_7b_int8_convrot.safetensors`（新引擎「SeedVR2 7B INT8」自动查找，优先于此文件，其次 `diffusion_models/` 其它 seedvr2、最后 `SEEDVR2/`） | 7.9 GB | Comfy-Org 转换包：https://huggingface.co/Comfy-Org/SeedVR2_comfyui_repackaged （ComfyUI 原生量化格式，插件走原生 NaDiT 链加载） |
 | SeedVR2 VAE | `SEEDVR2/ema_vae_fp16.safetensors`（原生引擎自动查找：`SEEDVR2/` → `vae/seedvr2_ema_vae_fp16.safetensors` → `vae/ema_vae_fp16.safetensors`；三者哈希相同） | 478 MB | https://huggingface.co/numz/SeedVR2_comfyUI |
 | SeedVR2 文本嵌入 | 插件仓库内 `pos_emb.pt` + `neg_emb.pt`（随 git clone 自带） | 1.3 MB | ✅ git clone 自带 |
-| **RelayVSR x4（Wan 主干）** | `diffusion_models/RelayVSR/relayvsr_x4_int8_convrot.safetensors`（int8 量化，ComfyUI 原生链路加载；同放 `diffusion_models/` 根目录也可） | 5.2 GB | RelayVSR x4 官方权重（int8 convrot 转档） |
-| **RelayVSR x2（LightX2V 主干）** | `diffusion_models/RelayVSR/relayvsr_x2_lightx2v_int8_convrot.safetensors` | 5.2 GB | LightX2V RelayVSR_X2（int8 convrot 转档） |
-| **RelayVSR Flash 解码器（x4）** | `vae/relayvsr VAE/relayvsr_flash_vae_x4_fp32.safetensors`（在 ComfyUI 里注册为 VAE） | 127 MB | RelayVSR Flash VAE x4 |
-| **RelayVSR Flash 解码器（x2）** | `vae/relayvsr VAE/relayvsr_flash_vae_x2_fp32.safetensors` | 127 MB | RelayVSR Flash VAE x2 |
+| **RelayVSR x4（Wan 主干）** | `diffusion_models/RelayVSR/relayvsr_x4_int8_convrot.safetensors`（int8 量化，ComfyUI 原生链路加载；同放 `diffusion_models/` 根目录也可） | 5.2 GB | 夸克网盘 Quark：https://pan.quark.cn/s/378a58226f5d（主模型包，含 x2/x4 主干 / trunk pack, x2 + x4） |
+| **RelayVSR x2（LightX2V 主干）** | `diffusion_models/RelayVSR/relayvsr_x2_lightx2v_int8_convrot.safetensors` | 5.2 GB | 夸克网盘 Quark：https://pan.quark.cn/s/378a58226f5d（主模型包，含 x2/x4 主干 / trunk pack, x2 + x4） |
+| **RelayVSR Flash 解码器（x4）** | `vae/relayvsr VAE/relayvsr_flash_vae_x4_fp32.safetensors`（在 ComfyUI 里注册为 VAE） | 127 MB | 夸克网盘 Quark：https://pan.quark.cn/s/ca4cf4e6ecfe（Flash 解码器包，含 x2/x4 / Flash VAE pack, x2 + x4） |
+| **RelayVSR Flash 解码器（x2）** | `vae/relayvsr VAE/relayvsr_flash_vae_x2_fp32.safetensors` | 127 MB | 夸克网盘 Quark：https://pan.quark.cn/s/ca4cf4e6ecfe（Flash 解码器包，含 x2/x4 / Flash VAE pack, x2 + x4） |
 | **DLSS 5 运行时** | `DLSS5/video2dlssnr.exe` | 429 KB | https://github.com/DaniilSokolyuk/video2dlssnr/releases/download/v1.2/video2dlssnr_release_light.zip （仅 exe） |
 | DLSS 5 NVIDIA DLL | `DLSS5/nvngx_dlss.dll` + `nvngx_dlssnr.dll` + `nvngx.dll_dlssnr.dll` | 227 MB | NVIDIA 专有运行时，来自本地 DLSS5 整合包 / NVIDIA 官方；或用全量包：https://github.com/DaniilSokolyuk/video2dlssnr/releases/download/v1.2/video2dlssnr_release.zip （含 DLL，约 247 MB） |
 | **VOSR 2.0** | `VOSR/` 整个仓库（含 `preset/ckpts/VOSR2/`、`Qwen-Image-vae-2d/`、`stable-diffusion-2-1-base/`、`torch_cache/` DINOv2） | ~7.5 GB | https://modelscope.cn/models/cswry/VOSR （国内直连优先）或 https://huggingface.co/cswry/VOSR ；仓库源码：https://github.com/cswry/VOSR |
 | **Topaz 引擎**（商业） | `Topaz_Engine/`（neuroserver + models） | ~33 GB | 商业软件，自行部署：https://www.topazlabs.com （放入 `models/Topaz_Engine/`） |
+
+### 二·补、RelayVSR 权重放置路径与下载 / RelayVSR weights — placement & download
+
+**中文**
+
+- **Wan 主干（主模型）**：解压后放入 `ComfyUI/models/diffusion_models/RelayVSR/`
+  - `relayvsr_x4_int8_convrot.safetensors`（x4，约 4.9 GB）
+  - `relayvsr_x2_lightx2v_int8_convrot.safetensors`（x2，约 4.9 GB）
+  - 下载 / Download（夸克网盘 Quark）：https://pan.quark.cn/s/378a58226f5d
+- **Flash 解码器（VAE）**：解压后放入 `ComfyUI/models/vae/relayvsr VAE/`
+  - `relayvsr_flash_vae_x4_fp32.safetensors`（x4，约 122 MB）
+  - `relayvsr_flash_vae_x2_fp32.safetensors`（x2，约 122 MB）
+  - 下载 / Download（夸克网盘 Quark）：https://pan.quark.cn/s/ca4cf4e6ecfe
+- 倍率由 safetensors metadata 的 `format` 字段自动配对，与文件名无关；x2 / x4 各需一对（主干 + 解码器）。文件放入后需重启 ComfyUI，新权重才会被扫描到。
+
+**English**
+
+- **Wan trunk (main model)**: extract into `ComfyUI/models/diffusion_models/RelayVSR/`
+  - `relayvsr_x4_int8_convrot.safetensors` (x4, ~4.9 GB)
+  - `relayvsr_x2_lightx2v_int8_convrot.safetensors` (x2, ~4.9 GB)
+  - Download (Quark drive): https://pan.quark.cn/s/378a58226f5d
+- **Flash decoder (VAE)**: extract into `ComfyUI/models/vae/relayvsr VAE/`
+  - `relayvsr_flash_vae_x4_fp32.safetensors` (x4, ~122 MB)
+  - `relayvsr_flash_vae_x2_fp32.safetensors` (x2, ~122 MB)
+  - Download (Quark drive): https://pan.quark.cn/s/ca4cf4e6ecfe
+- Scale is matched automatically from the safetensors metadata `format` field (filename-independent); each scale needs one trunk + one decoder pair. Restart ComfyUI after placing the files so the new weights are scanned.
 
 ### 三、无直链模型获取方式（GFPGANv1.4.onnx / codeformer.onnx）
 
@@ -227,7 +253,7 @@ The search area is now derived from the live install path: sibling ComfyUI packs
 - **实现方式（移植而非安装）**：直接走 ComfyUI 原生链路 `comfy.ldm.wan.model_vsr` —— Wan 关键帧主干（每 15 帧 + 末帧）经 1 步 `euler + simple`、cfg 1 采样出关键帧 latent，再由 RelayVSR **Flash 解码器**（在 ComfyUI 里注册为 VAE）逐帧还原全部帧像素。**不再需要 ComfyUI-Relay-VSR 节点包**（本插件内自实现，删掉外部插件不影响）。
 - **权重自动配对**：按 safetensors metadata 的 `format` 字段识别倍率并成对匹配，与文件名无关 ——
   Wan `relayvsr-wan-x2-v1`(x2) / `refvsr-wan-v1`(x4)，Flash `relayvsr-flash-x2-v1`(x2) / `refvsr-flash-v1`(x4)。
-  目录：`models/diffusion_models/RelayVSR/`（主干）+ `models/vae/`（Flash 解码器），本整合包已按此归位。
+  目录：`models/diffusion_models/RelayVSR/`（主干）+ `models/vae/relayvsr VAE/`（Flash 解码器），本整合包已按此归位。
 - **专属参数**：`relay_weights`（Auto 按 scale 自动选档，>=3 用 x4、否则 x2；也可手动锁 x2/x4）、`relay_detail`（Flash 解码细节强度 0~1，默认 1.0）。
 - **后处理**：本插件的光流时域 pass 对该引擎自动跳过（模型自带时序一致性）；`detail / softness / face_restore` 仍可叠加。
 - **倍率换算**：权重原生倍率与 `scale` 不一致时（如只有 x4 权重但要 2 倍），解码后 bicubic 精确缩放到目标尺寸，不重复推理。

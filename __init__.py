@@ -8,6 +8,13 @@ import os
 import folder_paths
 
 from .bsai_h3_upscale_4k import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
+from .relayvsr_batch_node import (
+    NODE_CLASS_MAPPINGS as _BATCH_CLASS_MAPPINGS,
+    NODE_DISPLAY_NAME_MAPPINGS as _BATCH_DISPLAY_MAPPINGS,
+)
+
+NODE_CLASS_MAPPINGS.update(_BATCH_CLASS_MAPPINGS)
+NODE_DISPLAY_NAME_MAPPINGS.update(_BATCH_DISPLAY_MAPPINGS)
 
 # 前端扩展: web/bsai_upscale_legacy_migrate.js (旧工作流 widget 顺序迁移)
 WEB_DIRECTORY = "./web"

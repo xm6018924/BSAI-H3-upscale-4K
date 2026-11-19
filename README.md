@@ -15,6 +15,31 @@ One-click upscale of H3 720P videos / low-res images to 4K, with **Real-ESRGAN /
 | **BSAI_H3_FaceRestore** | Face restore: GFPGAN / CodeFormer with YOLOv8-Face detection, small-face adaptive enhancement, temporal stabilization |
 | **BSAI_H3_DLSS5** | DLSS 5 neural-render upscale (NVIDIA, fastest 4K path on RTX) |
 | **BSAI Topaz Engine Face Restore** | Topaz commercial engine face restore |
+| **BSAI_RelayVSR_BatchUpscale** | **RelayVSR batch sub-node**: scan a folder of N videos, run each through VHS_LoadVideo → BSAI_H3_Upscale4K[RelayVSR] → VHS_VideoCombine, write clips to a custom output folder; optional ffmpeg merge (lossless stream copy / unified re-encode / off) |
+
+### RelayVSR Batch sub-node / RelayVSR 批量子节点
+
+**English**
+
+- **Purpose**: one node replaces the single-file chain (VHS_LoadVideo → BSAI_H3_Upscale4K[RelayVSR] → VHS_VideoCombine) for folder batches; per-file failure does not abort the whole batch.
+- **Workflow**: `workflows/BSAI-RelayVSR批量超分-示例.json` (single node; fill input/output folders).
+- **Key params**: `input_folder` / `output_folder` (absolute; relative paths resolve under `input/` / `output/`; copied-in quotes and bare drive letters like `C:` are normalized automatically), `scale` (2=1080p, 4=4K), `relay_weights` (Auto by scale), `relay_detail`, `detail_amount`/`detail_radius`/`softness`/`temporal_strength`, `face_restore`, `tile_size` (0=whole-frame fast path), `batch_frames`, `use_compile`, `crf` (h264, default 19), `skip_existing` (resume), `keep_audio`.
+- **`merge_mode` (merge stage)**:
+  - `无损流合并 (-c copy)` — lossless stream copy, no re-encode; requires identical encode params across clips;
+  - `统一重编码 (Re-encode)` — libx264/yuv420p/crf19 + AAC re-encode, tolerates mixed frame-rate/source params (not lossless);
+  - `Off` — save clips individually, no merge.
+- Output naming: `<原名>_RelayVSR_x<scale>.mp4`; merged file: `merged_RelayVSR_x<scale>.mp4`.
+
+**中文**
+
+- **用途**：一个节点替代单文件链（VHS_LoadVideo → BSAI_H3_Upscale4K[RelayVSR] → VHS_VideoCombine），对文件夹内 N 个视频逐个批量超分；单片失败不中断整批。
+- **示例工作流**：`workflows/BSAI-RelayVSR批量超分-示例.json`（单节点，填输入/输出文件夹即可）。
+- **主要参数**：`input_folder` / `output_folder`（绝对路径；相对路径按 `input/` / `output/` 解析；复制带入的引号、裸盘符 `C:` 自动归一化），`scale`（2=1080p 档，4=4K 档），`relay_weights`（Auto 按倍率选档），`relay_detail`、`detail_amount`/`detail_radius`/`softness`/`temporal_strength`，`face_restore`，`tile_size`（0=整图快路径），`batch_frames`，`use_compile`，`crf`（h264，默认 19），`skip_existing`（断点续跑），`keep_audio`。
+- **`merge_mode`（合并档）**：
+  - `无损流合并 (-c copy)`：不重编码直拼，要求各片编码参数一致；
+  - `统一重编码 (Re-encode)`：libx264/yuv420p/crf19 + AAC 重编码，兼容混帧率/混参数素材（非无损）；
+  - `Off`：逐片保存，不合并。
+- 成片命名：`<原名>_RelayVSR_x<scale>.mp4`；合并文件：`merged_RelayVSR_x<scale>.mp4`。
 
 ## Engines
 

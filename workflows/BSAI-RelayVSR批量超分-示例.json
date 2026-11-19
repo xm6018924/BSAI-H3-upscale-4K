@@ -1,0 +1,68 @@
+{
+  "id": "bsai-relayvsr-batch-example",
+  "revision": 0,
+  "last_node_id": 1,
+  "last_link_id": 0,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "BSAI_RelayVSR_BatchUpscale",
+      "pos": [240, 180],
+      "size": [420, 460],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "batch_report",
+          "type": "STRING",
+          "links": null
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "BSAI_RelayVSR_BatchUpscale",
+        "cnr_id": "comfy-nodes-registry"
+      },
+      "widgets_values": [
+        "",
+        "",
+        2.0,
+        "Auto (by scale)",
+        1.0,
+        0.5,
+        1.8,
+        0.1,
+        0.2,
+        "Off",
+        0,
+        4,
+        true,
+        19,
+        true,
+        true,
+        "无损流合并 (-c copy)"
+      ],
+      "title": "RelayVSR 批量超分"
+    }
+  ],
+  "links": [],
+  "groups": [
+    {
+      "id": 1,
+      "title": "RelayVSR 批量超分示例(复用参考工作流链路: LoadVideo -> BSAI_H3_Upscale4K[RelayVSR] -> VideoCombine)",
+      "bounding": [200, 120, 500, 560],
+      "color": "#3f789e",
+      "flags": {}
+    }
+  ],
+  "config": {},
+  "extra": {
+    "ds": {"scale": 1.0, "offset": [0, 0]},
+    "VHS_MetadataImage": true,
+    "VHS_KeepIntermediate": true
+  },
+  "extensions": {},
+  "version": 0.4,
+  "seed_widgets": {}
+}
